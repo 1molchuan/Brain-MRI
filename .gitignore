@@ -1,0 +1,108 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# PyCharm
+.idea/
+
+# Model files (通常很大，建议使用 Git LFS 或不上传)
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.pb
+
+# Data files (通常很大，建议不上传)
+data/
+datasets/
+*.nii
+*.nii.gz
+*.dcm
+*.dicom
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+*.cache
+temp/
+tmp/
+
+# OS files
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Output files
+outputs/
+results/
+predictions/
+*.png
+*.jpg
+*.jpeg
+*.mat
+
+# Keep example outputs if needed
+!examples/*.png
+!examples/*.jpg
+
+# Configuration files with sensitive information
+config.json
+secrets.json
+.env
+*.key
+
+# Training checkpoints (可选，如果不想上传模型)
+checkpoints/
+models/
+saved_models/
+
+# Performance analysis reports
+performance_reports/
+*.html
+*.pdf
+
+# MATLAB files (如果使用)
+*.m
+*.fig
+
+# Large visualization files
+visualizations/
+attention_maps/
+
