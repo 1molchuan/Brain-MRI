@@ -271,6 +271,8 @@ medical-segmentation/
 ---
 
 ⭐ 如果这个项目对你有帮助，请给个 Star！
+(住：作者训练模型采用的数据集链接https://www.kaggle.com/datasets/mateuszbuda/lgg-mri-segmentation )
+
 
 
 
