@@ -78,22 +78,18 @@ pip install scikit-learn
 ### 训练模型
 
 1. **准备数据**：
-   - 数据目录结构：
-     ```
-     data_dir/
-     ├── images/
-     │   ├── patient_id1/
-     │   │   ├── image1.png
-     │   │   └── image2.png
-     │   └── patient_id2/
-     │       └── ...
-     └── masks/
-         ├── patient_id1/
-         │   ├── mask1.png
-         │   └── mask2.png
-         └── patient_id2/
-             └── ...
-   ```
+ data_dir/
+├── patient_id1/
+│   ├── image1.png          # 原始图像
+│   ├── image1_mask.png     # 对应的mask
+│   ├── image2.png
+│   ├── image2_mask.png
+│   └── ...
+├── patient_id2/
+│   ├── image1.png
+│   ├── image1_mask.png
+│   └── ...
+└── ...
 
 2. **配置训练参数**：
    - 选择数据目录
@@ -272,6 +268,7 @@ medical-segmentation/
 
 ⭐ 如果这个项目对你有帮助，请给个 Star！
 (住：作者训练模型采用的数据集链接https://www.kaggle.com/datasets/mateuszbuda/lgg-mri-segmentation )
+
 
 
 
