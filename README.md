@@ -30,8 +30,8 @@
 ### 1. 克隆仓库
 
 ```bash
-git clone https://github.com/yourusername/medical-segmentation.git
-cd medical-segmentation
+git clone https://github.com/1molchuan/Brain-MRI.git
+cd Brain-MRI
 ```
 
 ### 2. 安装依赖
@@ -271,4 +271,5 @@ medical-segmentation/
 ---
 
 ⭐ 如果这个项目对你有帮助，请给个 Star！
+
 
