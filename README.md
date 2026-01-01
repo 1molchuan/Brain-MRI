@@ -1,6 +1,7 @@
 # 医学图像分割系统 - AI智能分析平台
 
 一个功能完整的医学图像分割系统，提供图形化界面和API服务，支持多种先进的深度学习模型架构。
+（注：代码已拆分为四个部分moduls.py,worker.py,utils.py,main.py。保留当初笨拙的原文件，纪念逝去的2025）
 
 ## ✨ 主要特性
 
@@ -268,6 +269,7 @@ medical-segmentation/
 
 ⭐ 如果这个项目对你有帮助，请给个 Star！
 (住：作者训练模型采用的数据集链接https://www.kaggle.com/datasets/mateuszbuda/lgg-mri-segmentation )
+
 
 
 
