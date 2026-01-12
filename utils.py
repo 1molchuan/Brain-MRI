@@ -9,6 +9,7 @@ if matlab_bin_path not in os.environ['PATH']:
     os.environ['PATH'] += ';' + matlab_bin_path
 import json
 import hashlib
+import threading
 import numpy as np
 import torch
 import torch.nn as nn
@@ -2034,6 +2035,108 @@ def find_optimal_ensemble_weights_global(mask_list, gt_masks, weight_range=(0.0,
     return best_weights, best_metrics
 
 
+# ==================== 全局进程池管理器（单例模式）====================
+class ProcessPoolManager:
+    """
+    全局进程池管理器，用于复用进程池（Windows兼容）
+    进程池在第一次创建后保留，后续调用复用，避免重复创建的开销
+    """
+    _instance = None
+    _lock = threading.Lock()
+    _pool = None
+    _pool_size = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super(ProcessPoolManager, cls).__new__(cls)
+        return cls._instance
+    
+    def get_pool(self, pool_size=None):
+        """
+        获取进程池，如果不存在则创建
+        
+        Args:
+            pool_size: 进程池大小，如果为None则使用CPU核心数-1
+            
+        Returns:
+            multiprocessing.Pool: 进程池对象，如果创建失败则返回None
+        """
+        if pool_size is None:
+            pool_size = max(1, mp.cpu_count() - 1)  # 保留一个核心给主进程
+        
+        # 如果进程池已存在且大小匹配，直接返回
+        if self._pool is not None and self._pool_size == pool_size:
+            try:
+                # 测试进程池是否仍然有效
+                self._pool._check_running()
+                return self._pool
+            except (ValueError, AssertionError):
+                # 进程池已关闭，需要重新创建
+                self._pool = None
+                self._pool_size = None
+        
+        # 创建新的进程池
+        if self._pool is None:
+            try:
+                # Windows下使用spawn方式（默认）
+                ctx = mp.get_context('spawn')
+                self._pool = ctx.Pool(processes=pool_size)
+                self._pool_size = pool_size
+                print(f"[进程池] 创建进程池，大小: {pool_size} (CPU核心数: {mp.cpu_count()})")
+            except Exception as e:
+                print(f"[进程池] 创建失败: {e}，将使用单进程模式")
+                self._pool = None
+                self._pool_size = None
+        
+        return self._pool
+    
+    def close_pool(self):
+        """关闭进程池（通常不需要手动调用，程序退出时自动清理）"""
+        if self._pool is not None:
+            try:
+                self._pool.close()
+                self._pool.join()
+                self._pool = None
+                self._pool_size = None
+                print("[进程池] 进程池已关闭")
+            except Exception as e:
+                print(f"[进程池] 关闭失败: {e}")
+
+
+# ==================== 多进程辅助函数 ====================
+def _calculate_dice_worker(args):
+    """
+    多进程工作函数：计算单个阈值的Dice系数
+    
+    Args:
+        args: 元组 (preds_flat, targets_flat, threshold)
+              preds_flat: 展平的概率图（numpy数组）
+              targets_flat: 展平的真实标签（numpy数组）
+              threshold: 二值化阈值
+    
+    Returns:
+        dice: Dice系数
+    """
+    preds_flat, targets_flat, threshold = args
+    
+    # 二值化预测
+    pred_mask = (preds_flat >= threshold).astype(np.float32)
+    targets_float = targets_flat.astype(np.float32)
+    
+    # 计算交集和并集
+    intersection = np.sum(pred_mask * targets_float)
+    union = np.sum(pred_mask) + np.sum(targets_float)
+    
+    # 避免除零
+    if union < 1e-7:
+        return 1.0 if intersection < 1e-7 else 0.0
+    
+    # Dice = 2 * intersection / union
+    return (2.0 * intersection) / union
+
+
 class GreyWolfThresholdOptimizer:
     """
     使用灰狼优化算法(GWO)寻找最佳分割阈值
@@ -2042,23 +2145,25 @@ class GreyWolfThresholdOptimizer:
     相比线性扫描，GWO 能够更智能地搜索阈值空间，在更少的迭代次数内找到更优解。
     """
     
-    def __init__(self, num_wolves=10, max_iter=20, progress_callback=None):
+    def __init__(self, num_wolves=10, max_iter=20, progress_callback=None, use_multiprocessing=True):
         """
         Args:
             num_wolves: 灰狼数量（种群大小），默认10
             max_iter: 最大迭代次数，默认20
             progress_callback: 进度回调函数，接收 (iteration, max_iter, best_score, best_threshold) 参数
+            use_multiprocessing: 是否在CPU模式下使用多进程（默认True）
         """
         self.num_wolves = num_wolves
         self.max_iter = max_iter
         self.progress_callback = progress_callback
+        self.use_multiprocessing = use_multiprocessing
         # 搜索空间 [0.1, 0.9]
         self.lb = 0.1
         self.ub = 0.9
 
     def optimize(self, preds, targets, device=None):
         """
-        使用GWO算法优化阈值（GPU加速版本）
+        使用GWO算法优化阈值（GPU加速版本，带自动回退）
         
         Args:
             preds: 模型输出的概率图，可以是 torch.Tensor 或 numpy.ndarray
@@ -2082,15 +2187,49 @@ class GreyWolfThresholdOptimizer:
             device = torch.device(device)
             use_gpu = device.type == 'cuda'
         
+        # 检查显存是否充足
+        if use_gpu:
+            try:
+                # 估算数据大小
+                if isinstance(preds, np.ndarray):
+                    data_size_mb = preds.nbytes / (1024 * 1024)
+                else:
+                    data_size_mb = preds.numel() * 4 / (1024 * 1024)  # float32 = 4 bytes
+                
+                # 检查可用显存
+                if torch.cuda.is_available():
+                    free_memory_mb = torch.cuda.get_device_properties(device).total_memory / (1024 * 1024) - torch.cuda.memory_allocated(device) / (1024 * 1024)
+                    # 如果数据大小超过可用显存的30%，使用CPU
+                    if data_size_mb > free_memory_mb * 0.3:
+                        print(f"[GWO] 显存不足（数据: {data_size_mb:.1f}MB, 可用: {free_memory_mb:.1f}MB），回退到CPU模式")
+                        use_gpu = False
+                        device = torch.device('cpu')
+            except Exception as e:
+                print(f"[GWO] 显存检查失败: {e}，回退到CPU模式")
+                use_gpu = False
+                device = torch.device('cpu')
+        
         # 转换为torch tensor并移到指定设备
         if isinstance(preds, np.ndarray):
             preds = torch.from_numpy(preds).float()
         if isinstance(targets, np.ndarray):
             targets = torch.from_numpy(targets).float()
         
-        # 确保在正确的设备上
-        preds = preds.to(device)
-        targets = targets.to(device)
+        # 尝试移到GPU，如果失败则回退到CPU
+        try:
+            preds = preds.to(device)
+            targets = targets.to(device)
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print(f"[GWO] GPU显存不足，回退到CPU模式")
+                device = torch.device('cpu')
+                use_gpu = False
+                preds = preds.cpu()
+                targets = targets.cpu()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            else:
+                raise
         
         # 统一维度：如果是4D，取第一个通道
         if preds.ndim == 4:
@@ -2098,13 +2237,32 @@ class GreyWolfThresholdOptimizer:
         if targets.ndim == 4:
             targets = targets[:, 0]
         
-        # 展平为一维tensor（保持在GPU上）
+        # 展平为一维tensor
         preds_flat = preds.flatten().float()
         targets_flat = targets.flatten().float()
         
+        # 如果是CPU模式，转换为numpy数组（多进程和单进程都需要）
+        if not use_gpu:
+            preds_flat_np = preds_flat.cpu().numpy()
+            targets_flat_np = targets_flat.cpu().numpy()
+            # 如果启用多进程，获取全局进程池管理器
+            if self.use_multiprocessing:
+                pool_manager = ProcessPoolManager()
+                pool = pool_manager.get_pool(pool_size=min(self.num_wolves, mp.cpu_count() - 1))
+            else:
+                pool = None
+        else:
+            preds_flat_np = None
+            targets_flat_np = None
+            pool = None
+        
         # 初始化狼群位置（阈值）
         positions = np.random.uniform(self.lb, self.ub, self.num_wolves)
-        positions = torch.from_numpy(positions).float().to(device)
+        
+        if use_gpu:
+            positions_tensor = torch.from_numpy(positions).float().to(device)
+        else:
+            positions_tensor = None
         
         # 初始化 Alpha, Beta, Delta 狼 (前三名)
         alpha_pos, alpha_score = 0.5, -float('inf')
@@ -2115,16 +2273,28 @@ class GreyWolfThresholdOptimizer:
             # 线性衰减参数 a 从 2 -> 0
             a = 2.0 - t * (2.0 / self.max_iter)
             
-            # 【GPU加速】批量计算所有狼的适应度（Dice分数）
             # 边界处理
-            positions = torch.clamp(positions, self.lb, self.ub)
+            positions = np.clip(positions, self.lb, self.ub)
             
-            # 向量化计算所有狼的Dice（一次性计算，而不是循环）
-            scores = self._calculate_dice_batch(preds_flat, targets_flat, positions)
+            # 计算所有狼的适应度（Dice分数）
+            if use_gpu:
+                # GPU模式：使用批量计算
+                positions_tensor = torch.from_numpy(positions).float().to(device)
+                positions_tensor = torch.clamp(positions_tensor, self.lb, self.ub)
+                scores = self._calculate_dice_batch(preds_flat, targets_flat, positions_tensor)
+                scores_np = scores.cpu().numpy()
+            elif pool is not None:
+                # CPU多进程模式：并行计算每只狼的Dice
+                # 准备参数列表
+                args_list = [(preds_flat_np, targets_flat_np, float(pos)) for pos in positions]
+                # 并行计算
+                scores_np = np.array(pool.map(_calculate_dice_worker, args_list))
+            else:
+                # CPU单进程模式：循环计算
+                scores_np = np.array([self._calculate_dice(preds_flat_np, targets_flat_np, float(pos)) 
+                                     for pos in positions])
             
-            # 转换为numpy以便更新前三名（CPU操作，很快）
-            scores_np = scores.cpu().numpy()
-            positions_np = positions.cpu().numpy()
+            positions_np = positions.copy()
             
             # 更新前三名（Alpha, Beta, Delta）
             for i in range(self.num_wolves):
@@ -2145,35 +2315,64 @@ class GreyWolfThresholdOptimizer:
                     delta_score, delta_pos = score, pos
             
             # 更新每只狼的位置（基于 Alpha, Beta, Delta 的位置）
-            # 在GPU上批量计算位置更新
-            alpha_pos_tensor = torch.tensor(alpha_pos, device=device)
-            beta_pos_tensor = torch.tensor(beta_pos, device=device)
-            delta_pos_tensor = torch.tensor(delta_pos, device=device)
-            
-            # 生成随机数（在GPU上）
-            r1 = torch.rand(self.num_wolves, device=device)
-            r2 = torch.rand(self.num_wolves, device=device)
-            A1 = 2.0 * a * r1 - a
-            C1 = 2.0 * r2
-            D_alpha = torch.abs(C1 * alpha_pos_tensor - positions)
-            X1 = alpha_pos_tensor - A1 * D_alpha
-            
-            r1 = torch.rand(self.num_wolves, device=device)
-            r2 = torch.rand(self.num_wolves, device=device)
-            A2 = 2.0 * a * r1 - a
-            C2 = 2.0 * r2
-            D_beta = torch.abs(C2 * beta_pos_tensor - positions)
-            X2 = beta_pos_tensor - A2 * D_beta
-            
-            r1 = torch.rand(self.num_wolves, device=device)
-            r2 = torch.rand(self.num_wolves, device=device)
-            A3 = 2.0 * a * r1 - a
-            C3 = 2.0 * r2
-            D_delta = torch.abs(C3 * delta_pos_tensor - positions)
-            X3 = delta_pos_tensor - A3 * D_delta
-            
-            # 狼的位置更新为三者平均
-            positions = (X1 + X2 + X3) / 3.0
+            if use_gpu:
+                # GPU模式：在GPU上批量计算位置更新
+                alpha_pos_tensor = torch.tensor(alpha_pos, device=device)
+                beta_pos_tensor = torch.tensor(beta_pos, device=device)
+                delta_pos_tensor = torch.tensor(delta_pos, device=device)
+                
+                # 生成随机数（在GPU上）
+                r1 = torch.rand(self.num_wolves, device=device)
+                r2 = torch.rand(self.num_wolves, device=device)
+                A1 = 2.0 * a * r1 - a
+                C1 = 2.0 * r2
+                D_alpha = torch.abs(C1 * alpha_pos_tensor - positions_tensor)
+                X1 = alpha_pos_tensor - A1 * D_alpha
+                
+                r1 = torch.rand(self.num_wolves, device=device)
+                r2 = torch.rand(self.num_wolves, device=device)
+                A2 = 2.0 * a * r1 - a
+                C2 = 2.0 * r2
+                D_beta = torch.abs(C2 * beta_pos_tensor - positions_tensor)
+                X2 = beta_pos_tensor - A2 * D_beta
+                
+                r1 = torch.rand(self.num_wolves, device=device)
+                r2 = torch.rand(self.num_wolves, device=device)
+                A3 = 2.0 * a * r1 - a
+                C3 = 2.0 * r2
+                D_delta = torch.abs(C3 * delta_pos_tensor - positions_tensor)
+                X3 = delta_pos_tensor - A3 * D_delta
+                
+                # 狼的位置更新为三者平均
+                positions_tensor = (X1 + X2 + X3) / 3.0
+                positions = positions_tensor.cpu().numpy()
+            else:
+                # CPU模式：使用numpy计算
+                positions_tensor = torch.from_numpy(positions).float()
+                
+                r1 = np.random.random(self.num_wolves)
+                r2 = np.random.random(self.num_wolves)
+                A1 = 2.0 * a * r1 - a
+                C1 = 2.0 * r2
+                D_alpha = np.abs(C1 * alpha_pos - positions)
+                X1 = alpha_pos - A1 * D_alpha
+                
+                r1 = np.random.random(self.num_wolves)
+                r2 = np.random.random(self.num_wolves)
+                A2 = 2.0 * a * r1 - a
+                C2 = 2.0 * r2
+                D_beta = np.abs(C2 * beta_pos - positions)
+                X2 = beta_pos - A2 * D_beta
+                
+                r1 = np.random.random(self.num_wolves)
+                r2 = np.random.random(self.num_wolves)
+                A3 = 2.0 * a * r1 - a
+                C3 = 2.0 * r2
+                D_delta = np.abs(C3 * delta_pos - positions)
+                X3 = delta_pos - A3 * D_delta
+                
+                # 狼的位置更新为三者平均
+                positions = (X1 + X2 + X3) / 3.0
             
             # 调用进度回调函数（如果提供）
             if self.progress_callback is not None:
@@ -2214,7 +2413,7 @@ class GreyWolfThresholdOptimizer:
     
     def _calculate_dice_batch(self, preds_flat, targets_flat, thresholds):
         """
-        GPU加速：批量计算多个阈值的Dice系数
+        GPU加速：批量计算多个阈值的Dice系数（显存优化版本）
         
         Args:
             preds_flat: 展平的概率图（一维tensor，在GPU上）
@@ -2224,33 +2423,67 @@ class GreyWolfThresholdOptimizer:
         Returns:
             dice_scores: Dice分数tensor（一维tensor，形状为[num_wolves]，在GPU上）
         """
-        # 扩展维度以便批量计算
-        # preds_flat: [N], thresholds: [M] -> preds_expanded: [M, N]
         num_wolves = thresholds.shape[0]
-        preds_expanded = preds_flat.unsqueeze(0).expand(num_wolves, -1)  # [M, N]
-        thresholds_expanded = thresholds.unsqueeze(1)  # [M, 1]
-        targets_expanded = targets_flat.unsqueeze(0).expand(num_wolves, -1).float()  # [M, N]
+        num_pixels = preds_flat.shape[0]
         
-        # 批量二值化：preds >= threshold for each threshold
-        pred_masks = (preds_expanded >= thresholds_expanded).float()  # [M, N]
+        # 【显存优化】如果数据量太大，使用循环计算而不是批量扩展
+        # 估算显存占用：expand会创建 [M, N] 的tensor，约 4*M*N 字节
+        # 如果超过500MB，使用循环方式
+        estimated_memory_mb = 4 * num_wolves * num_pixels / (1024 * 1024)
         
-        # 批量计算交集和并集
-        intersections = (pred_masks * targets_expanded).sum(dim=1)  # [M]
-        pred_sums = pred_masks.sum(dim=1)  # [M]
-        target_sum = targets_expanded.sum(dim=1)  # [M] - 每个阈值对应的target sum（实际上都相同）
-        
-        # 批量计算Dice
-        unions = pred_sums + target_sum  # [M]
-        
-        # 避免除零（使用smooth项）
-        smooth = 1e-7
-        dice_scores = (2.0 * intersections + smooth) / (unions + smooth)
-        
-        # 处理特殊情况：如果union为0，根据intersection判断
-        zero_union_mask = unions < smooth
-        zero_intersection_mask = intersections < smooth
-        dice_scores[zero_union_mask & zero_intersection_mask] = 1.0  # 两者都为0，Dice=1
-        dice_scores[zero_union_mask & ~zero_intersection_mask] = 0.0  # union=0但intersection>0，Dice=0
+        if estimated_memory_mb > 500:
+            # 使用循环方式，每次只计算一只狼（节省显存）
+            dice_scores = []
+            targets_sum = targets_flat.sum()  # 只计算一次
+            
+            for i in range(num_wolves):
+                threshold = thresholds[i]
+                # 二值化
+                pred_mask = (preds_flat >= threshold).float()
+                # 计算交集和并集
+                intersection = (pred_mask * targets_flat).sum()
+                pred_sum = pred_mask.sum()
+                union = pred_sum + targets_sum
+                # 计算Dice
+                smooth = 1e-7
+                if union < smooth:
+                    dice = 1.0 if intersection < smooth else 0.0
+                else:
+                    dice = (2.0 * intersection + smooth) / (union + smooth)
+                dice_scores.append(dice)
+                # 及时删除中间变量
+                del pred_mask, intersection, pred_sum
+            
+            dice_scores = torch.stack(dice_scores)
+        else:
+            # 使用批量计算（速度快，但显存占用大）
+            thresholds_expanded = thresholds.unsqueeze(1)  # [M, 1]
+            
+            # 批量二值化：preds >= threshold for each threshold
+            # 使用广播，避免expand创建大tensor
+            pred_masks = (preds_flat.unsqueeze(0) >= thresholds_expanded).float()  # [M, N]
+            
+            # 批量计算交集和并集
+            targets_expanded = targets_flat.unsqueeze(0)  # [1, N]
+            intersections = (pred_masks * targets_expanded).sum(dim=1)  # [M]
+            pred_sums = pred_masks.sum(dim=1)  # [M]
+            target_sum = targets_flat.sum()  # scalar，只计算一次
+            
+            # 批量计算Dice
+            unions = pred_sums + target_sum  # [M]
+            
+            # 避免除零（使用smooth项）
+            smooth = 1e-7
+            dice_scores = (2.0 * intersections + smooth) / (unions + smooth)
+            
+            # 处理特殊情况：如果union为0，根据intersection判断
+            zero_union_mask = unions < smooth
+            zero_intersection_mask = intersections < smooth
+            dice_scores[zero_union_mask & zero_intersection_mask] = 1.0  # 两者都为0，Dice=1
+            dice_scores[zero_union_mask & ~zero_intersection_mask] = 0.0  # union=0但intersection>0，Dice=0
+            
+            # 清理中间变量
+            del pred_masks, targets_expanded, intersections, pred_sums
         
         return dice_scores
 
@@ -2634,8 +2867,9 @@ class MedicalImageDataset(Dataset):
 
 # ==================== MATLAB 相关类 ====================
 
-import threading
 from scipy.io import savemat
+import multiprocessing as mp
+from functools import partial
 
 # 尝试导入 MATLAB 引擎
 MATLAB_ENGINE_AVAILABLE = False

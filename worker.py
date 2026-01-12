@@ -2552,30 +2552,56 @@ class TrainThread(QThread):
                 return 0.5
             
             # 数据收集完成，开始GWO优化
-            self.update_progress.emit(45, "阈值优化: 数据收集完成，开始GWO优化（GPU加速）...")
+            self.update_progress.emit(45, "阈值优化: 数据收集完成，开始GWO优化...")
             
-            # 【GPU加速优化】保持数据在GPU上，使用torch tensor进行GWO优化
-            # 拼接所有批次的数据（保持在GPU上）
-            all_probs_tensor = torch.cat([torch.from_numpy(p).to(device) for p in all_probs], dim=0)
-            all_masks_tensor = torch.cat([torch.from_numpy(m).to(device) for m in all_masks], dim=0)
+            # 【显存优化】先拼接numpy数组，再决定是否移到GPU
+            # 这样可以避免在GPU上拼接时占用过多显存
+            all_probs_np = np.concatenate(all_probs, axis=0)
+            all_masks_np = np.concatenate(all_masks, axis=0)
             
             # 【显存优化】删除原始列表，释放内存
             del all_probs, all_masks
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
             import gc
             gc.collect()
 
-            # 【GWO优化】使用灰狼优化算法替代线性扫描，更智能地寻找最佳阈值（GPU加速）
-            print(">>> [GWO] 灰狼群正在搜索最佳阈值（GPU加速）...")
+            # 检查数据大小，决定是否使用GPU
+            data_size_mb = all_probs_np.nbytes / (1024 * 1024) * 2  # preds + masks
+            use_gpu_for_gwo = False
+            
+            if torch.cuda.is_available():
+                try:
+                    # 检查可用显存
+                    free_memory_mb = (torch.cuda.get_device_properties(device).total_memory - 
+                                    torch.cuda.memory_allocated(device)) / (1024 * 1024)
+                    # 如果数据大小小于可用显存的20%，使用GPU
+                    if data_size_mb < free_memory_mb * 0.2:
+                        use_gpu_for_gwo = True
+                        print(f">>> [GWO] 数据大小: {data_size_mb:.1f}MB, 可用显存: {free_memory_mb:.1f}MB，使用GPU加速")
+                    else:
+                        print(f">>> [GWO] 数据大小: {data_size_mb:.1f}MB, 可用显存: {free_memory_mb:.1f}MB，使用CPU模式（节省显存）")
+                except Exception as e:
+                    print(f">>> [GWO] 显存检查失败: {e}，使用CPU模式")
+            
+            # 【GWO优化】使用灰狼优化算法替代线性扫描，更智能地寻找最佳阈值
+            if use_gpu_for_gwo:
+                print(">>> [GWO] 灰狼群正在搜索最佳阈值（GPU加速）...")
+                # 转换为tensor并移到GPU（在GWO内部会处理OOM）
+                all_probs_tensor = torch.from_numpy(all_probs_np).to(device)
+                all_masks_tensor = torch.from_numpy(all_masks_np).to(device)
+            else:
+                print(">>> [GWO] 灰狼群正在搜索最佳阈值（CPU模式）...")
+                # 保持在CPU上
+                all_probs_tensor = all_probs_np
+                all_masks_tensor = all_masks_np
             
             # 定义进度回调函数
             def gwo_progress_callback(iteration, max_iter, best_score, best_threshold):
                 # GWO优化进度（45-90%）
                 gwo_progress = 45 + int(45 * iteration / max_iter)
+                device_str = "GPU" if use_gpu_for_gwo else "CPU"
                 self.update_progress.emit(
                     gwo_progress,
-                    f"阈值优化: GWO迭代 {iteration}/{max_iter} | 最佳阈值: {best_threshold:.4f} | 最佳Dice: {best_score:.4f} (GPU)"
+                    f"阈值优化: GWO迭代 {iteration}/{max_iter} | 最佳阈值: {best_threshold:.4f} | 最佳Dice: {best_score:.4f} ({device_str})"
                 )
             
             gwo = GreyWolfThresholdOptimizer(
@@ -2583,21 +2609,47 @@ class TrainThread(QThread):
                 max_iter=15,
                 progress_callback=gwo_progress_callback
             )
-            # 传递GPU tensor和device，启用GPU加速
-            best_threshold, best_dice = gwo.optimize(all_probs_tensor, all_masks_tensor, device=device)
             
-            # 清理GPU tensor
-            del all_probs_tensor, all_masks_tensor
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # 执行优化（带错误处理和自动回退）
+            try:
+                best_threshold, best_dice = gwo.optimize(all_probs_tensor, all_masks_tensor, device=device if use_gpu_for_gwo else None)
+            except RuntimeError as e:
+                if "out of memory" in str(e) or "CUDA" in str(e):
+                    print(f">>> [GWO] GPU显存不足，自动回退到CPU模式")
+                    # 清理GPU显存
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    # 回退到CPU（确保使用numpy数组）
+                    if use_gpu_for_gwo:
+                        # 如果之前用的是GPU tensor，需要重新获取numpy数组
+                        # 但此时all_probs_np和all_masks_np应该还在
+                        best_threshold, best_dice = gwo.optimize(all_probs_np, all_masks_np, device=None)
+                    else:
+                        best_threshold, best_dice = gwo.optimize(all_probs_tensor, all_masks_tensor, device=None)
+                else:
+                    raise
             
             # GWO优化完成
             self.update_progress.emit(90, f"阈值优化: GWO完成 | 最佳阈值: {best_threshold:.4f} | 最佳Dice: {best_dice:.4f}")
             
             # 为了兼容性，计算完整的指标字典（使用找到的最佳阈值）
             # 使用 scan_best_threshold 计算完整指标，但只使用我们找到的阈值
-            pred_bool = (all_probs_np >= best_threshold)
-            gt_bool = (all_masks_np > 0.5)
+            # 注意：需要确保使用numpy数组，如果之前用的是tensor需要转换
+            if use_gpu_for_gwo:
+                # 如果用的是GPU tensor，需要转换回numpy
+                if isinstance(all_probs_tensor, torch.Tensor):
+                    all_probs_for_metrics = all_probs_tensor.cpu().numpy()
+                    all_masks_for_metrics = all_masks_tensor.cpu().numpy()
+                else:
+                    all_probs_for_metrics = all_probs_np
+                    all_masks_for_metrics = all_masks_np
+            else:
+                # CPU模式，直接使用numpy数组
+                all_probs_for_metrics = all_probs_np
+                all_masks_for_metrics = all_masks_np
+            
+            pred_bool = (all_probs_for_metrics >= best_threshold)
+            gt_bool = (all_masks_for_metrics > 0.5)
             
             # 混淆矩阵统计
             tp = np.logical_and(pred_bool, gt_bool).sum()
@@ -2628,8 +2680,14 @@ class TrainThread(QThread):
             
             print(f">>> [GWO] 搜索完成! 最佳阈值: {best_threshold:.4f}, 最佳 Dice: {best_dice:.4f}")
             
-            # 【显存优化】删除拼接后的数组
+            # 【显存优化】删除拼接后的数组和中间变量
+            if use_gpu_for_gwo:
+                del all_probs_tensor, all_masks_tensor
             del all_probs_np, all_masks_np, pred_bool, gt_bool
+            if 'all_probs_for_metrics' in locals():
+                del all_probs_for_metrics, all_masks_for_metrics
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             gc.collect()
 
         sample_info = "全部验证集" if use_all_samples else f"{num_samples}个批次"
