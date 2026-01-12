@@ -2032,6 +2032,146 @@ def find_optimal_ensemble_weights_global(mask_list, gt_masks, weight_range=(0.0,
             print(f"\n⚠️  指标仍需优化: Dice={full_avg_dice:.4f} (目标>{dice_target}), HD95={full_avg_hd95:.4f} (目标<{hd95_target})")
     
     return best_weights, best_metrics
+
+
+class GreyWolfThresholdOptimizer:
+    """
+    使用灰狼优化算法(GWO)寻找最佳分割阈值
+    目标函数：Dice系数
+    
+    相比线性扫描，GWO 能够更智能地搜索阈值空间，在更少的迭代次数内找到更优解。
+    """
+    
+    def __init__(self, num_wolves=10, max_iter=20):
+        """
+        Args:
+            num_wolves: 灰狼数量（种群大小），默认10
+            max_iter: 最大迭代次数，默认20
+        """
+        self.num_wolves = num_wolves
+        self.max_iter = max_iter
+        # 搜索空间 [0.1, 0.9]
+        self.lb = 0.1
+        self.ub = 0.9
+
+    def optimize(self, preds, targets):
+        """
+        使用GWO算法优化阈值
+        
+        Args:
+            preds: 模型输出的概率图 (N, H, W) 或 (N, C, H, W) 或 Logits
+            targets: 真实标签，形状与 preds 相同
+            
+        Returns:
+            best_threshold: 最佳阈值
+            best_dice: 最佳Dice分数
+        """
+        # 确保数据在 CPU 且展平，加速计算
+        if isinstance(preds, torch.Tensor):
+            preds = preds.detach().cpu().numpy()
+        if isinstance(targets, torch.Tensor):
+            targets = targets.detach().cpu().numpy()
+        
+        # 统一维度：如果是4D，取第一个通道
+        if preds.ndim == 4:
+            preds = preds[:, 0]
+        if targets.ndim == 4:
+            targets = targets[:, 0]
+        
+        # 展平为一维数组，加速计算
+        preds_flat = preds.flatten()
+        targets_flat = targets.flatten()
+        
+        # 初始化狼群位置（阈值）
+        positions = np.random.uniform(self.lb, self.ub, self.num_wolves)
+        
+        # 初始化 Alpha, Beta, Delta 狼 (前三名)
+        alpha_pos, alpha_score = 0.5, -float('inf')
+        beta_pos, beta_score = 0.5, -float('inf')
+        delta_pos, delta_score = 0.5, -float('inf')
+        
+        for t in range(self.max_iter):
+            # 线性衰减参数 a 从 2 -> 0
+            a = 2.0 - t * (2.0 / self.max_iter)
+            
+            # 计算每只狼的适应度（Dice分数）
+            for i in range(self.num_wolves):
+                # 边界处理
+                positions[i] = np.clip(positions[i], self.lb, self.ub)
+                
+                # 计算当前阈值的 Dice
+                score = self._calculate_dice(preds_flat, targets_flat, positions[i])
+                
+                # 更新前三名（Alpha, Beta, Delta）
+                if score > alpha_score:
+                    # 更新 Alpha，原 Alpha 降为 Beta，原 Beta 降为 Delta
+                    delta_score, delta_pos = beta_score, beta_pos
+                    beta_score, beta_pos = alpha_score, alpha_pos
+                    alpha_score, alpha_pos = score, positions[i]
+                elif score > beta_score:
+                    # 更新 Beta，原 Beta 降为 Delta
+                    delta_score, delta_pos = beta_score, beta_pos
+                    beta_score, beta_pos = score, positions[i]
+                elif score > delta_score:
+                    # 更新 Delta
+                    delta_score, delta_pos = score, positions[i]
+            
+            # 更新每只狼的位置（基于 Alpha, Beta, Delta 的位置）
+            for i in range(self.num_wolves):
+                # 计算与 Alpha 的距离和位置
+                r1, r2 = np.random.random(), np.random.random()
+                A1 = 2.0 * a * r1 - a
+                C1 = 2.0 * r2
+                D_alpha = abs(C1 * alpha_pos - positions[i])
+                X1 = alpha_pos - A1 * D_alpha
+                
+                # 计算与 Beta 的距离和位置
+                r1, r2 = np.random.random(), np.random.random()
+                A2 = 2.0 * a * r1 - a
+                C2 = 2.0 * r2
+                D_beta = abs(C2 * beta_pos - positions[i])
+                X2 = beta_pos - A2 * D_beta
+                
+                # 计算与 Delta 的距离和位置
+                r1, r2 = np.random.random(), np.random.random()
+                A3 = 2.0 * a * r1 - a
+                C3 = 2.0 * r2
+                D_delta = abs(C3 * delta_pos - positions[i])
+                X3 = delta_pos - A3 * D_delta
+                
+                # 狼的位置更新为三者平均
+                positions[i] = (X1 + X2 + X3) / 3.0
+                
+        return alpha_pos, alpha_score
+
+    def _calculate_dice(self, preds, targets, threshold):
+        """
+        快速计算 Dice 系数
+        
+        Args:
+            preds: 展平的概率图（一维数组）
+            targets: 展平的真实标签（一维数组）
+            threshold: 二值化阈值
+            
+        Returns:
+            dice: Dice 系数
+        """
+        # 二值化预测
+        pred_mask = (preds >= threshold).astype(np.float32)
+        targets_float = targets.astype(np.float32)
+        
+        # 计算交集和并集
+        intersection = np.sum(pred_mask * targets_float)
+        union = np.sum(pred_mask) + np.sum(targets_float)
+        
+        # 避免除零
+        if union < 1e-7:
+            return 1.0 if intersection < 1e-7 else 0.0
+        
+        # Dice = 2 * intersection / union
+        return (2.0 * intersection) / union
+
+
 def scan_best_threshold(prob_maps, gt_masks):
     """
     在给定的概率图和真实掩膜上扫描阈值，寻找综合评分最高的阈值。
@@ -3602,147 +3742,3 @@ def save_mat_file(data_dict: dict, file_path: str):
             error_msg += "\n2. 降低数据精度（如使用 float32 代替 float64）"
             error_msg += "\n3. 安装 h5py 库以支持 v7.3 格式：pip install h5py"
         raise RuntimeError(error_msg)
-
-
-# ==================== GWO 灰狼优化器 ====================
-
-class GreyWolfThresholdOptimizer:
-    """
-    使用灰狼优化算法(GWO)寻找最佳分割阈值
-    
-    目标函数：Dice系数
-    搜索空间：[0.1, 0.9]
-    
-    相比线性扫描，GWO 能够更智能地探索阈值空间，快速收敛到最优解。
-    """
-    
-    def __init__(self, num_wolves=10, max_iter=20):
-        """
-        Args:
-            num_wolves: 狼群数量（默认10，平衡速度和精度）
-            max_iter: 最大迭代次数（默认20，通常足够收敛）
-        """
-        self.num_wolves = num_wolves
-        self.max_iter = max_iter
-        # 搜索空间 [0.1, 0.9]
-        self.lb = 0.1
-        self.ub = 0.9
-    
-    def optimize(self, preds, targets):
-        """
-        使用 GWO 算法优化阈值
-        
-        Args:
-            preds: 模型输出的概率图 (N, C, H, W) 或 Logits，可以是 numpy 或 torch.Tensor
-            targets: 真实标签，可以是 numpy 或 torch.Tensor
-        
-        Returns:
-            best_threshold: 最佳阈值 (float)
-            best_dice: 最佳 Dice 分数 (float)
-        """
-        # 确保数据在 CPU 且展平，加速计算
-        if isinstance(preds, torch.Tensor):
-            preds = preds.detach().cpu().numpy()
-        if isinstance(targets, torch.Tensor):
-            targets = targets.detach().cpu().numpy()
-        
-        # 统一维度：如果是 4D (N, C, H, W)，取第一个通道
-        if preds.ndim == 4:
-            preds = preds[:, 0] if preds.shape[1] > 0 else preds.squeeze()
-        if targets.ndim == 4:
-            targets = targets[:, 0] if targets.shape[1] > 0 else targets.squeeze()
-        
-        # 展平为一维数组，加速计算
-        preds_flat = preds.flatten()
-        targets_flat = (targets > 0.5).astype(np.float32).flatten()
-        
-        # 初始化狼群位置（随机分布在搜索空间内）
-        positions = np.random.uniform(self.lb, self.ub, self.num_wolves)
-        
-        # 初始化 Alpha, Beta, Delta 狼（前三名）
-        alpha_pos, alpha_score = 0.5, -float('inf')
-        beta_pos, beta_score = 0.5, -float('inf')
-        delta_pos, delta_score = 0.5, -float('inf')
-        
-        # GWO 主循环
-        for t in range(self.max_iter):
-            # 线性衰减参数 a 从 2 -> 0
-            a = 2.0 - t * (2.0 / self.max_iter)
-            
-            # 计算每只狼的适应度（Dice 分数）
-            for i in range(self.num_wolves):
-                # 边界处理：确保位置在搜索空间内
-                positions[i] = np.clip(positions[i], self.lb, self.ub)
-                
-                # 计算当前阈值的 Dice
-                score = self._calculate_dice(preds_flat, targets_flat, positions[i])
-                
-                # 更新前三名（Alpha, Beta, Delta）
-                if score > alpha_score:
-                    # 更新 Delta 和 Beta
-                    delta_score, delta_pos = beta_score, beta_pos
-                    beta_score, beta_pos = alpha_score, alpha_pos
-                    # 更新 Alpha
-                    alpha_score, alpha_pos = score, positions[i]
-                elif score > beta_score:
-                    # 更新 Delta 和 Beta
-                    delta_score, delta_pos = beta_score, beta_pos
-                    beta_score, beta_pos = score, positions[i]
-                elif score > delta_score:
-                    # 只更新 Delta
-                    delta_score, delta_pos = score, positions[i]
-            
-            # 更新每只狼的位置（基于 Alpha, Beta, Delta 的位置）
-            for i in range(self.num_wolves):
-                # Alpha 狼的影响
-                r1, r2 = np.random.random(), np.random.random()
-                A1 = 2.0 * a * r1 - a
-                C1 = 2.0 * r2
-                D_alpha = abs(C1 * alpha_pos - positions[i])
-                X1 = alpha_pos - A1 * D_alpha
-                
-                # Beta 狼的影响
-                r1, r2 = np.random.random(), np.random.random()
-                A2 = 2.0 * a * r1 - a
-                C2 = 2.0 * r2
-                D_beta = abs(C2 * beta_pos - positions[i])
-                X2 = beta_pos - A2 * D_beta
-                
-                # Delta 狼的影响
-                r1, r2 = np.random.random(), np.random.random()
-                A3 = 2.0 * a * r1 - a
-                C3 = 2.0 * r2
-                D_delta = abs(C3 * delta_pos - positions[i])
-                X3 = delta_pos - A3 * D_delta
-                
-                # 狼的位置更新为三者平均
-                positions[i] = (X1 + X2 + X3) / 3.0
-        
-        return alpha_pos, alpha_score
-    
-    def _calculate_dice(self, preds, targets, threshold):
-        """
-        快速计算给定阈值下的 Dice 系数
-        
-        Args:
-            preds: 展平的概率图（一维数组）
-            targets: 展平的真实标签（一维数组，0/1）
-            threshold: 二值化阈值
-        
-        Returns:
-            dice: Dice 系数 (float)
-        """
-        # 二值化预测
-        pred_mask = (preds > threshold).astype(np.float32)
-        
-        # 计算交集和并集
-        intersection = np.sum(pred_mask * targets)
-        union = np.sum(pred_mask) + np.sum(targets)
-        
-        # 处理空集情况
-        if union == 0:
-            return 1.0  # 两者都为空，Dice = 1.0
-        
-        # Dice = 2 * intersection / union
-        dice = (2.0 * intersection) / union
-        return float(dice)
