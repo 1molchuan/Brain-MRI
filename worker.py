@@ -2552,18 +2552,22 @@ class TrainThread(QThread):
                 return 0.5
             
             # 数据收集完成，开始GWO优化
-            self.update_progress.emit(45, "阈值优化: 数据收集完成，开始GWO优化...")
+            self.update_progress.emit(45, "阈值优化: 数据收集完成，开始GWO优化（GPU加速）...")
             
-            all_probs_np = np.concatenate(all_probs, axis=0)
-            all_masks_np = np.concatenate(all_masks, axis=0)
+            # 【GPU加速优化】保持数据在GPU上，使用torch tensor进行GWO优化
+            # 拼接所有批次的数据（保持在GPU上）
+            all_probs_tensor = torch.cat([torch.from_numpy(p).to(device) for p in all_probs], dim=0)
+            all_masks_tensor = torch.cat([torch.from_numpy(m).to(device) for m in all_masks], dim=0)
             
             # 【显存优化】删除原始列表，释放内存
             del all_probs, all_masks
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             import gc
             gc.collect()
 
-            # 【GWO优化】使用灰狼优化算法替代线性扫描，更智能地寻找最佳阈值
-            print(">>> [GWO] 灰狼群正在搜索最佳阈值...")
+            # 【GWO优化】使用灰狼优化算法替代线性扫描，更智能地寻找最佳阈值（GPU加速）
+            print(">>> [GWO] 灰狼群正在搜索最佳阈值（GPU加速）...")
             
             # 定义进度回调函数
             def gwo_progress_callback(iteration, max_iter, best_score, best_threshold):
@@ -2571,7 +2575,7 @@ class TrainThread(QThread):
                 gwo_progress = 45 + int(45 * iteration / max_iter)
                 self.update_progress.emit(
                     gwo_progress,
-                    f"阈值优化: GWO迭代 {iteration}/{max_iter} | 最佳阈值: {best_threshold:.4f} | 最佳Dice: {best_score:.4f}"
+                    f"阈值优化: GWO迭代 {iteration}/{max_iter} | 最佳阈值: {best_threshold:.4f} | 最佳Dice: {best_score:.4f} (GPU)"
                 )
             
             gwo = GreyWolfThresholdOptimizer(
@@ -2579,7 +2583,13 @@ class TrainThread(QThread):
                 max_iter=15,
                 progress_callback=gwo_progress_callback
             )
-            best_threshold, best_dice = gwo.optimize(all_probs_np, all_masks_np)
+            # 传递GPU tensor和device，启用GPU加速
+            best_threshold, best_dice = gwo.optimize(all_probs_tensor, all_masks_tensor, device=device)
+            
+            # 清理GPU tensor
+            del all_probs_tensor, all_masks_tensor
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
             # GWO优化完成
             self.update_progress.emit(90, f"阈值优化: GWO完成 | 最佳阈值: {best_threshold:.4f} | 最佳Dice: {best_dice:.4f}")

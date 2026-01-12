@@ -2056,23 +2056,41 @@ class GreyWolfThresholdOptimizer:
         self.lb = 0.1
         self.ub = 0.9
 
-    def optimize(self, preds, targets):
+    def optimize(self, preds, targets, device=None):
         """
-        使用GWO算法优化阈值
+        使用GWO算法优化阈值（GPU加速版本）
         
         Args:
-            preds: 模型输出的概率图 (N, H, W) 或 (N, C, H, W) 或 Logits
+            preds: 模型输出的概率图，可以是 torch.Tensor 或 numpy.ndarray
+                  形状为 (N, H, W) 或 (N, C, H, W)
             targets: 真实标签，形状与 preds 相同
+            device: 计算设备（如果为None，自动检测preds的设备）
             
         Returns:
             best_threshold: 最佳阈值
             best_dice: 最佳Dice分数
         """
-        # 确保数据在 CPU 且展平，加速计算
+        # 检测设备
+        use_gpu = False
         if isinstance(preds, torch.Tensor):
-            preds = preds.detach().cpu().numpy()
-        if isinstance(targets, torch.Tensor):
-            targets = targets.detach().cpu().numpy()
+            device = device or preds.device
+            use_gpu = device.type == 'cuda'
+        elif device is None:
+            use_gpu = torch.cuda.is_available()
+            device = torch.device('cuda' if use_gpu else 'cpu')
+        else:
+            device = torch.device(device)
+            use_gpu = device.type == 'cuda'
+        
+        # 转换为torch tensor并移到指定设备
+        if isinstance(preds, np.ndarray):
+            preds = torch.from_numpy(preds).float()
+        if isinstance(targets, np.ndarray):
+            targets = torch.from_numpy(targets).float()
+        
+        # 确保在正确的设备上
+        preds = preds.to(device)
+        targets = targets.to(device)
         
         # 统一维度：如果是4D，取第一个通道
         if preds.ndim == 4:
@@ -2080,12 +2098,13 @@ class GreyWolfThresholdOptimizer:
         if targets.ndim == 4:
             targets = targets[:, 0]
         
-        # 展平为一维数组，加速计算
-        preds_flat = preds.flatten()
-        targets_flat = targets.flatten()
+        # 展平为一维tensor（保持在GPU上）
+        preds_flat = preds.flatten().float()
+        targets_flat = targets.flatten().float()
         
         # 初始化狼群位置（阈值）
         positions = np.random.uniform(self.lb, self.ub, self.num_wolves)
+        positions = torch.from_numpy(positions).float().to(device)
         
         # 初始化 Alpha, Beta, Delta 狼 (前三名)
         alpha_pos, alpha_score = 0.5, -float('inf')
@@ -2096,53 +2115,65 @@ class GreyWolfThresholdOptimizer:
             # 线性衰减参数 a 从 2 -> 0
             a = 2.0 - t * (2.0 / self.max_iter)
             
-            # 计算每只狼的适应度（Dice分数）
+            # 【GPU加速】批量计算所有狼的适应度（Dice分数）
+            # 边界处理
+            positions = torch.clamp(positions, self.lb, self.ub)
+            
+            # 向量化计算所有狼的Dice（一次性计算，而不是循环）
+            scores = self._calculate_dice_batch(preds_flat, targets_flat, positions)
+            
+            # 转换为numpy以便更新前三名（CPU操作，很快）
+            scores_np = scores.cpu().numpy()
+            positions_np = positions.cpu().numpy()
+            
+            # 更新前三名（Alpha, Beta, Delta）
             for i in range(self.num_wolves):
-                # 边界处理
-                positions[i] = np.clip(positions[i], self.lb, self.ub)
+                score = float(scores_np[i])
+                pos = float(positions_np[i])
                 
-                # 计算当前阈值的 Dice
-                score = self._calculate_dice(preds_flat, targets_flat, positions[i])
-                
-                # 更新前三名（Alpha, Beta, Delta）
                 if score > alpha_score:
                     # 更新 Alpha，原 Alpha 降为 Beta，原 Beta 降为 Delta
                     delta_score, delta_pos = beta_score, beta_pos
                     beta_score, beta_pos = alpha_score, alpha_pos
-                    alpha_score, alpha_pos = score, positions[i]
+                    alpha_score, alpha_pos = score, pos
                 elif score > beta_score:
                     # 更新 Beta，原 Beta 降为 Delta
                     delta_score, delta_pos = beta_score, beta_pos
-                    beta_score, beta_pos = score, positions[i]
+                    beta_score, beta_pos = score, pos
                 elif score > delta_score:
                     # 更新 Delta
-                    delta_score, delta_pos = score, positions[i]
+                    delta_score, delta_pos = score, pos
             
             # 更新每只狼的位置（基于 Alpha, Beta, Delta 的位置）
-            for i in range(self.num_wolves):
-                # 计算与 Alpha 的距离和位置
-                r1, r2 = np.random.random(), np.random.random()
-                A1 = 2.0 * a * r1 - a
-                C1 = 2.0 * r2
-                D_alpha = abs(C1 * alpha_pos - positions[i])
-                X1 = alpha_pos - A1 * D_alpha
-                
-                # 计算与 Beta 的距离和位置
-                r1, r2 = np.random.random(), np.random.random()
-                A2 = 2.0 * a * r1 - a
-                C2 = 2.0 * r2
-                D_beta = abs(C2 * beta_pos - positions[i])
-                X2 = beta_pos - A2 * D_beta
-                
-                # 计算与 Delta 的距离和位置
-                r1, r2 = np.random.random(), np.random.random()
-                A3 = 2.0 * a * r1 - a
-                C3 = 2.0 * r2
-                D_delta = abs(C3 * delta_pos - positions[i])
-                X3 = delta_pos - A3 * D_delta
-                
-                # 狼的位置更新为三者平均
-                positions[i] = (X1 + X2 + X3) / 3.0
+            # 在GPU上批量计算位置更新
+            alpha_pos_tensor = torch.tensor(alpha_pos, device=device)
+            beta_pos_tensor = torch.tensor(beta_pos, device=device)
+            delta_pos_tensor = torch.tensor(delta_pos, device=device)
+            
+            # 生成随机数（在GPU上）
+            r1 = torch.rand(self.num_wolves, device=device)
+            r2 = torch.rand(self.num_wolves, device=device)
+            A1 = 2.0 * a * r1 - a
+            C1 = 2.0 * r2
+            D_alpha = torch.abs(C1 * alpha_pos_tensor - positions)
+            X1 = alpha_pos_tensor - A1 * D_alpha
+            
+            r1 = torch.rand(self.num_wolves, device=device)
+            r2 = torch.rand(self.num_wolves, device=device)
+            A2 = 2.0 * a * r1 - a
+            C2 = 2.0 * r2
+            D_beta = torch.abs(C2 * beta_pos_tensor - positions)
+            X2 = beta_pos_tensor - A2 * D_beta
+            
+            r1 = torch.rand(self.num_wolves, device=device)
+            r2 = torch.rand(self.num_wolves, device=device)
+            A3 = 2.0 * a * r1 - a
+            C3 = 2.0 * r2
+            D_delta = torch.abs(C3 * delta_pos_tensor - positions)
+            X3 = delta_pos_tensor - A3 * D_delta
+            
+            # 狼的位置更新为三者平均
+            positions = (X1 + X2 + X3) / 3.0
             
             # 调用进度回调函数（如果提供）
             if self.progress_callback is not None:
@@ -2151,12 +2182,12 @@ class GreyWolfThresholdOptimizer:
                 except Exception as e:
                     # 如果回调函数出错，不影响优化过程
                     pass
-                
+        
         return alpha_pos, alpha_score
 
     def _calculate_dice(self, preds, targets, threshold):
         """
-        快速计算 Dice 系数
+        快速计算 Dice 系数（CPU版本，用于兼容性）
         
         Args:
             preds: 展平的概率图（一维数组）
@@ -2180,6 +2211,48 @@ class GreyWolfThresholdOptimizer:
         
         # Dice = 2 * intersection / union
         return (2.0 * intersection) / union
+    
+    def _calculate_dice_batch(self, preds_flat, targets_flat, thresholds):
+        """
+        GPU加速：批量计算多个阈值的Dice系数
+        
+        Args:
+            preds_flat: 展平的概率图（一维tensor，在GPU上）
+            targets_flat: 展平的真实标签（一维tensor，在GPU上）
+            thresholds: 阈值tensor（一维tensor，形状为[num_wolves]，在GPU上）
+            
+        Returns:
+            dice_scores: Dice分数tensor（一维tensor，形状为[num_wolves]，在GPU上）
+        """
+        # 扩展维度以便批量计算
+        # preds_flat: [N], thresholds: [M] -> preds_expanded: [M, N]
+        num_wolves = thresholds.shape[0]
+        preds_expanded = preds_flat.unsqueeze(0).expand(num_wolves, -1)  # [M, N]
+        thresholds_expanded = thresholds.unsqueeze(1)  # [M, 1]
+        targets_expanded = targets_flat.unsqueeze(0).expand(num_wolves, -1).float()  # [M, N]
+        
+        # 批量二值化：preds >= threshold for each threshold
+        pred_masks = (preds_expanded >= thresholds_expanded).float()  # [M, N]
+        
+        # 批量计算交集和并集
+        intersections = (pred_masks * targets_expanded).sum(dim=1)  # [M]
+        pred_sums = pred_masks.sum(dim=1)  # [M]
+        target_sum = targets_expanded.sum(dim=1)  # [M] - 每个阈值对应的target sum（实际上都相同）
+        
+        # 批量计算Dice
+        unions = pred_sums + target_sum  # [M]
+        
+        # 避免除零（使用smooth项）
+        smooth = 1e-7
+        dice_scores = (2.0 * intersections + smooth) / (unions + smooth)
+        
+        # 处理特殊情况：如果union为0，根据intersection判断
+        zero_union_mask = unions < smooth
+        zero_intersection_mask = intersections < smooth
+        dice_scores[zero_union_mask & zero_intersection_mask] = 1.0  # 两者都为0，Dice=1
+        dice_scores[zero_union_mask & ~zero_intersection_mask] = 0.0  # union=0但intersection>0，Dice=0
+        
+        return dice_scores
 
 
 def scan_best_threshold(prob_maps, gt_masks):
