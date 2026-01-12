@@ -117,6 +117,7 @@ from models import *
 from utils import (
     EarlyStopping,
     scan_best_threshold,
+    GreyWolfThresholdOptimizer,  # 【GWO】引入灰狼优化器
     save_mat_file,
     MatlabVisualizationBridge,
     MatlabEngineSession,
@@ -2323,9 +2324,9 @@ class TrainThread(QThread):
         # 跟踪训练历史
         self.train_loss_history = []
         self.val_loss_history = []
-        self.val_dice_history = []
-        self.val_dice_pos_history = []  # 仅统计有前景mask样本的Dice
-        self.val_dice_neg_history = []  # 仅统计空mask样本的Dice
+        self.val_dice_history = []  # 统计所有验证样本的平均Dice（包括空mask样本），用于最佳模型选择
+        self.val_dice_pos_history = []  # 仅统计有前景mask样本的Dice（用于诊断）
+        self.val_dice_neg_history = []  # 仅统计空mask样本的Dice（用于诊断）
         # 增加深度监督权重,提升多尺度特征学习
         self.aux_loss_weights = [0.3, 0.2, 0.1]  # 从[0.2,0.1,0.05]提升
         self.split_metadata: Dict[str, Dict[str, List[str]]] = {}
@@ -2547,10 +2548,47 @@ class TrainThread(QThread):
             import gc
             gc.collect()
 
-            best_threshold, best_metrics = scan_best_threshold(all_probs_np, all_masks_np)
+            # 【GWO优化】使用灰狼优化算法替代线性扫描，更智能地寻找最佳阈值
+            print(">>> [GWO] 灰狼群正在搜索最佳阈值...")
+            gwo = GreyWolfThresholdOptimizer(num_wolves=10, max_iter=15)
+            best_threshold, best_dice = gwo.optimize(all_probs_np, all_masks_np)
+            
+            # 为了兼容性，计算完整的指标字典（使用找到的最佳阈值）
+            # 使用 scan_best_threshold 计算完整指标，但只使用我们找到的阈值
+            pred_bool = (all_probs_np >= best_threshold)
+            gt_bool = (all_masks_np > 0.5)
+            
+            # 混淆矩阵统计
+            tp = np.logical_and(pred_bool, gt_bool).sum()
+            fp = np.logical_and(pred_bool, ~gt_bool).sum()
+            fn = np.logical_and(~pred_bool, gt_bool).sum()
+            tn = np.logical_and(~pred_bool, ~gt_bool).sum()
+            
+            # 计算完整指标
+            dice_den = 2.0 * tp + fp + fn
+            dice = 1.0 if dice_den < 1e-7 else (2.0 * tp) / (dice_den + 1e-7)
+            iou_den = tp + fp + fn
+            iou = 1.0 if iou_den < 1e-7 else tp / (iou_den + 1e-7)
+            prec_den = tp + fp
+            precision = 1.0 if prec_den < 1e-7 else tp / (prec_den + 1e-7)
+            rec_den = tp + fn
+            recall = 1.0 if rec_den < 1e-7 else tp / (rec_den + 1e-7)
+            spec_den = tn + fp
+            specificity = 1.0 if spec_den < 1e-7 else tn / (spec_den + 1e-7)
+            
+            best_metrics = {
+                'dice': float(dice),
+                'iou': float(iou),
+                'precision': float(precision),
+                'recall': float(recall),
+                'specificity': float(specificity),
+                'score': float(best_dice)  # 使用 GWO 找到的最佳 Dice 作为综合评分
+            }
+            
+            print(f">>> [GWO] 搜索完成! 最佳阈值: {best_threshold:.4f}, 最佳 Dice: {best_dice:.4f}")
             
             # 【显存优化】删除拼接后的数组
-            del all_probs_np, all_masks_np
+            del all_probs_np, all_masks_np, pred_bool, gt_bool
             gc.collect()
 
         sample_info = "全部验证集" if use_all_samples else f"{num_samples}个批次"
@@ -3980,6 +4018,30 @@ class TrainThread(QThread):
 
     def run(self):
         try:
+            # 【Bug修复】清空训练历史记录，防止图表数据重叠
+            # 策略：每次开始训练时都清空历史记录，确保图表从第1轮开始绘制
+            # 如果历史记录列表不为空，说明可能是上次训练留下的数据，应该清空
+            # 注意：当前实现不支持从checkpoint恢复历史记录，如果需要断点续训并恢复历史，
+            # 可以在后续添加从checkpoint读取历史数据的逻辑
+            has_existing_history = (
+                len(self.train_loss_history) > 0 or 
+                len(self.val_loss_history) > 0 or 
+                len(self.val_dice_history) > 0
+            )
+            
+            if has_existing_history:
+                print("[训练历史] 检测到残留的历史记录，已清空（防止图表数据重叠）")
+            
+            # 清空所有历史记录列表，确保每次训练都从第1轮开始
+            self.train_loss_history = []
+            self.val_loss_history = []
+            self.val_dice_history = []
+            self.val_dice_pos_history = []
+            self.val_dice_neg_history = []
+            
+            if not has_existing_history:
+                print("[训练历史] 开始新训练，历史记录已初始化")
+            
             # 初始化设备
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             self.update_progress.emit(0, f"使用设备: {device}")
@@ -4367,8 +4429,8 @@ class TrainThread(QThread):
                     decoder_params = list(model.parameters())
                 
                 if encoder_params and decoder_params:
-                    # 参数分组：encoder使用initial_lr，decoder使用10倍LR
-                    decoder_lr = initial_lr * 10.0
+                    # 参数分组：encoder和decoder使用相同学习率（修正：移除10倍倍率，避免训练初期震荡）
+                    decoder_lr = initial_lr
                     print(f"[差异化学习率] Encoder LR: {initial_lr:.2e}, Decoder LR: {decoder_lr:.2e}")
                     optimizer = self._create_optimizer_with_groups(
                         [
@@ -4384,10 +4446,9 @@ class TrainThread(QThread):
                 # 非SMP U-Net++模型，使用统一学习率
                 optimizer = self._create_optimizer(model.parameters(), lr=initial_lr)
             
-            # 增强前景权重以处理类别不平衡
-            adjusted_pos_weight = min(train_pos_weight * 1.5, 20.0)
-            bce_weight_tensor = torch.tensor([adjusted_pos_weight], device=device)
-            bce_criterion = nn.BCEWithLogitsLoss(pos_weight=bce_weight_tensor)
+            # 【简化】移除 pos_weight，使用标准 BCEWithLogitsLoss
+            # Dice Loss 本身就能很好地处理类别不平衡，额外的 pos_weight 会导致严重的假阳性
+            bce_criterion = nn.BCEWithLogitsLoss()
 
             # Poly学习率 + Warmup: lr = base_lr * (1 - epoch / max_epochs) ** power
             warmup_epochs_lr = 5
@@ -4617,20 +4678,25 @@ class TrainThread(QThread):
                             # 【DeepLabV3+ 兼容性】检查模型类型，DeepLabV3+ 的 forward 不支持 return_attention
                             is_deeplabv3 = self.model_type in ("deeplabv3plus", "smp_deeplabv3plus")
                             
-                            # 【显存优化】训练阶段禁用注意力图生成，避免显存溢出
-                            # 仅在验证/可视化阶段（model.eval()）生成注意力图
+                            # 【显存优化】训练阶段彻底禁用注意力图生成，避免显存溢出
+                            # 训练和验证阶段都不生成注意力热力图，仅在测试阶段（ModelTestThread）生成
                             need_attention = False  # 训练阶段强制禁用，避免 OOM
                         
-                        # 如果是 DeepLabV3+ 且需要 attention，先移除 return_attention 参数，避免崩溃
+                        # 【显存优化】训练阶段不传递 return_attention 参数，彻底禁用注意力图生成
                         forward_kwargs = {}
                         if supports_aux:
                             forward_kwargs['return_aux'] = True
-                        if supports_attention:
-                            forward_kwargs['return_attention'] = True
+                        # 训练阶段不传递 return_attention，即使模型支持也不生成注意力图
+                        # if supports_attention:
+                        #     forward_kwargs['return_attention'] = True
                         
                         # 【紧急修复】DeepLabV3+ 不支持 return_attention，必须在调用前移除
                         # 无论 need_attention 是否为 True，都要移除，因为 DeepLabV3+ 的 forward 方法不支持此参数
                         if is_deeplabv3 and "return_attention" in forward_kwargs:
+                            forward_kwargs.pop("return_attention")
+                        
+                        # 【显存优化】确保训练阶段不生成任何注意力图
+                        if "return_attention" in forward_kwargs:
                             forward_kwargs.pop("return_attention")
                         
                         # 执行正常的前向传播（用于计算 Loss 和指标）
@@ -4645,25 +4711,10 @@ class TrainThread(QThread):
                             outputs = model(images)
                             aux_outputs = []
                         
-                        # 【显存优化】训练循环中禁用 Grad-CAM，避免显存溢出
-                        # Grad-CAM 需要额外的显存来存储梯度，在训练时会导致 OOM
-                        # 仅在验证/可视化阶段（model.eval()）生成 Grad-CAM 热力图
-                        attention_maps = {}
-                        # 【紧急修复】训练阶段（model.train()）完全禁用 Grad-CAM，避免 CUDA OOM
-                        # if is_deeplabv3 and need_attention and images.shape[0] > 0:
-                        #     # 获取未包装的模型（用于 Grad-CAM）
-                        #     actual_model = self._unwrap_model(model)
-                        #     attention_maps = self._generate_gradcam_for_deeplabv3(actual_model, images, device)
-                        if not is_deeplabv3 and supports_attention:
-                            # 其他模型使用原生注意力图
-                            if forward_kwargs and 'return_attention' in forward_kwargs:
-                                # 如果 forward 返回了注意力图，提取它
-                                if isinstance(forward_out, tuple) and len(forward_out) == 2:
-                                    outputs, attention_maps = forward_out
-                                elif isinstance(forward_out, tuple) and len(forward_out) == 3:
-                                    outputs, aux_outputs, attention_maps = forward_out
-                            else:
-                                attention_maps = {}
+                        # 【显存优化】训练阶段彻底禁用所有注意力图生成，避免显存溢出
+                        # 训练和验证阶段都不生成注意力热力图（Grad-CAM 或原生注意力图）
+                        # 仅在测试阶段（ModelTestThread）生成注意力热力图用于最终分析
+                        attention_maps = {}  # 始终为空字典，不生成任何注意力图
                         if brain_mask is not None:
                             outputs = outputs * brain_mask
 
@@ -5163,7 +5214,10 @@ class TrainThread(QThread):
                         # 更新验证进度
                         val_progress = int(100 * (val_idx + 1) / len(val_loader))
                         current_avg_loss = val_loss / max(1, val_samples)
-                        current_avg_dice = val_dice / max(1, val_samples)
+                        # 计算当前批次的所有样本平均 Dice（用于最佳模型选择）
+                        val_current_total_count = val_non_empty_mask_count + val_empty_mask_count
+                        val_current_total_dice_sum = val_non_empty_mask_dice_sum + val_empty_mask_dice_sum
+                        current_avg_dice = val_current_total_dice_sum / max(1, val_current_total_count)
                         # 计算当前批次的 Dice_Pos 和 Dice_Neg（用于进度显示）
                         current_dice_pos = val_non_empty_mask_dice_sum / max(1, val_non_empty_mask_count) if val_non_empty_mask_count > 0 else 0.0
                         current_dice_neg = val_empty_mask_dice_sum / max(1, val_empty_mask_count) if val_empty_mask_count > 0 else 0.0
@@ -5171,7 +5225,7 @@ class TrainThread(QThread):
                         self.update_val_progress.emit(
                             val_progress,
                             f"验证轮次 {epoch+1} | 批次 {val_idx+1}/{len(val_loader)}\n"
-                            f"损失: {current_avg_loss:.4f} | Dice_Pos: {current_dice_pos:.4f} | Dice_Neg: {current_dice_neg:.4f} | 整体Dice: {current_avg_dice:.4f}"
+                            f"损失: {current_avg_loss:.4f} | Dice_Pos: {current_dice_pos:.4f} | Dice_Neg: {current_dice_neg:.4f} | 整体Dice(所有样本): {current_avg_dice:.4f}"
                         )
                         
                         # 每5个批次强制更新UI
@@ -5196,14 +5250,17 @@ class TrainThread(QThread):
                     print(f"[警告] Epoch {epoch+1}: 训练平均损失为NaN/Inf，使用0.0")
                     avg_train_loss = 0.0
                 
-                # 【关键修复】val_dice 和 val_iou 只统计前景类（有前景mask的样本）
-                # 在医学分割中，我们不应该计算背景类的 Dice，因为背景往往占据绝大部分，
-                # 会掩盖模型在前景上的真实性能。空mask样本应该被忽略或单独处理。
-                if val_non_empty_mask_count > 0:
-                    val_dice = val_non_empty_mask_dice_sum / val_non_empty_mask_count
-                    val_iou = val_non_empty_mask_iou_sum / val_non_empty_mask_count
+                # 【修改】val_dice 和 val_iou 统计所有验证样本（包括空mask样本）
+                # 使用所有样本的平均 Dice 来选择最佳模型，确保模型在所有场景下都有良好表现
+                val_total_count = val_non_empty_mask_count + val_empty_mask_count
+                val_total_dice_sum = val_non_empty_mask_dice_sum + val_empty_mask_dice_sum
+                val_total_iou_sum = val_non_empty_mask_iou_sum + val_empty_mask_iou_sum
+                
+                if val_total_count > 0:
+                    val_dice = val_total_dice_sum / val_total_count
+                    val_iou = val_total_iou_sum / val_total_count
                 else:
-                    # 如果没有有前景的样本，使用0.0（而不是NaN）
+                    # 如果没有样本，使用0.0（而不是NaN）
                     val_dice = 0.0
                     val_iou = 0.0
                 
@@ -5234,25 +5291,33 @@ class TrainThread(QThread):
                 pred_fg_ratio = val_pred_fg_pixels / max(1.0, val_total_pixels)
                 gt_fg_ratio = val_gt_fg_pixels / max(1.0, val_total_pixels)
                 
-                # 【关键修改】分别统计有前景mask和空mask的Dice/IoU（仅用于诊断）
-                # 注意：val_dice 和 val_iou 现在只统计前景类（已在上面计算）
+                # 【关键修改】分别统计有前景mask和空mask的Dice/IoU（用于诊断和详细分析）
+                # 注意：val_dice 和 val_iou 现在统计所有样本（包括空mask样本），用于最佳模型选择
                 dice_pos = val_non_empty_mask_dice_sum / max(1, val_non_empty_mask_count) if val_non_empty_mask_count > 0 else 0.0
                 dice_neg = val_empty_mask_dice_sum / max(1, val_empty_mask_count) if val_empty_mask_count > 0 else 0.0
                 iou_pos = val_non_empty_mask_iou_sum / max(1, val_non_empty_mask_count) if val_non_empty_mask_count > 0 else 0.0
                 iou_neg = val_empty_mask_iou_sum / max(1, val_empty_mask_count) if val_empty_mask_count > 0 else 0.0
                 empty_mask_ratio = val_empty_mask_count / max(1, val_samples) if val_samples > 0 else 0.0
                 
-                # 记录到历史中（只记录前景类的Dice）
-                self.val_dice_pos_history.append(dice_pos)
-                self.val_dice_neg_history.append(dice_neg)  # 保留用于诊断，但不用于主要评估
+                # 记录到历史中（记录所有样本的平均Dice，用于最佳模型选择）
+                val_total_count = val_non_empty_mask_count + val_empty_mask_count
+                val_total_dice = val_dice  # 已经在上面计算为所有样本的平均Dice
+                # 【修复】val_dice_history 已在下方"更新训练历史"部分统一添加，此处不再重复添加
+                self.val_dice_pos_history.append(dice_pos)  # 保留用于诊断
+                self.val_dice_neg_history.append(dice_neg)  # 保留用于诊断
                 
-                # 【统一标准】所有日志输出都只报告前景类的 Dice 和 IoU
+                # 【统一标准】日志输出显示所有样本的平均 Dice 和 IoU（用于最佳模型选择）
+                # 同时显示前景类和空mask类的分别统计（用于诊断）
                 # 注意：验证统计使用全部验证集 + 后处理，用于主要评估和早停判断
                 print(
                     f"[验证统计] Epoch {epoch+1}: threshold={val_threshold:.3f}, "
                     f"pred_fg_ratio={pred_fg_ratio:.4f}, gt_fg_ratio={gt_fg_ratio:.4f}, "
-                    f"Dice(前景类)={val_dice:.4f}, IoU(前景类)={val_iou:.4f} "
+                    f"Dice(所有样本)={val_dice:.4f}, IoU(所有样本)={val_iou:.4f} "
                     f"(基于全部验证集{val_samples}个样本，使用后处理)"
+                )
+                print(
+                    f"[详细分析] Dice(前景类)={dice_pos:.4f}, Dice(空mask)={dice_neg:.4f}, "
+                    f"IoU(前景类)={iou_pos:.4f}, IoU(空mask)={iou_neg:.4f}"
                 )
                 print(
                     f"[样本分布] "
@@ -5350,9 +5415,7 @@ class TrainThread(QThread):
                     'precision': [],
                     'recall': [],
                     'sensitivity': [],
-                    'specificity': [],
-                    'f1': [],
-                    'hd95': []
+                    'f1': []
                 }
                 
                 with torch.no_grad():
@@ -5448,22 +5511,14 @@ class TrainThread(QThread):
                                 else:
                                     recall = tp / (tp + fn)
                                 
-                                specificity = 1.0 if (tn + fp) < 1e-7 else tn / (tn + fp)
-                                
                                 f1 = dice  # 二分类下F1=Dice
-                                hd95 = calculate_hd95(
-                                    pred.cpu().numpy(),
-                                    mask.cpu().numpy()
-                                )
                                 
                                 epoch_metrics['dice'].append(float(dice))
                                 epoch_metrics['iou'].append(float(iou))
                                 epoch_metrics['precision'].append(float(precision))
                                 epoch_metrics['recall'].append(float(recall))
                                 epoch_metrics['sensitivity'].append(float(recall))
-                                epoch_metrics['specificity'].append(float(specificity))
                                 epoch_metrics['f1'].append(float(f1))
-                                epoch_metrics['hd95'].append(hd95)
                             
                             eval_count += 1
                         
@@ -5491,33 +5546,17 @@ class TrainThread(QThread):
                     else:
                         avg_epoch_metrics[k] = float(np.nanmean(arr))
 
-                # 基于当前阈值的平均指标，计算综合评分
-                hd95_mean = avg_epoch_metrics.get('hd95', float('inf'))
-                total_score = calculate_custom_score(
-                    dice=avg_epoch_metrics.get('dice', 0.0),
-                    iou=avg_epoch_metrics.get('iou', 0.0),
-                    precision=avg_epoch_metrics.get('precision', 0.0),
-                    recall=avg_epoch_metrics.get('recall', 0.0),
-                    specificity=avg_epoch_metrics.get('specificity', 0.0),
-                    hd95=hd95_mean,
-                )
-                avg_epoch_metrics['score'] = float(total_score)
-
-                # 格式化 HD95（处理 NaN/Inf 情况）
-                hd95_str = f"{hd95_mean:.4f}" if np.isfinite(hd95_mean) else "nan"
+                # 【简化】验证阶段只关注Dice和IoU，不再计算TotalScore
                 # 计算实际评估的样本数量
                 actual_eval_samples = len(epoch_metrics.get('dice', []))
                 # 【统一标准】验证评分中的 Dice 和 IoU 只统计前景类（有前景mask的样本）
                 # 注意：验证评分使用部分样本（最多20个）+ 后处理，与验证统计的主要差异是样本数量
                 print(
                     f"[验证评分] Epoch {epoch+1}: threshold={val_threshold:.3f}, "
-                    f"TotalScore={total_score:.4f}, "
                     f"Dice(前景类)={avg_epoch_metrics.get('dice', float('nan')):.4f}, "
                     f"IoU(前景类)={avg_epoch_metrics.get('iou', float('nan')):.4f}, "
                     f"Precision={avg_epoch_metrics.get('precision', float('nan')):.4f}, "
-                    f"Recall={avg_epoch_metrics.get('recall', float('nan')):.4f}, "
-                    f"Specificity={avg_epoch_metrics.get('specificity', float('nan')):.4f}, "
-                    f"HD95={hd95_str} "
+                    f"Recall={avg_epoch_metrics.get('recall', float('nan')):.4f} "
                     f"(基于{actual_eval_samples}个有前景样本，使用后处理)"
                 )
                 
@@ -5940,26 +5979,27 @@ class TrainThread(QThread):
             self.update_progress.emit(98, "生成性能分析报告...")
             perf_analysis_path = self.generate_performance_analysis(detailed_metrics)
             
-            # 生成注意力可视化用于可解释性分析（若模型支持）- 使用TTA
-            if self._supports_attention_maps(eval_model):
-                self.update_progress.emit(99, "生成注意力可解释性分析（TTA）...")
-                # 注意：visualize_attention_maps 内部会使用 return_attention，TTA可能不支持，保持原样
-                attention_viz_path = self.visualize_attention_maps(eval_model, val_loader, device, num_samples=4)
-                attention_stats = self.analyze_attention_statistics(eval_model, val_loader, device, num_samples=20)
-            else:
-                self.update_progress.emit(99, "当前模型不支持注意力可视化，跳过该步骤。")
-                attention_viz_path = ""
-                attention_stats = {}
+            # 【显存优化】彻底禁用训练和验证阶段的注意力热力图生成，防止 CUDA OOM
+            # 注意力热力图生成需要大量显存（Grad-CAM 需要反向传播），在训练和验证阶段禁用
+            # 仅在测试阶段（ModelTestThread）生成注意力热力图用于最终分析
+            self.update_progress.emit(99, "注意力可视化已禁用（训练/验证阶段，防止 CUDA OOM）")
+            attention_viz_path = ""
+            attention_stats = {}
             
             # 发送测试结果信号，包含性能分析路径
             self.test_results_ready.emit(test_viz_path, detailed_metrics)
             self.visualization_ready.emit(perf_analysis_path)  # 同时发送性能分析
             
-            # 【关键修复】如果 attention_stats 为 None（Grad-CAM 失败），使用空字典代替
-            # 避免 TypeError: argument 2 has unexpected type 'NoneType'
+            # 【显存优化】训练和验证阶段已禁用注意力热力图生成，发送空信号
+            # 仅在测试阶段（ModelTestThread）生成注意力热力图用于最终分析
             if attention_stats is None:
                 attention_stats = {}
-            self.attention_analysis_ready.emit(attention_viz_path, attention_stats)  # 发送注意力分析
+            # 如果 attention_viz_path 为空，说明未生成注意力热力图（训练/验证阶段）
+            if attention_viz_path:
+                self.attention_analysis_ready.emit(attention_viz_path, attention_stats)
+            else:
+                # 训练/验证阶段不发送注意力分析信号，避免下游处理错误
+                pass
             
             # 训练完成
             fallback_dice = self.val_dice_history[-1] if self.val_dice_history else 0.0
@@ -6839,44 +6879,24 @@ class TrainThread(QThread):
     
     def _get_loss_weights(self, epoch: int, total_epochs: int) -> Dict[str, float]:
         """
-        修复过度自信问题的损失权重策略
+        【极简配置】回归稳健的基准配置：50% BCE + 50% Dice
         
-        【关键修复】：
-        1. BCE权重必须保持在0.4-0.5以上，以有效约束假阳性，防止过度自信
-        2. Dice权重降低到0.3-0.4，避免模型过度关注Dice而忽略BCE约束
-        3. 增加Focal Loss权重，帮助抑制假阳性
+        这是医学分割的黄金标准组合，先跑通这个，再考虑加其他的。
         """
-        progress = epoch / max(1, total_epochs - 1)
-        # 【修复】早期：BCE和Dice平衡；后期：BCE权重保持较高，防止过度自信
+        # 极简 Loss 组合：只使用 BCE 和 Dice，各占 50%
         weights = {
-            # 【关键修复】BCE权重必须保持在0.4以上，以有效约束假阳性
-            # 早期0.5帮助收敛，后期0.4保持约束力，防止最佳阈值过高（如0.96）
-            'bce': 0.50 - 0.10 * progress,           # 0.50 -> 0.40 (保持较高权重)
-            # 【修复】Dice权重降低，避免过度自信
-            # 早期0.35，后期0.30，不再占据主导地位
-            'dice': 0.35 - 0.05 * progress,          # 0.35 -> 0.30 (降低权重)
-            # Tversky 权重降低，避免与Dice叠加导致过度自信
-            'tversky': 0.15 + 0.05 * progress,       # 0.15 -> 0.20 (适度增加)
-            # Focal Tversky 保持较低权重
-            'tversky_focal': 0.05 + 0.05 * progress,  # 0.05 -> 0.10
-            # 边界损失保持较低，防止过度关注细小噪声
-            'boundary': 0.05,
-            # Hausdorff 距离损失：训练前30%关闭，之后渐进开启
-            'hausdorff': 0.05 * max((progress - 0.3) / 0.7, 0.0),
-            # 【修复】Focal Loss权重提升，帮助抑制假阳性（gamma=2.0已配置）
-            # 早期0.10，后期0.08，保持对难样本的关注
-            'focal': 0.10 - 0.02 * progress,         # 0.10 -> 0.08 (保持较高权重)
-            # Lovasz 保持较低权重
-            'lovasz': 0.05 + 0.05 * progress,        # 0.05 -> 0.10
-            # 假阴性惩罚保持适中
-            'fn_penalty': 0.05 + 0.05 * progress,    # 0.05 -> 0.10
-            # 【修复】假阳性惩罚权重提升，加强对假阳性的约束
-            # 早期0.15，后期0.12，保持对假阳性的惩罚
-            'fp_penalty': 0.15 - 0.03 * progress,     # 0.15 -> 0.12 (保持较高权重)
+            'bce': 0.5,
+            'dice': 0.5,
+            'focal': 0.0,
+            'tversky': 0.0,
+            'tversky_focal': 0.0,
+            'boundary': 0.0,
+            'hausdorff': 0.0,
+            'lovasz': 0.0,
+            'fn_penalty': 0.0,
+            'fp_penalty': 0.0,
         }
-        total = sum(weights.values())
-        for k in weights:
-            weights[k] /= total
+        # 不需要归一化，因为总和已经是 1.0
         return weights
     
     def _init_ema_model(self, model, device):
@@ -8772,7 +8792,7 @@ class TrainThread(QThread):
         if binary.sum() == 0:
             return pred_mask
         
-        # 连通域标记，并使用概率图作为 intensity_image，以便计算 mean_intensity
+        # 连通域标记，并使用概率图作为 intensity_image，以便计算 mean_intensity / max_intensity
         labels = measure.label(binary, connectivity=1)
         regions = measure.regionprops(labels, intensity_image=probs_np.astype(np.float32))
         
@@ -8781,6 +8801,8 @@ class TrainThread(QThread):
         for region in regions:
             area = region.area
             mean_prob = float(region.mean_intensity) if hasattr(region, "mean_intensity") else 0.0
+            # 获取区域内的最大概率（如果不可用则回退为 mean_prob）
+            max_prob = float(region.max_intensity) if hasattr(region, "max_intensity") else mean_prob
             
             # Level 1: 极小区域（<= tiny_size_thresh）视为绝对噪音，直接跳过
             if area <= tiny_size_thresh:
@@ -8791,8 +8813,9 @@ class TrainThread(QThread):
                 cleaned[labels == region.label] = 1
                 continue
             
-            # Level 3: 3~19 像素之间，依据平均概率判断
-            if small_min_size <= area <= small_max_size and mean_prob > prob_threshold:
+            # Level 3: 3~19 像素之间，依据平均概率 / 最大概率判断
+            # 修改为：平均概率达标 或 最大概率极高(>0.9) 时保留
+            if small_min_size <= area <= small_max_size and (mean_prob > prob_threshold or max_prob > 0.9):
                 cleaned[labels == region.label] = 1
                 continue
             # 否则视为噪声，不写入 cleaned
@@ -8886,7 +8909,8 @@ class TrainThread(QThread):
         
         # 2. 形态学闭操作 - 进一步填充小孔洞和缝隙
         if use_morphology:
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            # 核大小从 (5, 5) 调整为 (3, 3)，减弱闭操作，避免不同病灶被误连
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
             pred_binary = cv2.morphologyEx(pred_binary, cv2.MORPH_CLOSE, kernel)
             # 形态学开操作（可选）- 去除小噪点/毛刺
             if enable_opening:

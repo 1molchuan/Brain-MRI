@@ -166,6 +166,10 @@ class MedicalSegmentationApp(QMainWindow):
         self.resnet_model_path = None
         self.data_dir = None
         self.output_dir = None
+        
+        # 【Bug修复】图表防抖去重：记录上一次绘制的轮次，防止重复绘制
+        self.last_plotted_epoch = -1
+        self.epoch_history = []  # 存储真实的epoch值，用于X轴
 
         self.train_thread = None
         self.predict_thread = None
@@ -3609,6 +3613,22 @@ class MedicalSegmentationApp(QMainWindow):
             QMessageBox.warning(self, "警告", "请先选择数据目录")
             return
         
+        # 【Bug修复】清空图表，确保每次训练都从空白图表开始
+        if hasattr(self, 'dice_ax'):
+            self.dice_ax.clear()
+            self.dice_ax.set_xlabel('训练轮次', fontsize=11, fontweight='bold')
+            self.dice_ax.set_ylabel('Dice系数', fontsize=11, fontweight='bold')
+            self.dice_ax.set_title('训练过程中Dice系数的变化', fontsize=12, fontweight='bold', pad=15)
+            self.dice_ax.grid(True, alpha=0.3, linestyle='--')
+            self.dice_ax.set_ylim([0, 1])
+            self.dice_ax.set_xlim([0, 10])
+            if hasattr(self, 'dice_canvas'):
+                self.dice_canvas.draw()
+        
+        # 【Bug修复】重置图表防抖状态，确保每次新训练都从第1轮开始
+        self.last_plotted_epoch = -1
+        self.epoch_history = []
+        
         self.train_btn.setEnabled(False)
         self.stop_train_btn.setEnabled(True)
         self.train_progress.setValue(0)
@@ -3656,17 +3676,38 @@ class MedicalSegmentationApp(QMainWindow):
             )
             print(">>> [DEBUG] TrainThread 实例化成功")
             
-            # 连接所有信号
+            # 【Bug修复】防止信号重复连接导致数据重复显示
+            # 在连接新信号之前，先断开旧线程的所有信号连接（如果存在）
+            old_thread = getattr(self, 'train_thread', None)
+            if old_thread is not None:
+                try:
+                    # 断开旧线程的所有信号连接
+                    old_thread.update_progress.disconnect()
+                    old_thread.update_val_progress.disconnect()
+                    old_thread.training_finished.disconnect()
+                    old_thread.model_saved.disconnect()
+                    old_thread.epoch_completed.disconnect()
+                    old_thread.test_results_ready.disconnect()
+                    old_thread.metrics_ready.disconnect()
+                    old_thread.visualization_ready.disconnect()
+                    old_thread.epoch_analysis_ready.disconnect()
+                    old_thread.attention_analysis_ready.disconnect()
+                    print(">>> [DEBUG] 已断开旧线程的信号连接")
+                except (TypeError, RuntimeError):
+                    # 如果信号未连接或已断开，忽略错误（这是正常的）
+                    pass
+            
+            # 连接所有信号（确保只连接一次）
             self.train_thread.update_progress.connect(self.update_train_progress)
-            self.train_thread.update_val_progress.connect(self.update_val_progress)  # 添加这行
+            self.train_thread.update_val_progress.connect(self.update_val_progress)
             self.train_thread.training_finished.connect(self.training_complete)
             self.train_thread.model_saved.connect(self.model_saved)
-            self.train_thread.epoch_completed.connect(self.update_train_stats)  # 添加这行
-            self.train_thread.test_results_ready.connect(self.display_test_results)  # 添加测试结果展示
-            self.train_thread.metrics_ready.connect(self.display_performance_metrics)  # 添加性能指标展示
-            self.train_thread.visualization_ready.connect(self.display_performance_chart)  # 添加性能分析图表展示
-            self.train_thread.epoch_analysis_ready.connect(self.display_epoch_analysis)  # 添加每个epoch的分析展示
-            self.train_thread.attention_analysis_ready.connect(self.display_attention_analysis)  # 添加注意力分析展示
+            self.train_thread.epoch_completed.connect(self.update_train_stats)
+            self.train_thread.test_results_ready.connect(self.display_test_results)
+            self.train_thread.metrics_ready.connect(self.display_performance_metrics)
+            self.train_thread.visualization_ready.connect(self.display_performance_chart)
+            self.train_thread.epoch_analysis_ready.connect(self.display_epoch_analysis)
+            self.train_thread.attention_analysis_ready.connect(self.display_attention_analysis)
             
             print(">>> [DEBUG] 所有信号连接成功，准备启动线程...")
             self.train_thread.start()
@@ -3737,8 +3778,8 @@ class MedicalSegmentationApp(QMainWindow):
         self.val_loss_label.setText(f"验证Loss: {val_loss:.4f}")  
         self.dice_label.setText(f"Dice系数: {val_dice:.4f}")
         
-        # 更新Dice系数折线图
-        self.update_dice_chart()
+        # 更新Dice系数折线图（传入当前epoch，用于防抖去重）
+        self.update_dice_chart(epoch)
     
     def update_train_progress(self, value, message):
         """更新训练进度"""
@@ -4154,8 +4195,10 @@ f"结果已保存到:\n{input_path}\n{output_path}")
         
         self.metrics_text.setText(metrics_text)
         
-        # 更新Dice系数折线图
-        self.update_dice_chart()
+        # 【Bug修复】移除重复的图表更新调用
+        # update_dice_chart() 已由 update_train_stats (epoch_completed 信号) 负责更新
+        # 这里不再重复调用，避免每个 epoch 的数据点被绘制两次
+        # self.update_dice_chart()  # 已移除
         
         # 自动切换到性能分析标签页（仅在第一个epoch或每5个epoch切换一次，避免过于频繁）
         if epoch == 1 or epoch % 5 == 0:
@@ -4272,83 +4315,114 @@ f"结果已保存到:\n{input_path}\n{output_path}")
         # 更新Dice系数折线图
         self.update_dice_chart()
     
-    def update_dice_chart(self):
-        """更新Dice系数折线图"""
-        if (self.train_thread is not None and 
-            hasattr(self.train_thread, 'val_dice_history') and 
-            len(self.train_thread.val_dice_history) > 0):
+    def update_dice_chart(self, epoch=None):
+        """更新Dice系数折线图
+        
+        Args:
+            epoch: 当前epoch值（用于防抖去重）。如果为None，则从历史记录长度推断
+        """
+        if (self.train_thread is None or 
+            not hasattr(self.train_thread, 'val_dice_history') or 
+            len(self.train_thread.val_dice_history) == 0):
+            return
+        
+        # 【核心修复】防抖去重：如果这个 epoch 已经画过了，直接忽略
+        # 如果未传入epoch，从历史记录长度推断（向后兼容）
+        if epoch is None:
+            epoch = len(self.train_thread.val_dice_history)
+        
+        if epoch == self.last_plotted_epoch:
+            print(f"[UI防抖] 忽略重复的绘图请求: Epoch {epoch}")
+            return
+        
+        # 更新记录
+        self.last_plotted_epoch = epoch
+        
+        dice_values = self.train_thread.val_dice_history
+        
+        # 【核心修复】确保X轴使用真实的epoch值，而不是基于数据点数量自动生成
+        # 如果历史记录长度与epoch不匹配，说明数据可能有问题，使用实际长度
+        actual_length = len(dice_values)
+        if actual_length != epoch:
+            print(f"[UI警告] Epoch {epoch} 与历史记录长度 {actual_length} 不匹配，使用实际长度")
+            epoch = actual_length
+        
+        # 确保 epoch_history 与 dice_values 同步
+        # 如果 epoch_history 长度小于 dice_values，补齐缺失的epoch值
+        while len(self.epoch_history) < len(dice_values):
+            self.epoch_history.append(len(self.epoch_history) + 1)
+        
+        # 使用真实的epoch值作为X轴（确保每个epoch只对应一个数据点）
+        epochs = self.epoch_history[:len(dice_values)]
+        
+        # 更新折线图数据
+        self.dice_ax.clear()
+        self.dice_ax.plot(epochs, dice_values, 'o-', color='#4CAF50', linewidth=2.5, 
+                        markersize=8, label='Dice系数', markerfacecolor='#66BB6A',
+                        markeredgecolor='#2E7D32', markeredgewidth=1.5)
+        self.dice_ax.set_xlabel('训练轮次', fontsize=11, fontweight='bold')
+        self.dice_ax.set_ylabel('Dice系数', fontsize=11, fontweight='bold')
+        self.dice_ax.set_title('训练过程中Dice系数的变化', fontsize=12, fontweight='bold', pad=15)
+        self.dice_ax.grid(True, alpha=0.3, linestyle='--')
+        self.dice_ax.set_ylim([0, 1])
+        
+        # 智能调整X轴范围，确保所有数据点可见
+        max_epoch = max(epochs) if epochs else 1
+        # 如果轮次较少，显示更多空间；如果轮次较多，自动扩展
+        if max_epoch <= 10:
+            x_max = 10
+        else:
+            x_max = max_epoch + 2  # 留出一些边距
+        
+        self.dice_ax.set_xlim([0, x_max])
+        
+        # 设置X轴刻度，避免过于密集
+        if max_epoch <= 20:
+            self.dice_ax.set_xticks(range(0, x_max + 1, max(1, x_max // 10)))
+        else:
+            # 轮次较多时，只显示部分刻度
+            step = max(1, max_epoch // 10)
+            self.dice_ax.set_xticks(range(0, max_epoch + 1, step))
+        
+        # 设置Y轴刻度
+        self.dice_ax.set_yticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
+        self.dice_ax.set_yticklabels(['0.0', '0.2', '0.4', '0.6', '0.8', '1.0'])
+        
+        self.dice_ax.legend(loc='lower right', fontsize=10, framealpha=0.9)
+        
+        # 添加当前最大值标注
+        if dice_values:
+            max_idx = dice_values.index(max(dice_values))
+            max_epoch = epochs[max_idx]
+            max_dice = dice_values[max_idx]
             
-            epochs = list(range(1, len(self.train_thread.val_dice_history) + 1))
-            dice_values = self.train_thread.val_dice_history
+            # 确保标注不会超出图表范围
+            annotation_y = min(max_dice + 0.1, 0.95)
             
-            # 更新折线图数据
-            self.dice_ax.clear()
-            self.dice_ax.plot(epochs, dice_values, 'o-', color='#4CAF50', linewidth=2.5, 
-                            markersize=8, label='Dice系数', markerfacecolor='#66BB6A',
-                            markeredgecolor='#2E7D32', markeredgewidth=1.5)
-            self.dice_ax.set_xlabel('训练轮次', fontsize=11, fontweight='bold')
-            self.dice_ax.set_ylabel('Dice系数', fontsize=11, fontweight='bold')
-            self.dice_ax.set_title('训练过程中Dice系数的变化', fontsize=12, fontweight='bold', pad=15)
-            self.dice_ax.grid(True, alpha=0.3, linestyle='--')
-            self.dice_ax.set_ylim([0, 1])
-            
-            # 智能调整X轴范围，确保所有数据点可见
-            max_epoch = max(epochs) if epochs else 1
-            # 如果轮次较少，显示更多空间；如果轮次较多，自动扩展
-            if max_epoch <= 10:
-                x_max = 10
-            else:
-                x_max = max_epoch + 2  # 留出一些边距
-            
-            self.dice_ax.set_xlim([0, x_max])
-            
-            # 设置X轴刻度，避免过于密集
-            if max_epoch <= 20:
-                self.dice_ax.set_xticks(range(0, x_max + 1, max(1, x_max // 10)))
-            else:
-                # 轮次较多时，只显示部分刻度
-                step = max(1, max_epoch // 10)
-                self.dice_ax.set_xticks(range(0, max_epoch + 1, step))
-            
-            # 设置Y轴刻度
-            self.dice_ax.set_yticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
-            self.dice_ax.set_yticklabels(['0.0', '0.2', '0.4', '0.6', '0.8', '1.0'])
-            
-            self.dice_ax.legend(loc='lower right', fontsize=10, framealpha=0.9)
-            
-            # 添加当前最大值标注
-            if dice_values:
-                max_idx = dice_values.index(max(dice_values))
-                max_epoch = epochs[max_idx]
-                max_dice = dice_values[max_idx]
-                
-                # 确保标注不会超出图表范围
-                annotation_y = min(max_dice + 0.1, 0.95)
-                
-                self.dice_ax.annotate(f'最佳: {max_dice:.4f}\n轮次: {max_epoch}', 
-                                     xy=(max_epoch, max_dice),
-                                     xytext=(max_epoch, annotation_y),
-                                     arrowprops=dict(arrowstyle='->', color='#f44336', lw=2, 
-                                                   connectionstyle="arc3,rad=0.2"),
-                                     fontsize=9,
-                                     color='#f44336',
-                                     fontweight='bold',
-                                     bbox=dict(boxstyle='round,pad=0.5', facecolor='yellow', alpha=0.7))
-            
-            # 添加当前值标注（最后一个点）
-            if len(dice_values) > 0:
-                current_epoch = epochs[-1]
-                current_dice = dice_values[-1]
-                self.dice_ax.annotate(f'当前: {current_dice:.4f}', 
-                                     xy=(current_epoch, current_dice),
-                                     xytext=(current_epoch + 0.5, current_dice),
-                                     fontsize=8,
-                                     color='#1976d2',
-                                     bbox=dict(boxstyle='round,pad=0.3', facecolor='lightblue', alpha=0.6))
-            
-            # 优化布局，确保所有元素可见
-            self.dice_figure.subplots_adjust(left=0.12, right=0.95, top=0.90, bottom=0.15)
-            self.dice_canvas.draw()
+            self.dice_ax.annotate(f'最佳: {max_dice:.4f}\n轮次: {max_epoch}', 
+                                 xy=(max_epoch, max_dice),
+                                 xytext=(max_epoch, annotation_y),
+                                 arrowprops=dict(arrowstyle='->', color='#f44336', lw=2, 
+                                               connectionstyle="arc3,rad=0.2"),
+                                 fontsize=9,
+                                 color='#f44336',
+                                 fontweight='bold',
+                                 bbox=dict(boxstyle='round,pad=0.5', facecolor='yellow', alpha=0.7))
+        
+        # 添加当前值标注（最后一个点）
+        if len(dice_values) > 0:
+            current_epoch = epochs[-1]
+            current_dice = dice_values[-1]
+            self.dice_ax.annotate(f'当前: {current_dice:.4f}', 
+                                 xy=(current_epoch, current_dice),
+                                 xytext=(current_epoch + 0.5, current_dice),
+                                 fontsize=8,
+                                 color='#1976d2',
+                                 bbox=dict(boxstyle='round,pad=0.3', facecolor='lightblue', alpha=0.6))
+        
+        # 优化布局，确保所有元素可见
+        self.dice_figure.subplots_adjust(left=0.12, right=0.95, top=0.90, bottom=0.15)
+        self.dice_canvas.draw()
     
     def display_attention_analysis(self, viz_path, attention_stats):
         """显示注意力可解释性分析结果 - 优化版"""
@@ -5009,85 +5083,13 @@ f"结果已保存到:\n{input_path}\n{output_path}")
         # 请求可视化更新
         self.visualizer.plot_history(self.training_history)
 
-
-class EarlyStopping:
-    """自适应的早停策略，适配小数据场景（更平滑+暖启动+相对增益判定）。"""
-
-    def __init__(
-        self,
-        patience: int = 6,
-        min_delta: float = 5e-4,
-        min_rel_improve: float = 0.005,
-        warmup_epochs: int = 3,
-        cooldown: int = 1,
-        smoothing: float = 0.4,
-    ):
-        self.patience = max(1, patience)
-        self.min_delta = min_delta
-        self.min_rel = min_rel_improve
-        self.warmup_epochs = max(0, warmup_epochs)
-        self.cooldown = max(0, cooldown)
-        self.smoothing = min(max(smoothing, 0.0), 0.99)
-
-        self.best_score = -float("inf")
-        self.best_epoch = -1
-        self.bad_epochs = 0
-        self.epoch_counter = 0
-        self.cooldown_counter = 0
-        self._smoothed = None
-
-    def _update_smooth(self, score: float) -> float:
-        if self._smoothed is None:
-            self._smoothed = score
-        else:
-            self._smoothed = (
-                self.smoothing * self._smoothed + (1 - self.smoothing) * score
-            )
-        return self._smoothed
-
-    def step(self, score: float) :  # -> bool
-        self.epoch_counter += 1
-        smoothed = self._update_smooth(score)
-
-        # warmup: always observe a few epochs before starting to stop
-        if self.epoch_counter <= self.warmup_epochs:
-            if smoothed > self.best_score:
-                self.best_score = smoothed
-                self.best_epoch = self.epoch_counter
-            self.bad_epochs = 0
-            self.cooldown_counter = self.cooldown
-            return False
-
-        improvement = smoothed - self.best_score
-        rel_improvement = (
-            improvement / (abs(self.best_score) + 1e-8)
-            if self.best_score > -float("inf")
-            else float("inf")
-        )
-
-        if improvement > self.min_delta or rel_improvement > self.min_rel:
-            self.best_score = smoothed
-            self.best_epoch = self.epoch_counter
-            self.bad_epochs = 0
-            self.cooldown_counter = self.cooldown
-            return False
-
-        if self.cooldown_counter > 0:
-            self.cooldown_counter -= 1
-            return False
-
-        self.bad_epochs += 1
-        return self.bad_epochs >= self.patience
-
-
-
 # 注意：以下类和函数已在 utils.py 中定义，通过 from utils import * 导入：
 # - parse_extra_modalities_spec
 # - build_extra_modalities_lists
 # - normalize_volume_percentile
 # - MedicalImageDataset
 
-# EarlyStopping 类保留在此文件中（如果 worker.py 需要，可以考虑移到 utils.py）
+# EarlyStopping 类已在 utils.py 中定义，worker.py 从 utils.py 导入
 
 # 注意：以下 MATLAB 相关类已标记为已移除，但保留在此文件中以避免导入错误
 # 如果不再需要，可以删除这些类定义
@@ -5163,184 +5165,6 @@ class MatlabMetricsBridge:
     def instance(cls):
             return None
 
-
-class MatlabVisualizationBridge:
-    """使用MATLAB绘制预测可视化网格。"""
-
-    _instance = None
-    _instance_lock = threading.Lock()
-
-    def __init__(self):
-        self.session = MatlabEngineSession.instance()
-
-    @classmethod
-    def instance(cls):
-        # MATLAB 功能已移除，直接返回 None，避免引用未定义的 MATLAB_ENGINE_AVAILABLE
-            return None
-
-    def render_prediction_grid(self, payload_mat_path: str, save_path: str):
-        engine, lock = self.session.acquire()
-        payload_mat = MatlabEngineSession.to_matlab_path(payload_mat_path)
-        save_mat = MatlabEngineSession.to_matlab_path(save_path)
-
-        script = f"""
-data = load('{payload_mat}');
-images = data.images;
-masks = data.masks;
-preds = data.preds;
-numSamples = min(size(images, 4), 4);
-cols = 4;
-fig = figure('Visible','off');
-tl = tiledlayout(fig, numSamples, cols, 'Padding','compact', 'TileSpacing','compact');
-for idx = 1:numSamples
-    img = images(:,:,:,idx);
-    mask = masks(:,:,idx) > 0.5;
-    predMask = preds(:,:,idx) > 0.5;
-    overlay = img;
-    channel1 = overlay(:,:,1);
-    channel1(mask) = 1;
-    overlay(:,:,1) = channel1;
-    channel2 = overlay(:,:,2);
-    channel2(predMask) = 1;
-    overlay(:,:,2) = channel2;
-    nexttile(tl); imshow(img, []); title(sprintf('样本 %d 输入', idx));
-    nexttile(tl); imshow(mask); title('真实Mask');
-    nexttile(tl); imshow(predMask); title('预测Mask');
-    nexttile(tl); imshow(overlay); title('叠加图');
-end
-exportgraphics(fig, '{save_mat}', 'Resolution', 200);
-close(fig);
-"""
-
-        with lock:
-            engine.eval(script, nargout=0)
-
-    def render_training_history(self, payload_mat_path: str, save_path: str):
-        engine, lock = self.session.acquire()
-        payload = MatlabEngineSession.to_matlab_path(payload_mat_path)
-        save_mat = MatlabEngineSession.to_matlab_path(save_path)
-        script = f"""
-data = load('{payload}');
-epochs = data.epochs;
-trainLoss = data.train_loss;
-valLoss = data.val_loss;
-valDice = data.val_dice;
-fig = figure('Visible','off');
-tiledlayout(fig,1,2,'Padding','compact','TileSpacing','compact');
-nexttile;
-plot(epochs, trainLoss, '-ob', 'LineWidth', 2); hold on;
-plot(epochs, valLoss, '-or', 'LineWidth', 2);
-title('训练/验证损失'); xlabel('轮次'); ylabel('Loss');
-legend('训练','验证','Location','best'); grid on;
-nexttile;
-plot(epochs, valDice, '-og', 'LineWidth', 2);
-title('验证Dice'); xlabel('轮次'); ylabel('Dice'); ylim([0 1]); grid on;
-exportgraphics(fig, '{save_mat}', 'Resolution', 200);
-close(fig);
-"""
-        with lock:
-            engine.eval(script, nargout=0)
-
-    def render_performance_analysis(self, payload_mat_path: str, save_path: str):
-        engine, lock = self.session.acquire()
-        payload = MatlabEngineSession.to_matlab_path(payload_mat_path)
-        save_mat = MatlabEngineSession.to_matlab_path(save_path)
-        script = f"""
-data = load('{payload}');
-metrics = data.metrics;
-avg = data.avg_metrics;
-stdVals = data.std_metrics;
-fig = figure('Visible','off');
-tiledlayout(fig,2,3,'Padding','compact','TileSpacing','compact');
-nexttile;
-histogram(metrics.dice,20,'FaceColor',[0.2 0.4 0.8]);
-xline(avg.dice,'r--','LineWidth',1.5);
-title('Dice分布'); xlabel('Dice'); ylabel('数量'); grid on;
-nexttile;
-histogram(metrics.iou,20,'FaceColor',[0.2 0.7 0.3]);
-xline(avg.iou,'r--','LineWidth',1.5);
-title('IoU分布'); xlabel('IoU'); ylabel('数量'); grid on;
-nexttile;
-histogram(metrics.precision,20,'FaceColor',[0.9 0.5 0.2]);
-xline(avg.precision,'r--','LineWidth',1.5);
-title('精确率分布'); xlabel('Precision'); ylabel('数量'); grid on;
-nexttile;
-vals = [avg.dice, avg.iou, avg.precision, avg.sensitivity, avg.specificity, avg.f1];
-err = [stdVals.dice, stdVals.iou, stdVals.precision, stdVals.sensitivity, stdVals.specificity, stdVals.f1];
-bar(vals,'FaceColor',[0.3 0.6 0.9]); hold on;
-errorbar(1:numel(vals), vals, err, 'k.', 'LineWidth', 1.5);
-set(gca,'XTickLabel',{'Dice','IoU','Precision','Recall','Specificity','F1'},'XTickLabelRotation',30);
-ylim([0 1]); title('平均性能'); grid on;
-nexttile;
-boxplot([metrics.dice', metrics.iou', metrics.precision', metrics.sensitivity', metrics.specificity', metrics.f1'],...
-    'Labels',{'Dice','IoU','Precision','Recall','Specificity','F1'});
-ylim([0 1]); title('指标箱线图'); grid on;
-nexttile;
-valsTable = [
-    avg.dice, stdVals.dice, data.min_metrics.dice, data.max_metrics.dice, data.median_metrics.dice;
-    avg.iou, stdVals.iou, data.min_metrics.iou, data.max_metrics.iou, data.median_metrics.iou;
-    avg.precision, stdVals.precision, data.min_metrics.precision, data.max_metrics.precision, data.median_metrics.precision;
-    avg.sensitivity, stdVals.sensitivity, data.min_metrics.sensitivity, data.max_metrics.sensitivity, data.median_metrics.sensitivity;
-    avg.specificity, stdVals.specificity, data.min_metrics.specificity, data.max_metrics.specificity, data.median_metrics.specificity;
-    avg.f1, stdVals.f1, data.min_metrics.f1, data.max_metrics.f1, data.median_metrics.f1;
-    avg.hd95, stdVals.hd95, data.min_metrics.hd95, data.max_metrics.hd95, data.median_metrics.hd95];
-ax = nexttile;
-axis(ax,'off');
-rowLabels = {{'Dice','IoU','Precision','Recall','Specificity','F1','HD95'}};
-for row = 1:size(valsTable,1)
-    yPos = 1 - row * 0.12;
-    text(0.01, yPos, sprintf('%-11s: 均值%.4f | std %.4f | min %.4f | max %.4f | median %.4f', ...
-        rowLabels{{row}}, valsTable(row,1), valsTable(row,2), valsTable(row,3), valsTable(row,4), valsTable(row,5)), ...
-        'FontSize',9,'Parent',ax);
-end
-title(ax,'统计摘要');
-exportgraphics(fig, '{save_mat}', 'Resolution', 200);
-close(fig);
-"""
-        with lock:
-            engine.eval(script, nargout=0)
-
-    def render_test_results(self, payload_mat_path: str, save_path: str):
-        engine, lock = self.session.acquire()
-        payload = MatlabEngineSession.to_matlab_path(payload_mat_path)
-        save_mat = MatlabEngineSession.to_matlab_path(save_path)
-        script = f"""
-data = load('{payload}');
-images = data.images;
-masks = data.masks;
-preds = data.preds;
-diceVals = data.dice;
-iouVals = data.iou;
-numSamples = size(images, 4);
-fig = figure('Visible','off');
-tiledlayout(fig, numSamples, 4, 'Padding','compact','TileSpacing','compact');
-for idx = 1:numSamples
-    img = images(:,:,:,idx);
-    mask = masks(:,:,idx) > 0.5;
-    pred = preds(:,:,idx) > 0.5;
-    overlay = img;
-    overlay(:,:,1) = max(overlay(:,:,1), mask);
-    overlay(:,:,2) = max(overlay(:,:,2), pred);
-    overlay(:,:,3) = max(overlay(:,:,3), mask & pred);
-    nexttile; imshow(img, []); title(sprintf('样本 %d 原图', idx));
-    nexttile; imshow(mask); title('真实Mask');
-    nexttile; imshow(pred); title(sprintf('预测Mask\\nDice %.3f / IoU %.3f', diceVals(idx), iouVals(idx)));
-    nexttile; imshow(overlay); title('叠加对比');
-end
-exportgraphics(fig, '{save_mat}', 'Resolution', 200);
-close(fig);
-"""
-        with lock:
-            engine.eval(script, nargout=0)
-
-    def render_attention_maps(self, payload_mat_path: str, save_path: str):
-        engine, lock = self.session.acquire()
-        payload = MatlabEngineSession.to_matlab_path(payload_mat_path)
-        save_mat = MatlabEngineSession.to_matlab_path(save_path)
-        script = f"""
-"""
-        with lock:
-            engine.eval(script, nargout=0)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="医学图像分割GUI/API应用")
