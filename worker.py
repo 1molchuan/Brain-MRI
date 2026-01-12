@@ -2500,9 +2500,20 @@ class TrainThread(QThread):
             all_probs = []
             all_masks = []
             
+            # 计算总批次数（用于进度显示）
+            total_batches = len(dataloader) if use_all_samples else min(num_samples, len(dataloader))
+            
             for idx, batch_data in enumerate(dataloader):
                 if not use_all_samples and idx >= num_samples:
                     break
+                
+                # 更新数据收集进度（0-40%）
+                data_collect_progress = int(40 * (idx + 1) / max(1, total_batches))
+                self.update_progress.emit(
+                    data_collect_progress,
+                    f"阈值优化: 收集数据 {idx+1}/{total_batches} 批次..."
+                )
+                
                 # 处理数据：可能包含分类标签
                 if len(batch_data) == 3:
                     images, masks, _ = batch_data
@@ -2540,6 +2551,9 @@ class TrainThread(QThread):
             if not all_probs:
                 return 0.5
             
+            # 数据收集完成，开始GWO优化
+            self.update_progress.emit(45, "阈值优化: 数据收集完成，开始GWO优化...")
+            
             all_probs_np = np.concatenate(all_probs, axis=0)
             all_masks_np = np.concatenate(all_masks, axis=0)
             
@@ -2550,8 +2564,25 @@ class TrainThread(QThread):
 
             # 【GWO优化】使用灰狼优化算法替代线性扫描，更智能地寻找最佳阈值
             print(">>> [GWO] 灰狼群正在搜索最佳阈值...")
-            gwo = GreyWolfThresholdOptimizer(num_wolves=10, max_iter=15)
+            
+            # 定义进度回调函数
+            def gwo_progress_callback(iteration, max_iter, best_score, best_threshold):
+                # GWO优化进度（45-90%）
+                gwo_progress = 45 + int(45 * iteration / max_iter)
+                self.update_progress.emit(
+                    gwo_progress,
+                    f"阈值优化: GWO迭代 {iteration}/{max_iter} | 最佳阈值: {best_threshold:.4f} | 最佳Dice: {best_score:.4f}"
+                )
+            
+            gwo = GreyWolfThresholdOptimizer(
+                num_wolves=10, 
+                max_iter=15,
+                progress_callback=gwo_progress_callback
+            )
             best_threshold, best_dice = gwo.optimize(all_probs_np, all_masks_np)
+            
+            # GWO优化完成
+            self.update_progress.emit(90, f"阈值优化: GWO完成 | 最佳阈值: {best_threshold:.4f} | 最佳Dice: {best_dice:.4f}")
             
             # 为了兼容性，计算完整的指标字典（使用找到的最佳阈值）
             # 使用 scan_best_threshold 计算完整指标，但只使用我们找到的阈值
@@ -4944,7 +4975,6 @@ class TrainThread(QThread):
                 # 验证阶段
                 model.eval()
                 val_dice = 0.0
-                val_iou = 0.0
                 val_loss = 0.0
                 val_samples = 0
                 val_pred_fg_pixels = 0.0
@@ -4955,9 +4985,6 @@ class TrainThread(QThread):
                 val_empty_mask_dice_sum = 0.0  # 空mask样本的Dice总和
                 val_non_empty_mask_count = 0  # 目标有前景的样本数
                 val_non_empty_mask_dice_sum = 0.0  # 有前景样本的Dice总和
-                # IoU分类统计
-                val_empty_mask_iou_sum = 0.0
-                val_non_empty_mask_iou_sum = 0.0
                 
                 self.update_val_progress.emit(0, f"开始验证轮次 {epoch+1}...")
                 # 如果启用EMA且训练了足够轮次，使用EMA模型进行评估
@@ -5151,39 +5178,11 @@ class TrainThread(QThread):
                         val_gt_fg_pixels += masks.sum().item()
                         val_total_pixels += float(masks.numel())
                         
-                        # 计算批次 IoU（逐样本），并分类统计
-                        # 【关键修复】确保 IoU 和 Dice 使用相同的阈值和二值化逻辑
+                        # 【性能优化】验证阶段只计算 Dice，不计算 IoU 等其他指标以节省时间
                         batch_size = masks.shape[0]
                         for i in range(batch_size):
                             mask_i = masks[i, 0]
                             mask_sum = mask_i.sum().item()
-                            pred_i = preds[i, 0]  # pred_i 已经使用 val_threshold 二值化并经过后处理
-                            
-                            # 【修复1：阈值一致性】pred_i 已经是二进制值（0/1），但为了与 Dice 保持一致，
-                            # 使用相同的阈值判断逻辑（虽然 pred_i 已经是二值化的，但后处理可能产生浮点数）
-                            # 为了确保一致性，我们使用与 Dice 计算相同的二值化标准
-                            pred_binary = (pred_i > 0.5).float()  # 确保是严格的 0/1
-                            
-                            # 计算混淆矩阵（使用与 Dice 相同的二值化标准）
-                            tp = torch.sum((pred_binary > 0.5) & (mask_i > 0.5)).item()
-                            fp = torch.sum((pred_binary > 0.5) & (mask_i <= 0.5)).item()
-                            fn = torch.sum((pred_binary <= 0.5) & (mask_i > 0.5)).item()
-                            tn = torch.sum((pred_binary <= 0.5) & (mask_i <= 0.5)).item()
-                            
-                            # 【修复2：平滑系数一致性】使用与 Dice 相同的平滑系数 1e-7（而非 1e-8）
-                            smooth_iou = 1e-7
-                            
-                            # 【修复】分别计算前景类和背景类的IoU
-                            # 前景类IoU（Positive Class）
-                            iou_pos_den = tp + fp + fn
-                            iou_pos_i = 1.0 if iou_pos_den < smooth_iou else tp / (iou_pos_den + smooth_iou)
-                            
-                            # 背景类IoU（Negative Class）
-                            iou_neg_den = tn + fp + fn
-                            iou_neg_i = 1.0 if iou_neg_den < smooth_iou else tn / (iou_neg_den + smooth_iou)
-                            
-                            # 【关键修复】不再累加所有样本的IoU，而是只统计有前景mask的样本
-                            # val_iou 将在后面使用 val_non_empty_mask_iou_sum 计算（只统计前景类）
                             
                             # 判断是否为空mask（使用与 Dice 计算相同的阈值逻辑）
                             total_pixels = mask_i.numel()
@@ -5192,24 +5191,11 @@ class TrainThread(QThread):
                             empty_threshold_pixels = adaptive_empty_threshold * total_pixels
                             
                             if mask_sum <= empty_threshold_pixels:
-                                # 【修复3：空 mask 处理一致性】
-                                # 对于空 mask，如果预测也为空，IoU 应该返回 1.0（与 Dice 保持一致）
-                                # 如果预测有前景，IoU 应该返回 0.0（误检）
-                                pred_sum = pred_binary.sum().item()
-                                if pred_sum <= smooth_iou:
-                                    # 预测也为空，IoU = 1.0（与 Dice 的 1.0 保持一致）
-                                    iou_for_empty = 1.0
-                                else:
-                                    # 误检：目标为空但预测有前景，IoU = 0.0（与 Dice 的惩罚逻辑保持一致）
-                                    iou_for_empty = 0.0
-                                
                                 val_empty_mask_count += 1
                                 val_empty_mask_dice_sum += batch_dice[i].item()
-                                val_empty_mask_iou_sum += iou_for_empty  # ✅ 使用与 Dice 一致的空 mask 处理
                             else:
                                 val_non_empty_mask_count += 1
                                 val_non_empty_mask_dice_sum += batch_dice[i].item()
-                                val_non_empty_mask_iou_sum += iou_pos_i  # ✅ 使用前景类IoU（用于主要评估）
                         
                         # 更新验证进度
                         val_progress = int(100 * (val_idx + 1) / len(val_loader))
@@ -5250,26 +5236,20 @@ class TrainThread(QThread):
                     print(f"[警告] Epoch {epoch+1}: 训练平均损失为NaN/Inf，使用0.0")
                     avg_train_loss = 0.0
                 
-                # 【修改】val_dice 和 val_iou 统计所有验证样本（包括空mask样本）
+                # 【修改】val_dice 统计所有验证样本（包括空mask样本）
                 # 使用所有样本的平均 Dice 来选择最佳模型，确保模型在所有场景下都有良好表现
                 val_total_count = val_non_empty_mask_count + val_empty_mask_count
                 val_total_dice_sum = val_non_empty_mask_dice_sum + val_empty_mask_dice_sum
-                val_total_iou_sum = val_non_empty_mask_iou_sum + val_empty_mask_iou_sum
                 
                 if val_total_count > 0:
                     val_dice = val_total_dice_sum / val_total_count
-                    val_iou = val_total_iou_sum / val_total_count
                 else:
                     # 如果没有样本，使用0.0（而不是NaN）
                     val_dice = 0.0
-                    val_iou = 0.0
                 
                 if not np.isfinite(val_dice):
                     print(f"[警告] Epoch {epoch+1}: 验证Dice为NaN/Inf，使用0.0")
                     val_dice = 0.0
-                if not np.isfinite(val_iou):
-                    print(f"[警告] Epoch {epoch+1}: 验证IoU为NaN/Inf，使用0.0")
-                    val_iou = 0.0
 
                 # 使用 ReduceLROnPlateau 根据验证Dice自动调整学习率（优先提升稳定性）
                 if plateau_scheduler is not None:
@@ -5291,12 +5271,10 @@ class TrainThread(QThread):
                 pred_fg_ratio = val_pred_fg_pixels / max(1.0, val_total_pixels)
                 gt_fg_ratio = val_gt_fg_pixels / max(1.0, val_total_pixels)
                 
-                # 【关键修改】分别统计有前景mask和空mask的Dice/IoU（用于诊断和详细分析）
-                # 注意：val_dice 和 val_iou 现在统计所有样本（包括空mask样本），用于最佳模型选择
+                # 【关键修改】分别统计有前景mask和空mask的Dice（用于诊断和详细分析）
+                # 注意：val_dice 现在统计所有样本（包括空mask样本），用于最佳模型选择
                 dice_pos = val_non_empty_mask_dice_sum / max(1, val_non_empty_mask_count) if val_non_empty_mask_count > 0 else 0.0
                 dice_neg = val_empty_mask_dice_sum / max(1, val_empty_mask_count) if val_empty_mask_count > 0 else 0.0
-                iou_pos = val_non_empty_mask_iou_sum / max(1, val_non_empty_mask_count) if val_non_empty_mask_count > 0 else 0.0
-                iou_neg = val_empty_mask_iou_sum / max(1, val_empty_mask_count) if val_empty_mask_count > 0 else 0.0
                 empty_mask_ratio = val_empty_mask_count / max(1, val_samples) if val_samples > 0 else 0.0
                 
                 # 记录到历史中（记录所有样本的平均Dice，用于最佳模型选择）
@@ -5306,18 +5284,18 @@ class TrainThread(QThread):
                 self.val_dice_pos_history.append(dice_pos)  # 保留用于诊断
                 self.val_dice_neg_history.append(dice_neg)  # 保留用于诊断
                 
-                # 【统一标准】日志输出显示所有样本的平均 Dice 和 IoU（用于最佳模型选择）
+                # 【统一标准】日志输出显示所有样本的平均 Dice（用于最佳模型选择）
                 # 同时显示前景类和空mask类的分别统计（用于诊断）
                 # 注意：验证统计使用全部验证集 + 后处理，用于主要评估和早停判断
+                # 【性能优化】验证阶段只输出 Dice 和 Loss，不计算 IoU 等其他指标以节省时间
                 print(
                     f"[验证统计] Epoch {epoch+1}: threshold={val_threshold:.3f}, "
                     f"pred_fg_ratio={pred_fg_ratio:.4f}, gt_fg_ratio={gt_fg_ratio:.4f}, "
-                    f"Dice(所有样本)={val_dice:.4f}, IoU(所有样本)={val_iou:.4f} "
+                    f"Dice(所有样本)={val_dice:.4f}, Loss={avg_val_loss:.4f} "
                     f"(基于全部验证集{val_samples}个样本，使用后处理)"
                 )
                 print(
-                    f"[详细分析] Dice(前景类)={dice_pos:.4f}, Dice(空mask)={dice_neg:.4f}, "
-                    f"IoU(前景类)={iou_pos:.4f}, IoU(空mask)={iou_neg:.4f}"
+                    f"[详细分析] Dice(前景类)={dice_pos:.4f}, Dice(空mask)={dice_neg:.4f}"
                 )
                 print(
                     f"[样本分布] "
@@ -5327,7 +5305,7 @@ class TrainThread(QThread):
                 # 【诊断信息】背景类Dice仅用于诊断，明确标记
                 if val_empty_mask_count > 0:
                     print(
-                        f"[诊断信息] 背景类Dice(仅诊断): {dice_neg:.4f}, 背景类IoU(仅诊断): {iou_neg:.4f} "
+                        f"[诊断信息] 背景类Dice(仅诊断): {dice_neg:.4f} "
                         f"| 注意：背景类指标不用于主要评估，仅用于诊断假阳性问题"
                     )
 

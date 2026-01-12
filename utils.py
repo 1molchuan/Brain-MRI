@@ -2042,14 +2042,16 @@ class GreyWolfThresholdOptimizer:
     相比线性扫描，GWO 能够更智能地搜索阈值空间，在更少的迭代次数内找到更优解。
     """
     
-    def __init__(self, num_wolves=10, max_iter=20):
+    def __init__(self, num_wolves=10, max_iter=20, progress_callback=None):
         """
         Args:
             num_wolves: 灰狼数量（种群大小），默认10
             max_iter: 最大迭代次数，默认20
+            progress_callback: 进度回调函数，接收 (iteration, max_iter, best_score, best_threshold) 参数
         """
         self.num_wolves = num_wolves
         self.max_iter = max_iter
+        self.progress_callback = progress_callback
         # 搜索空间 [0.1, 0.9]
         self.lb = 0.1
         self.ub = 0.9
@@ -2141,6 +2143,14 @@ class GreyWolfThresholdOptimizer:
                 
                 # 狼的位置更新为三者平均
                 positions[i] = (X1 + X2 + X3) / 3.0
+            
+            # 调用进度回调函数（如果提供）
+            if self.progress_callback is not None:
+                try:
+                    self.progress_callback(t + 1, self.max_iter, alpha_score, alpha_pos)
+                except Exception as e:
+                    # 如果回调函数出错，不影响优化过程
+                    pass
                 
         return alpha_pos, alpha_score
 
