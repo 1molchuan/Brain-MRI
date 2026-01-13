@@ -66,8 +66,14 @@ import logging  # 日志可能用到
 import html     # HTML转义
 import tempfile # 临时文件
 import importlib # 动态导入模块
+import json     # JSON处理
+import hashlib  # 哈希计算
+from pathlib import Path
+from typing import List
 import numpy as np
 import torch
+from torch.utils.data import Dataset  # Dataset基类
+import cv2  # OpenCV图像处理
 
 # === GUI 相关的 PyQt5 ===
 from PyQt5.QtWidgets import (
