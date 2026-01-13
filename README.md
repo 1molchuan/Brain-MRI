@@ -6,8 +6,14 @@
 ![PyTorch](https://img.shields.io/badge/PyTorch-1.9.0+-orange.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)
+[![GitHub stars](https://img.shields.io/github/stars/yourusername/medical-segmentation?style=social)](https://github.com/yourusername/medical-segmentation)
+[![许可证](https://img.shields.io/badge/许可证-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Python](https://img.shields.io/badge/Python-3.7%2B-blue)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-1.9%2B-red)](https://pytorch.org/)
 
-一个功能完整的医学图像分割系统，提供图形化界面和API服务，支持多种先进的深度学习模型架构。系统专为医学图像分割任务设计，特别优化了脑肿瘤分割场景。
+## 概述
+
+一个全面的医学图像分割系统，具有图形界面和API服务，支持多种先进的深度学习模型架构。该系统专为医学图像分割任务设计，特别针对脑肿瘤分割场景进行了优化。
 
 [功能特性](#-主要特性) • [快速开始](#-快速开始) • [使用指南](#-使用指南) • [模型架构](#-支持的模型架构) • [常见问题](#-常见问题)
 
@@ -105,25 +111,25 @@ cd medical-segmentation
 pip install -r requirements.txt
 ```
 
-**主要依赖包：**
-- `torch>=1.9.0` - PyTorch 深度学习框架
-- `PyQt5>=5.15.0` - GUI 界面
-- `albumentations>=1.1.0` - 数据增强
-- `opencv-python>=4.5.0` - 图像处理
-- `scikit-image>=0.18.0` - 图像处理工具
-- `segmentation-models-pytorch` - SMP 模型库（U-Net++、DeepLabV3+）
-- `pytorch-grad-cam` - Grad-CAM 可视化（可选）
-- `matlab.engine` - MATLAB 引擎（可选，用于报告生成）
+**核心依赖**：
+- `torch>=1.9.0` – PyTorch深度学习框架
+- `PyQt5>=5.15.0` – GUI框架
+- `albumentations>=1.1.0` – 数据增强
+- `opencv-python>=4.5.0` – 图像处理
+- `scikit-image>=0.18.0` – 图像工具
+- `segmentation-models-pytorch` – SMP库（U‑Net++、DeepLabV3+）
+- `pytorch-grad-cam` – Grad‑CAM可视化（可选）
+- `matlab.engine` – MATLAB引擎（可选，用于报告生成）
 
-### 3. 运行程序
+### 3. 运行应用
 
-#### GUI 模式（推荐）
+#### GUI模式（推荐）
 
 ```bash
 python main.py
 ```
 
-#### API 模式
+#### API模式
 
 ```bash
 python main.py --mode api --model path/to/model.pth --host 0.0.0.0 --port 8000
@@ -135,15 +141,21 @@ python main.py --mode api --model path/to/model.pth --host 0.0.0.0 --port 8000
 
 ```
 medical-segmentation/
-├── main.py              # 主程序入口（GUI界面）
-├── models.py            # 模型定义（所有模型架构）
-├── worker.py            # 工作线程模块（训练、测试、预测逻辑）
-├── utils.py             # 工具函数和数据处理类
-├── dataset.py           # 2.5D 数据集加载器（TCGA2_5DDataset）
-├── config.py            # 模型配置中心
-├── README.md            # 项目说明文档
-├── requirements.txt     # 依赖包列表
-├── .gitignore           # Git 忽略文件
+├── main.py              # 主入口（GUI和应用程序）
+├── models.py            # 所有模型架构
+├── worker.py            # 工作线程（训练、测试、预测）
+├── utils.py             # 工具函数和数据预处理
+├── dataset.py           # 2.5D数据集加载器（TCGA2_5DDataset）
+├── config.py            # 集中式模型配置
+├── README.md            # 本文档
+├── requirements.txt     # 依赖列表
+├── .gitignore           # Git忽略文件
+├── .autocoderignore     # Auto‑coder忽略文件
+├── 2.5D_DATASET_REVIEW.md  # 数据集审查报告
+├── main_data_postprocessing_summary.md  # 代码摘要
+├── debug_data_check.py  # 调试脚本
+├── actions/             # 动作定义（如有）
+├── matlab_reports/      # 生成的MATLAB报告
 └── data/                # 数据目录（用户创建）
     ├── patient_id1/
     │   ├── image1.png
@@ -363,8 +375,7 @@ data_dir/
 - 多尺度推理（0.8x, 1.0x, 1.2x）
 - 8 种几何变换（翻转、旋转等）
 - 加权融合策略
-- 自动填充到 16 的倍数（DeepLabV3+ 要求）
-- 可提升 1-3% 的 Dice 系数
+- 可将Dice提升1‑3%
 
 ### 智能后处理
 - **LCC（最大连通域）**: 保留最大连通区域，去除噪点
@@ -375,25 +386,25 @@ data_dir/
 - **动态面积阈值**: 根据概率图平均值动态调整过滤阈值
 - **高置信度小病灶保护**: 智能保留高置信度（>0.9）的微小病灶
 
-### Grad-CAM 可视化
-- 支持 DeepLabV3+ 等不支持原生注意力图的模型
-- 使用 Decoder 层作为目标层，获得高分辨率热力图
+### Grad‑CAM可视化
+- 支持没有原生注意力图的模型（如DeepLabV3+）
+- 使用解码器层作为目标层生成高分辨率热图
 - 自动适配二分类/多分类模型
-- 仅在验证/测试阶段生成（训练阶段禁用以节省显存）
-- 采样策略：仅对前 5 个 batch 生成，其余跳过以提升速度
+- 仅在验证/测试阶段生成（训练时禁用以节省GPU内存）
+- 采样策略：仅处理前5个批次；其余跳过以提高速度。
 
 ### 2.5D 数据集支持
 - 支持 TCGA-LGG 格式的 2.5D 数据集
 - 自动将相邻切片堆叠为三通道输入
 - 支持递归搜索子文件夹
-- 自动处理缺失的边界切片
+- 优雅处理边界缺失切片。
 
-### MATLAB 报告生成
-- 自动生成性能分析报告（柱状图 + 误差棒）
+### MATLAB报告生成
+- 自动生成性能分析报告（条形图 + 误差条）
 - 预测结果网格可视化
-- 高清图表导出（1200x800，300 DPI）
-- 优化的图表布局（预留 X 轴标签空间）
-- 持久化保存到 `matlab_reports/` 目录
+- 高质量图表导出（1200×800，300 DPI）
+- 优化布局（为X轴标签预留空间）
+- 持久保存到 `matlab_reports/` 目录。
 
 ### 性能优化
 - **CuDNN Benchmark**: 自动寻找最适合的卷积算法
@@ -427,15 +438,14 @@ data_dir/
 
 ---
 
-## 🐛 常见问题
+系统使用以下指标评估分割质量：
 
-### Q: 训练时出现 CUDA 内存不足？
-**A**: 尝试以下方法：
-- 减小批次大小（Batch Size）
-- 降低图像分辨率
-- 关闭混合精度训练（如果已启用）
-- 使用 CPU 训练（速度较慢）
-- 启用梯度累积
+- **Dice系数**：衡量重叠度（仅前景类，空掩码特殊处理）。
+- **IoU（Jaccard指数）**：交集除以并集（仅前景类，空掩码特殊处理）。
+- **精确率**：真正例占预测正例的比例。
+- **召回率**：真正例占实际正例的比例。
+- **特异性**：真负例占实际负例的比例。
+- **HD95**：95% Hausdorff距离，衡量边界准确性。
 
 ### Q: 如何选择最适合的模型架构？
 **A**: 
@@ -444,8 +454,7 @@ data_dir/
 - **大数据集**: 推荐 SwinUNet（支持 GWO 优化）
 - **需要高精度**: 推荐 DeepLabV3+（训练稳定，性能优秀）
 
-### Q: TTA 会显著增加推理时间吗？
-**A**: 是的，TTA 会增加约 24 倍推理时间，但可以提升 1-3% 的 Dice 系数。建议在最终评估时使用，训练和验证阶段可关闭。
+后处理函数 `post_process_mask` 实现了**绝对最小面积限制**，确保微小噪声（面积 < `min_size`）被清除，从而触发“两者皆空 = 1.0”的完美评分。
 
 ### Q: 如何提高模型性能？
 **A**: 
@@ -458,27 +467,40 @@ data_dir/
 7. 使用智能后处理（LCC、孔洞填充等）
 8. **使用 GWO 优化阈值**（推荐）
 
-### Q: DeepLabV3+ 如何生成注意力热图？
-**A**: DeepLabV3+ 不支持原生注意力图，系统使用 Grad-CAM 技术生成热力图。需要安装 `pytorch-grad-cam`：
+### 问：训练时CUDA内存不足？
+**答**：尝试减小批次大小、降低图像分辨率、禁用混合精度训练、使用CPU训练或启用梯度累积。
+
+### 问：如何选择最佳模型架构？
+**答**：
+- **小数据集**：ImprovedUNet或ResNetUNet。
+- **中等数据集**：TransUNet、U‑Net++或DeepLabV3+。
+- **大数据集**：SwinUNet（带GWO优化）。
+- **最高准确率**：DeepLabV3+（训练稳定，性能优异）。
+
+### 问：TTA会显著增加推理时间吗？
+**答**：是的，TTA会使推理时间增加约24倍，但可将Dice提升1‑3%。建议仅用于最终评估。
+
+### 问：如何处理空掩码（无病灶）？
+**答**：系统具有全面的空掩码处理机制：
+- 指标计算：两者皆空返回1.0，单边空返回0.0。
+- 后处理：微小噪声（面积 < `min_size`）自动清除。
+- 确保在空GT场景下，小假阳性不影响Dice分数。
+
+### 问：如何为DeepLabV3+生成注意力热图？
+**答**：DeepLabV3+不支持原生注意力图；系统使用Grad‑CAM。安装 `pytorch-grad-cam`：
 ```bash
 pip install grad-cam
 ```
 
-### Q: MATLAB 报告生成失败？
-**A**: 
-1. 确保已安装 MATLAB R2020b+
-2. 确保已安装 MATLAB Engine for Python：
+### 问：MATLAB报告生成失败？
+**答**：
+1. 确保已安装MATLAB R2020b+。
+2. 安装MATLAB Engine for Python：
    ```bash
    cd "matlabroot/extern/engines/python"
    python setup.py install
    ```
-3. 检查 MATLAB 路径配置（main.py 中的 `MATLAB_BIN_PATH`）
-
-### Q: 如何处理空 Mask（无病灶）的情况？
-**A**: 系统已实现完善的空 Mask 处理：
-- 指标计算：双空返回 1.0，单空返回 0.0
-- 后处理：微小噪点（面积 < min_size）会被自动清空
-- 确保在空 GT 场景下，微小误报不会影响 Dice 分数
+3. 检查MATLAB路径配置（`main.py`中的`MATLAB_BIN_PATH`）。
 
 ### Q: GWO 优化器如何使用？
 **A**: GWO 优化器在验证阶段自动启用，用于：
@@ -490,7 +512,8 @@ pip install grad-cam
 
 ## 📝 开发说明
 
-### 代码结构
+### 代码架构
+项目采用模块化设计，将功能拆分为几个核心模块：
 
 项目采用模块化设计，将功能拆分为多个主要模块：
 
@@ -514,13 +537,13 @@ pip install grad-cam
 
 ## 📝 许可证
 
-本项目采用 MIT 许可证。详见 [LICENSE](LICENSE) 文件。
+本项目采用MIT许可证。详见[LICENSE](LICENSE)文件。
 
 ---
 
 ## 🤝 贡献
 
-欢迎提交 Issue 和 Pull Request！
+欢迎提交Issue和Pull Request！请确保您的更改符合项目的编码风格，并包含适当的测试。
 
 ### 贡献指南
 1. Fork 本仓库
@@ -533,8 +556,8 @@ pip install grad-cam
 
 ## 📧 联系方式
 
-如有问题或建议，请通过以下方式联系：
-- 提交 GitHub Issue
+如有问题或建议，请：
+- 提交GitHub Issue
 - 发送邮件至：chuan2410450745@sjtu.edu.cn
 
 ---
@@ -553,8 +576,8 @@ pip install grad-cam
 
 ## 📚 数据集
 
-作者训练模型采用的数据集：
-- [LGG MRI Segmentation Dataset](https://www.kaggle.com/datasets/mateuszbuda/lgg-mri-segmentation)
+模型训练使用了：
+- [LGG MRI分割数据集](https://www.kaggle.com/datasets/mateuszbuda/lgg-mri-segmentation)
 
 ---
 
@@ -580,10 +603,10 @@ pip install grad-cam
 - ✅ 支持 2.5D 数据集（TCGA-LGG）
 
 ### v1.0
-- ✅ 基础模型架构（ImprovedUNet、ResNetUNet、TransUNet、DS-TransUNet、SwinUNet）
-- ✅ GUI 界面
+- ✅ 基础模型架构（ImprovedUNet、ResNetUNet、TransUNet、DS‑TransUNet、SwinUNet）
+- ✅ GUI界面
 - ✅ 训练/测试/预测功能
-- ✅ TTA 支持
+- ✅ TTA支持
 - ✅ 基础后处理
 
 ---

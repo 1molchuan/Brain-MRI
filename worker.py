@@ -2199,6 +2199,7 @@ class TrainThread(QThread):
         self.stop_requested = False
         self.best_model_path = None
         self.best_dice = -1.0
+        self.gwo_best_dice = None  # GWO找到的全验证集最佳Dice，用于best_model判定
         
         # 【日志优化】标记是否已打印 Grad-CAM 信息，避免重复日志刷屏
         self._has_logged_gradcam_info = False
@@ -2549,7 +2550,7 @@ class TrainThread(QThread):
                     torch.cuda.empty_cache()
             
             if not all_probs:
-                return 0.5
+                return (0.5, 0.0)  # 返回默认阈值和0.0 Dice
             
             # 数据收集完成，开始GWO优化
             self.update_progress.emit(45, "阈值优化: 数据收集完成，开始GWO优化...")
@@ -2696,14 +2697,16 @@ class TrainThread(QThread):
             gc.collect()
 
         sample_info = "全部验证集" if use_all_samples else f"{num_samples}个批次"
+        total_samples = all_probs_np.shape[0] if 'all_probs_np' in locals() and all_probs_np is not None else 0
         score_val = best_metrics.get("score", 0.0) if isinstance(best_metrics, dict) else 0.0
         print(
-            f"[阈值优化] 使用样本: {sample_info} | "
-            f"最优阈值: {best_threshold:.3f}, 综合评分: {score_val:.4f}, "
+            f"[阈值优化] 使用样本: {sample_info} ({total_samples}个样本) | "
+            f"最优阈值: {best_threshold:.3f}, 最佳Dice(全验证集): {best_dice:.4f}, "
             f"Dice: {best_metrics.get('dice', float('nan')):.4f}, "
             f"IoU: {best_metrics.get('iou', float('nan')):.4f}"
         )
-        return float(best_threshold)
+        # 返回最佳阈值和最佳Dice（基于全验证集GWO优化）
+        return (float(best_threshold), float(best_dice))
     
     def evaluate_model(self, model, dataloader, device, use_tta=True, adaptive_threshold=True):
         """
@@ -2715,9 +2718,17 @@ class TrainThread(QThread):
         """
         # 寻找最优阈值
         if adaptive_threshold:
-            optimal_thresh = self.find_optimal_threshold(model, dataloader, device)
+            threshold_result = self.find_optimal_threshold(model, dataloader, device)
+            # 处理返回值：可能是元组(threshold, dice)或单个值（向后兼容）
+            if isinstance(threshold_result, tuple):
+                optimal_thresh, gwo_dice = threshold_result
+                self.gwo_best_dice = float(gwo_dice)
+            else:
+                optimal_thresh = threshold_result
+                self.gwo_best_dice = None
         else:
             optimal_thresh = 0.5
+            self.gwo_best_dice = None
         self.last_optimal_threshold = float(optimal_thresh)
         
         model.eval()
@@ -5089,12 +5100,22 @@ class TrainThread(QThread):
                         # 使用全部验证集进行阈值优化
                         # 注意：阈值优化阶段不使用后处理（为了速度），但验证阶段会使用后处理
                         # 这可能导致阈值优化找到的阈值与验证阶段实际效果略有差异，但通常影响很小
-                        val_threshold = float(self.find_optimal_threshold(
+                        threshold_result = self.find_optimal_threshold(
                             eval_model_for_epoch,
                             val_loader,
                             device,
                             num_samples=None,  # None表示使用全部验证集
-                        ))
+                        )
+                        # 处理返回值：可能是元组(threshold, dice)或单个值（向后兼容）
+                        if isinstance(threshold_result, tuple):
+                            val_threshold, gwo_best_dice = threshold_result
+                            # 【关键修复】保存GWO找到的全验证集最佳Dice，用于best_model判定
+                            self.gwo_best_dice = float(gwo_best_dice)
+                            print(f">>> [GWO] 全验证集最佳Dice已保存: {self.gwo_best_dice:.4f} (将用于best_model判定)")
+                        else:
+                            # 向后兼容：如果返回单个值
+                            val_threshold = float(threshold_result)
+                            self.gwo_best_dice = None
                         self.last_optimal_threshold = val_threshold
                         # 【显存优化】阈值优化后清理GPU缓存
                         if torch.cuda.is_available():
@@ -5102,6 +5123,7 @@ class TrainThread(QThread):
                     except Exception as threshold_err:
                         print(f"[警告] 阈值搜索失败，使用上一次的阈值。原因: {threshold_err}")
                         val_threshold = float(getattr(self, "last_optimal_threshold", 0.5))
+                        self.gwo_best_dice = None
                 else:
                     if epoch == 0:
                         val_threshold = 0.5
@@ -5448,11 +5470,10 @@ class TrainThread(QThread):
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 
-                # 计算当前轮次的性能指标（快速评估）
-                # 【重要说明】验证评分与验证统计的差异：
+                # 计算当前轮次的性能指标（全验证集评估）
+                # 【关键修复】验证评分现在使用全部验证集，与验证统计保持一致
                 # 1. 验证统计：使用全部验证集 + 后处理，用于主要评估和早停判断
-                # 2. 验证评分：使用部分样本（20个）+ 无后处理，用于性能分析和可视化
-                # 注意：为了与验证统计保持一致，验证评分也应该使用后处理，但为了速度只使用部分样本
+                # 2. 验证评分：使用全部验证集 + 后处理，用于性能分析和可视化（已修复）
                 # 【显存优化】使用临时eval模型
                 temp_eval_model_for_metrics = model.eval() if not isinstance(model, nn.DataParallel) else model.module.eval()
                 if self.use_ema and ema_model is not None and epoch >= self.ema_eval_start_epoch:
@@ -5470,13 +5491,11 @@ class TrainThread(QThread):
                 }
                 
                 with torch.no_grad():
-                    # 只评估部分验证集以加快速度
-                    eval_samples = min(20, len(val_dataset))  # 最多评估20个样本
+                    # 【关键修复】使用全部验证集，不再限制为20个样本
                     eval_count = 0
+                    total_eval_samples = len(val_dataset)
                     
                     for batch_data in val_loader:
-                        if eval_count >= eval_samples:
-                            break
                         
                         # 处理数据：可能包含分类标签
                         if len(batch_data) == 3:
@@ -5518,9 +5537,6 @@ class TrainThread(QThread):
                                 preds[i, 0] = torch.from_numpy(pred_mask_processed).float().to(preds.device)
                         
                         for i in range(preds.shape[0]):
-                            if eval_count >= eval_samples:
-                                break
-                                
                             pred = preds[i, 0]
                             mask = masks[i, 0]
                             
@@ -5536,13 +5552,21 @@ class TrainThread(QThread):
                             fn = float(((1 - pred) * mask).sum().item())
                             tn = float(((1 - pred) * (1 - mask)).sum().item())
                             
-                            # 【关键修复】只统计有前景mask的样本，忽略空mask样本
-                            # 在医学分割中，我们不应该计算背景类的 Dice，因为背景往往占据绝大部分，
-                            # 会掩盖模型在前景上的真实性能。空mask样本应该被忽略或单独处理。
+                            # 【关键修复】统计所有样本（包括空mask），与验证统计保持一致
+                            # 空mask样本的Dice计算：如果GT为空且预测也为空，Dice=1.0；否则Dice=0.0
                             empty_threshold_pixels = max(1.0, float(mask.numel()) * 0.001)  # 0.1%像素
                             
-                            # 只对有前景的样本计算指标
-                            if mask_sum > empty_threshold_pixels:
+                            if mask_sum <= empty_threshold_pixels:
+                                # 空mask样本：GT为空
+                                if pred_sum <= 1e-7:
+                                    dice = 1.0  # GT为空，预测也为空，Dice=1.0
+                                else:
+                                    dice = 0.0  # GT为空，预测不为空（假阳性），Dice=0.0
+                                iou = dice  # IoU与Dice相同
+                                precision = 0.0 if pred_sum > 1e-7 else 1.0
+                                recall = 1.0  # GT为空，recall=1.0（没有漏检）
+                            else:
+                                # 有前景样本
                                 dice_den = 2.0 * tp + fp + fn
                                 if dice_den < 1e-7:
                                     dice = 0.0  # 有前景但预测为空，Dice=0
@@ -5561,20 +5585,18 @@ class TrainThread(QThread):
                                     recall = 0.0  # 有前景但预测为空，recall=0
                                 else:
                                     recall = tp / (tp + fn)
-                                
-                                f1 = dice  # 二分类下F1=Dice
-                                
-                                epoch_metrics['dice'].append(float(dice))
-                                epoch_metrics['iou'].append(float(iou))
-                                epoch_metrics['precision'].append(float(precision))
-                                epoch_metrics['recall'].append(float(recall))
-                                epoch_metrics['sensitivity'].append(float(recall))
-                                epoch_metrics['f1'].append(float(f1))
+                            
+                            f1 = dice  # 二分类下F1=Dice
+                            
+                            # 统计所有样本（包括空mask）
+                            epoch_metrics['dice'].append(float(dice))
+                            epoch_metrics['iou'].append(float(iou))
+                            epoch_metrics['precision'].append(float(precision))
+                            epoch_metrics['recall'].append(float(recall))
+                            epoch_metrics['sensitivity'].append(float(recall))
+                            epoch_metrics['f1'].append(float(f1))
                             
                             eval_count += 1
-                        
-                        if eval_count >= eval_samples:
-                            break
                         
                         # 【显存优化】删除epoch分析阶段的中间变量
                         del outputs, probs, preds, images, masks
@@ -5597,18 +5619,17 @@ class TrainThread(QThread):
                     else:
                         avg_epoch_metrics[k] = float(np.nanmean(arr))
 
-                # 【简化】验证阶段只关注Dice和IoU，不再计算TotalScore
+                # 【关键修复】验证评分现在使用全部验证集，与验证统计保持一致
                 # 计算实际评估的样本数量
                 actual_eval_samples = len(epoch_metrics.get('dice', []))
-                # 【统一标准】验证评分中的 Dice 和 IoU 只统计前景类（有前景mask的样本）
-                # 注意：验证评分使用部分样本（最多20个）+ 后处理，与验证统计的主要差异是样本数量
+                # 【统一标准】验证评分统计所有样本（包括空mask），与验证统计保持一致
                 print(
                     f"[验证评分] Epoch {epoch+1}: threshold={val_threshold:.3f}, "
-                    f"Dice(前景类)={avg_epoch_metrics.get('dice', float('nan')):.4f}, "
-                    f"IoU(前景类)={avg_epoch_metrics.get('iou', float('nan')):.4f}, "
+                    f"Dice(所有样本)={avg_epoch_metrics.get('dice', float('nan')):.4f}, "
+                    f"IoU(所有样本)={avg_epoch_metrics.get('iou', float('nan')):.4f}, "
                     f"Precision={avg_epoch_metrics.get('precision', float('nan')):.4f}, "
                     f"Recall={avg_epoch_metrics.get('recall', float('nan')):.4f} "
-                    f"(基于{actual_eval_samples}个有前景样本，使用后处理)"
+                    f"(基于全部验证集{actual_eval_samples}个样本，使用后处理)"
                 )
                 
                 # 【高清模式】关键 Epoch 时调用所有 MATLAB 方法生成出版级图表
@@ -5799,15 +5820,25 @@ class TrainThread(QThread):
                 self.epoch_analysis_ready.emit(epoch + 1, test_viz_path, avg_epoch_metrics)
                 
                 # Save best model
-                if val_dice > self.best_dice:
-                    self.best_dice = val_dice
+                # 【关键修复】优先使用GWO找到的全验证集最佳Dice作为判定依据
+                # 如果GWO未运行或失败，则回退到验证循环计算的val_dice
+                dice_for_best_model = getattr(self, 'gwo_best_dice', None)
+                if dice_for_best_model is None:
+                    # 回退到验证循环计算的val_dice（基于全部验证集+后处理）
+                    dice_for_best_model = val_dice
+                    print(f">>> [Best Model] 使用验证循环Dice: {dice_for_best_model:.4f} (GWO未运行)")
+                else:
+                    print(f">>> [Best Model] 使用GWO全验证集最佳Dice: {dice_for_best_model:.4f}")
+                
+                if dice_for_best_model > self.best_dice:
+                    self.best_dice = dice_for_best_model
                     if self.save_best:
                         os.makedirs(self.best_model_cache_dir, exist_ok=True)
                         self.best_model_path = os.path.join(
-                            self.best_model_cache_dir, f"best_model_dice_{val_dice:.4f}.pth"
+                            self.best_model_cache_dir, f"best_model_dice_{dice_for_best_model:.4f}.pth"
                         )
                         self._save_checkpoint(eval_model_for_epoch, self.best_model_path)
-                        self.model_saved.emit(f"已保存最佳模型 (Dice: {val_dice:.4f})")
+                        self.model_saved.emit(f"已保存最佳模型 (Dice: {dice_for_best_model:.4f}, 基于全验证集GWO优化)")
 
                 # 恢复EMA模型为train模式（如果使用了EMA）
                 if self.use_ema and ema_model is not None and epoch >= self.ema_eval_start_epoch:
