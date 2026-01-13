@@ -140,14 +140,15 @@ class CRFPostProcessor:
         return np.stack(results, axis=0)
 
 
-class CBAM(nn.Module):
+class CBAMBlock(nn.Module):
     """
-    Convolutional Block Attention Module (CBAM)
+    Convolutional Block Attention Module (CBAM) - Block version
     结合通道注意力和空间注意力，提升特征表达能力
     参考: "CBAM: Convolutional Block Attention Module" (ECCV 2018)
+    使用 nn.Linear 实现通道注意力，适用于通用特征块
     """
     def __init__(self, channels, reduction=16):
-        super(CBAM, self).__init__()
+        super(CBAMBlock, self).__init__()
         # 通道注意力模块
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
@@ -2193,10 +2194,12 @@ class SpatialAttention(nn.Module):
         return self.sigmoid(x)
 
 
-class CBAM(nn.Module):
-    """结合通道和空间注意力，放在Skip Connection处"""
+class CBAMSkip(nn.Module):
+    """结合通道和空间注意力，放在Skip Connection处
+    使用 ChannelAttention 和 SpatialAttention 模块，专门用于跳跃连接特征增强
+    """
     def __init__(self, in_planes, ratio=16, kernel_size=7):
-        super(CBAM, self).__init__()
+        super(CBAMSkip, self).__init__()
         self.ca = ChannelAttention(in_planes, ratio)
         self.sa = SpatialAttention(kernel_size)
 
@@ -2256,7 +2259,7 @@ class DecoderBlock(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        self.attention = CBAM(skip_channels) # 对跳跃连接特征应用注意力
+        self.attention = CBAMSkip(skip_channels) # 对跳跃连接特征应用注意力
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels + skip_channels, out_channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),

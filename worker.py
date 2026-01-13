@@ -2596,7 +2596,7 @@ class TrainThread(QThread):
                 # 再执行传统形态学后处理（与验证阶段参数一致）
                 pred_mask_final = self.post_process_mask(
                     pred_mask_processed,
-                    min_size=0,
+                    min_size=150,
                     use_morphology=True,
                     keep_largest=False,
                     fill_holes=True,
@@ -2713,7 +2713,7 @@ class TrainThread(QThread):
                 # 再执行传统形态学后处理（与验证阶段参数一致）
                 pred_mask_processed = self.post_process_mask(
                     pred_mask_tensor,
-                    min_size=0,
+                    min_size=150,
                     use_morphology=True,
                     keep_largest=False,
                     fill_holes=True,
@@ -2966,7 +2966,7 @@ class TrainThread(QThread):
                 for i in range(preds.shape[0]):
                     preds[i, 0] = self.post_process_mask(
                         preds[i, 0], 
-                        min_size=30, 
+                        min_size=150, 
                         use_morphology=True,
                         keep_largest=False,  # 允许多发病灶同时存在
                         fill_holes=True,     # 填充孔洞，去除假阴性空洞
@@ -3205,7 +3205,7 @@ class TrainThread(QThread):
                     # 再执行传统形态学后处理，但不移除小区域（min_size=0）
                     pred_mask_processed = self.post_process_mask(
                         pred_mask_tensor,
-                        min_size=0,
+                        min_size=150,
                         use_morphology=True,
                         keep_largest=False,  # 允许多发病灶同时存在
                         fill_holes=True,     # 填充孔洞，去除假阴性空洞
@@ -4905,6 +4905,13 @@ class TrainThread(QThread):
                     images, masks = batch_data
                     images, masks = images.to(device), masks.float().to(device)
                     
+                    # 【数据诊断】首个批次打印输入像素范围，确认归一化是否正常
+                    if batch_idx == 0:
+                        img_min = float(images.min().item())
+                        img_max = float(images.max().item())
+                        img_mean = float(images.mean().item())
+                        print(f"[数据诊断] 输入像素范围 (min/max/mean): {img_min:.3f} / {img_max:.3f} / {img_mean:.3f}")
+                    
                     # 【通道一致性检查】确保数据通道数与模型匹配
                     # DeepLabV3+ 使用"伪三通道流"：数据加载器将单通道图像转换为3通道RGB
                     # 模型固定为3通道输入，因此 images 应该是 [B, 3, H, W]
@@ -5452,7 +5459,7 @@ class TrainThread(QThread):
                             # 再执行传统形态学后处理，但不移除小区域（min_size=0）
                             pred_mask_processed = self.post_process_mask(
                                 pred_mask_tensor,
-                                min_size=0,
+                                min_size=150,
                                 use_morphology=True,
                                 keep_largest=False,  # 允许多发病灶同时存在
                                 fill_holes=True,     # 填充孔洞，去除假阴性空洞
@@ -5732,7 +5739,7 @@ class TrainThread(QThread):
                             # 再执行传统形态学后处理
                             pred_mask_processed = self.post_process_mask(
                                 pred_mask_tensor,
-                                min_size=0,
+                                min_size=150,
                                 use_morphology=True,
                                 keep_largest=False,
                                 fill_holes=True,
@@ -8408,7 +8415,7 @@ class TrainThread(QThread):
             'recall': recall_scores,
             'is_empty': is_empty_list,
         }
-    
+
     def calculate_batch_dice(self, pred, target, smooth=1e-7):
         """
         计算一个批次中每个样本的Dice系数。
@@ -9275,16 +9282,17 @@ class TrainThread(QThread):
     @staticmethod
     def post_process_mask(
         pred_mask,
-        min_size=50,
+        min_size=150,
         use_morphology=True,
-        keep_largest=True,
+        keep_largest=False,
         fill_holes=True,
         enable_opening=True,
         opening_kernel_size: int = 3,
         opening_iterations: int = 1,
         prob_map=None,
-        confidence_gate: float = 0.85,
+        confidence_gate: float = 0.90,
         min_largest_avg_prob: float = 0.5,
+        edge_margin: int = 10,
     ):
         """
         后处理优化预测mask - 增强版
@@ -9411,6 +9419,16 @@ class TrainThread(QThread):
                         pred_binary = np.zeros_like(pred_binary)
                     else:
                         pred_binary = np.isin(labeled, keep_labels).astype(np.uint8)
+                        # 【边缘抑制】可选：移除质心靠近边界的伪影（例如头骨高亮）
+                        if edge_margin and edge_margin > 0:
+                            coords = ndimage.center_of_mass(pred_binary, labeled, keep_labels)
+                            H, W = pred_binary.shape
+                            remove_labels = []
+                            for lbl, (cy, cx) in zip(keep_labels, coords):
+                                if cx < edge_margin or cx > W - edge_margin - 1 or cy < edge_margin or cy > H - edge_margin - 1:
+                                    remove_labels.append(lbl)
+                            if remove_labels:
+                                pred_binary = np.isin(labeled, np.setdiff1d(keep_labels, remove_labels)).astype(np.uint8)
         
         # 返回原始类型
         if is_tensor:
@@ -10853,10 +10871,11 @@ class PredictThread(QThread):
     def _post_process(self, prob_tensor):
         processed = TrainThread.post_process_mask(
             prob_tensor.squeeze(0), 
-            min_size=30, 
+            min_size=150, 
             use_morphology=True,
             keep_largest=False,  # 允许多发病灶同时存在
-            fill_holes=True     # 填充孔洞，去除假阴性空洞
+            fill_holes=True,     # 填充孔洞，去除假阴性空洞
+            prob_map=prob_tensor.squeeze(0)
         )
         if isinstance(processed, torch.Tensor):
             return processed.unsqueeze(0).unsqueeze(0)

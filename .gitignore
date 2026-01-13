@@ -144,7 +144,7 @@ runs/
 logs/
 tensorboard/
 tb_logs/
-
+.aider*
 # Weights & Biases
 wandb/
 
@@ -346,4 +346,17 @@ test_*.py
 # 注释：如果某些文件需要强制跟踪，可以使用以下命令：
 # git add -f <file>
 
+.aider
+# --- Aider AI Tools ---
+# 忽略聊天记录（防止隐私泄露）
+.aider.chat.history.md
+# 忽略输入历史（类似 bash_history）
+.aider.input.history
+# 忽略 Aider 的代码索引缓存（那个报错的 .tags.cache 文件夹）
+.aider.tags.cache*
+# 忽略所有以 .aider 开头的文件（以此类推）
 .aider*
+
+# --- Environment Secrets (重要！) ---
+# 既然你在用 API Key，防止手滑把 .env 传上去
+.env
