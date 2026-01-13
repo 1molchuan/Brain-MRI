@@ -2635,18 +2635,15 @@ class TrainThread(QThread):
             # 为了兼容性，计算完整的指标字典（使用找到的最佳阈值）
             # 使用 scan_best_threshold 计算完整指标，但只使用我们找到的阈值
             # 注意：需要确保使用numpy数组，如果之前用的是tensor需要转换
-            if use_gpu_for_gwo:
-                # 如果用的是GPU tensor，需要转换回numpy
-                if isinstance(all_probs_tensor, torch.Tensor):
-                    all_probs_for_metrics = all_probs_tensor.cpu().numpy()
-                    all_masks_for_metrics = all_masks_tensor.cpu().numpy()
-                else:
-                    all_probs_for_metrics = all_probs_np
-                    all_masks_for_metrics = all_masks_np
+            # 统一处理：无论GPU还是CPU模式，都转换为numpy数组
+            if isinstance(all_probs_tensor, torch.Tensor):
+                # 如果是tensor，转换回numpy
+                all_probs_for_metrics = all_probs_tensor.cpu().numpy()
+                all_masks_for_metrics = all_masks_tensor.cpu().numpy()
             else:
-                # CPU模式，直接使用numpy数组
-                all_probs_for_metrics = all_probs_np
-                all_masks_for_metrics = all_masks_np
+                # 如果已经是numpy数组，直接使用（CPU模式）
+                all_probs_for_metrics = all_probs_tensor
+                all_masks_for_metrics = all_masks_tensor
             
             pred_bool = (all_probs_for_metrics >= best_threshold)
             gt_bool = (all_masks_for_metrics > 0.5)
@@ -2681,9 +2678,17 @@ class TrainThread(QThread):
             print(f">>> [GWO] 搜索完成! 最佳阈值: {best_threshold:.4f}, 最佳 Dice: {best_dice:.4f}")
             
             # 【显存优化】删除拼接后的数组和中间变量
+            # 注意：在CPU模式下，all_probs_tensor就是all_probs_np，所以只需要删除一次
             if use_gpu_for_gwo:
+                # GPU模式：删除tensor和numpy数组
                 del all_probs_tensor, all_masks_tensor
-            del all_probs_np, all_masks_np, pred_bool, gt_bool
+                del all_probs_np, all_masks_np
+            else:
+                # CPU模式：all_probs_tensor就是all_probs_np，只删除一次
+                del all_probs_np, all_masks_np
+            
+            # 删除中间变量
+            del pred_bool, gt_bool
             if 'all_probs_for_metrics' in locals():
                 del all_probs_for_metrics, all_masks_for_metrics
             if torch.cuda.is_available():
