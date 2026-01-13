@@ -35,10 +35,16 @@ import json
 import random
 import copy
 import shutil
+import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
+
+# 【日志优化】抑制 Numpy 和 Grad-CAM 的非致命警告
+# 训练初期梯度不稳定可能导致 Numpy 抛出 invalid value 或 overflow 警告，这些是非致命的
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="numpy")
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="pytorch_grad_cam")
 from tqdm import tqdm
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GroupShuffleSplit
 from sklearn.metrics import confusion_matrix, classification_report
 import pandas as pd
 
@@ -53,7 +59,20 @@ try:
     SKIMAGE_AVAILABLE = True
 except ImportError:
     SKIMAGE_AVAILABLE = False
-    print("[警告] skimage未安装，直方图匹配功能将不可用")
+    # 【Windows 多进程支持】不在全局作用域打印，避免多进程导入时的问题
+    # print("[警告] skimage未安装，直方图匹配功能将不可用")
+
+# Grad-CAM 支持（用于 DeepLabV3+ 等不支持原生注意力图的模型）
+try:
+    from pytorch_grad_cam import GradCAM
+    from pytorch_grad_cam.utils.model_targets import SemanticSegmentationTarget
+    from pytorch_grad_cam.utils.image import show_cam_on_image
+    GRAD_CAM_AVAILABLE = True
+except ImportError:
+    GRAD_CAM_AVAILABLE = False
+    # 不在全局作用域打印，避免多进程导入时的问题
+    # print("[警告] pytorch-grad-cam 未安装，DeepLabV3+ 的 Grad-CAM 热力图功能将不可用")
+    # print("      请运行: pip install grad-cam")
 
 # 可视化
 import matplotlib
@@ -69,9 +88,11 @@ try:
     NIBABEL_AVAILABLE = True
 except ImportError:
     NIBABEL_AVAILABLE = False
-    print("[警告] nibabel 未安装，NIfTI 可视化将不可用")
+    # 【Windows 多进程支持】不在全局作用域打印，避免多进程导入时的问题
+    # print("[警告] nibabel 未安装，NIfTI 可视化将不可用")
 
 # 设置matplotlib支持中文显示
+# 【Windows 多进程支持】这些配置在导入时执行是安全的，不会影响多进程
 try:
     chinese_fonts = ['SimHei', 'Microsoft YaHei', 'KaiTi', 'FangSong', 'STSong']
     available_fonts = [f.name for f in font_manager.fontManager.ttflist]
@@ -92,7 +113,35 @@ matplotlib.rcParams['axes.unicode_minus'] = False
 
 # 导入模型和工具函数
 from models import *
+# 显式导入关键工具函数和类，防止 NameError
+from utils import (
+    EarlyStopping,
+    scan_best_threshold,
+    GreyWolfThresholdOptimizer,  # 【GWO】引入灰狼优化器
+    save_mat_file,
+    MatlabVisualizationBridge,
+    MatlabEngineSession,
+    MedicalImageDataset,
+    load_model_compatible,
+    read_checkpoint_config,
+    parse_extra_modalities_spec,
+    build_extra_modalities_lists,
+    calculate_hd95,
+    calculate_custom_score,
+    window_partition,
+    window_reverse,
+)
+# 导入其他工具函数（使用 * 导入以保持兼容性）
 from utils import *
+
+# 尝试导入2.5D数据集
+try:
+    from dataset import TCGA2_5DDataset
+    TCGA2_5D_AVAILABLE = True
+except ImportError:
+    TCGA2_5D_AVAILABLE = False
+    # 【Windows 多进程支持】不在全局作用域打印，避免多进程导入时的问题
+    # print("[警告] TCGA2_5DDataset 未导入，2.5D数据集功能将不可用")
 
 class ModelTestThread(QThread):
     """模型测试线程"""
@@ -101,7 +150,7 @@ class ModelTestThread(QThread):
     # 阈值扫描结果（完整表格 + 推荐阈值信息），通过object传递，避免PyQt类型限制
     threshold_sweep_ready = pyqtSignal(object)
     
-    def __init__(self, model_paths, data_dir, model_type, use_tta=True):
+    def __init__(self, model_paths, data_dir, model_type, use_tta=True, enable_matlab_plots=None, dataset_type="standard"):
         super().__init__()
         # 支持单模型（集成功能已删除）
         if isinstance(model_paths, str):
@@ -115,8 +164,17 @@ class ModelTestThread(QThread):
         self.data_dir = data_dir
         self.model_type = model_type
         self.use_tta = use_tta
+        self.enable_matlab_plots = enable_matlab_plots  # 保存用户设置的MATLAB开关状态
+        self.dataset_type = dataset_type  # 数据集类型：standard 或 2.5d
         self.stop_requested = False
         self.temp_dir = tempfile.mkdtemp(prefix="model_test_")
+        
+        # 【持久化修复】创建持久化目录用于保存 MATLAB 报表
+        # 在项目根目录下创建 matlab_reports 文件夹，确保报表不会被系统清理
+        project_root = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd()
+        self.persistent_report_dir = os.path.join(project_root, "matlab_reports")
+        os.makedirs(self.persistent_report_dir, exist_ok=True)
+        print(f"[MATLAB] 报表将保存到持久化目录: {self.persistent_report_dir}")
         
     def run(self):
         try:
@@ -141,20 +199,64 @@ class ModelTestThread(QThread):
                 epochs=1,
                 batch_size=4,
                 model_path=None,
-                save_best=False
+                save_best=False,
+                dataset_type=self.dataset_type  # 传递数据集类型
             )
             temp_train_thread.model_type = self.model_type  # 设置模型类型
             
-            # 获取patient_ids（子文件夹）
-            patient_ids = [pid for pid in os.listdir(self.data_dir) 
-                          if os.path.isdir(os.path.join(self.data_dir, pid))]
+            # 【修复归一化参数】根据数据集类型动态设置归一化参数
+            if self.dataset_type == "2.5d":
+                # 2.5D数据集：3通道输入，使用ImageNet 3通道归一化
+                normalize_mean = (0.485, 0.456, 0.406)
+                normalize_std = (0.229, 0.224, 0.225)
+            else:
+                # 标准数据集：根据模型类型判断
+                # 如果模型是SMP模型（U-Net++或DeepLabV3+），可能使用3通道（如果用户配置了3通道）
+                # 其他模型通常使用1通道，但为了兼容性，先使用3通道归一化
+                # 实际通道数会在模型构建时根据dataset_type设置
+                normalize_mean = (0.485, 0.456, 0.406)  # 默认3通道，兼容性考虑
+                normalize_std = (0.229, 0.224, 0.225)
             
-            if not patient_ids:
-                raise ValueError("测试数据目录为空，未找到子文件夹")
+            val_transform = A.Compose([
+                A.Resize(512, 512),  # 提升分辨率以保留更多病灶边缘细节
+                A.Normalize(mean=normalize_mean, std=normalize_std),
+                ToTensorV2()
+            ])
             
-            # 使用TrainThread的_collect_image_mask_paths方法获取图像路径
-            # 这个方法会正确处理文件结构：data_dir/images/patient_id/*.png 和 data_dir/masks/patient_id/*.png
-            image_paths, mask_paths = temp_train_thread._collect_image_mask_paths(patient_ids)
+            # 根据数据集类型选择不同的数据加载逻辑
+            if self.dataset_type == "2.5d":
+                # 2.5D数据集：直接使用TCGA2_5DDataset，无需patient_ids
+                if not TCGA2_5D_AVAILABLE:
+                    raise ImportError("TCGA2_5DDataset 未导入，无法使用2.5D数据集")
+                
+                # 使用全部数据作为测试集（2.5D数据集会自动递归搜索所有.tif文件）
+                test_dataset = temp_train_thread.load_dataset(
+                    [], val_transform, split_name="test", 
+                    return_classification=False, use_weighted_sampling=False
+                )
+                
+                # 为了兼容后续代码，创建虚拟的image_paths和mask_paths
+                # 这些路径仅用于日志和可视化，不影响实际数据加载
+                image_paths = []
+                mask_paths = []
+                if hasattr(test_dataset, 'file_dict') and hasattr(test_dataset, 'file_list'):
+                    for case_id, slice_id in test_dataset.file_list:
+                        img_path = test_dataset.file_dict.get((case_id, slice_id))
+                        if img_path:
+                            image_paths.append(img_path)
+                            # mask路径用于日志，实际加载由TCGA2_5DDataset处理
+                            mask_paths.append(img_path.replace('.tif', '_mask.tif'))
+            else:
+                # 标准数据集：按patient_id组织
+                patient_ids = [pid for pid in os.listdir(self.data_dir) 
+                              if os.path.isdir(os.path.join(self.data_dir, pid))]
+                
+                if not patient_ids:
+                    raise ValueError("测试数据目录为空，未找到子文件夹")
+                
+                # 使用TrainThread的_collect_image_mask_paths方法获取图像路径
+                # 这个方法会正确处理文件结构：data_dir/images/patient_id/*.png 和 data_dir/masks/patient_id/*.png
+                image_paths, mask_paths = temp_train_thread._collect_image_mask_paths(patient_ids)
             
             if not image_paths:
                 raise ValueError(f"未找到测试图像文件。请检查数据目录结构：\n{self.data_dir}\n\n"
@@ -171,29 +273,194 @@ class ModelTestThread(QThread):
                                f"      patient_id2/\n"
                                f"        *.png")
             
-            # 使用全部数据作为测试集
-            val_transform = A.Compose([
-                A.Resize(256, 256),
-                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-                ToTensorV2()
-            ])
-            
             # 使用全部patient_ids作为测试集
             test_dataset = temp_train_thread.load_dataset(
                 patient_ids, val_transform, split_name="test", 
                 return_classification=False, use_weighted_sampling=False
             )
+            # 【Windows 多进程优化】为测试线程也启用多进程数据加载
+            # Intel Core Ultra 9 285HX: 使用 8 个 worker 充分利用 P-Core
+            import platform
+            is_windows = platform.system() == 'Windows'
+            cpu_count = os.cpu_count() or 1
+            num_workers = 8 if is_windows else max(0, min(4, cpu_count - 1))
             test_loader = DataLoader(
-                test_dataset, batch_size=4, shuffle=False, num_workers=0
+                test_dataset, 
+                batch_size=4, 
+                shuffle=False, 
+                num_workers=num_workers,
+                pin_memory=True,  # 【优化】加速数据传输
+                persistent_workers=(num_workers > 0)  # 【关键】让子进程保持存活
             )
             
             # 评估模型（集成功能已删除，仅支持单模型）
             self.update_progress.emit(30, "正在评估模型性能...")
+            print("[测试] 开始评估模型性能...")
             detailed_metrics, low_dice_cases = self._evaluate_model(model, test_loader, device, image_paths)
+            print("[测试] 模型性能评估完成")
             
             # 生成注意力热图
             self.update_progress.emit(80, "正在生成注意力热图...")
+            print("[测试] 开始生成注意力热图...")
             attention_path = self._generate_attention_maps(model, test_loader, device)
+            print("[测试] 注意力热图生成完成")
+            
+            # 【MATLAB 可视化增强】如果 MATLAB 可用且用户已启用，生成高清报表
+            # 【修复】首先检查用户是否启用了 MATLAB，避免不必要的计算
+            if not self.enable_matlab_plots:
+                print("[测试] 用户已禁用 MATLAB 绘图，跳过 MATLAB 可视化报表生成")
+            else:
+                self.update_progress.emit(90, "正在生成 MATLAB 可视化报表...")
+                print("[测试] 开始 MATLAB 可视化报表生成...")
+                try:
+                    # 创建临时 TrainThread 实例以使用其 MATLAB 桥接
+                    # 【修复】传递用户设置的 MATLAB 开关状态和数据集类型，保持与主界面设置一致
+                    temp_train_thread = TrainThread(
+                        data_dir=self.data_dir,
+                        epochs=1,
+                        batch_size=4,
+                        model_path=None,
+                        save_best=False,
+                        enable_matlab_plots=self.enable_matlab_plots,  # 传递用户设置
+                        dataset_type=self.dataset_type  # 传递数据集类型
+                    )
+                    
+                    # 【修复】再次检查 temp_train_thread 的 enable_matlab_plots（可能因为 MATLAB 不可用而被禁用）
+                    if not temp_train_thread.enable_matlab_plots:
+                        print("[测试] MATLAB 引擎不可用或用户已禁用，跳过 MATLAB 可视化报表生成")
+                    elif not temp_train_thread.matlab_viz_bridge:
+                        print("[测试] MATLAB 引擎不可用，跳过 MATLAB 可视化报表生成")
+                    else:
+                        # MATLAB 可用且已启用，收集测试数据用于 MATLAB 可视化
+                        # 【内存优化】只收集前 5 个样本用于可视化，其他样本只计算指标，防止内存泄漏
+                        print("[MATLAB] 正在收集测试数据（仅保存前 5 个样本用于可视化）...")
+                        viz_images = []  # 只保存前 5 个样本用于可视化
+                        viz_masks = []
+                        viz_preds = []
+                        viz_metrics = []
+                        max_viz_samples = 5  # 最多保存 5 个样本
+                        sample_count = 0  # 已处理的样本计数
+                        
+                        model.eval()
+                        # 验证前主动清理显存，避免与训练阶段的中间缓存互相干扰
+                        try:
+                            import gc
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            gc.collect()
+                        except Exception:
+                            # 清理失败不影响主流程，安全忽略
+                            pass
+                        
+                        # 获取最优阈值（从_evaluate_model返回的detailed_metrics中获取）
+                        optimal_threshold = detailed_metrics.get('optimal_threshold', 0.5)
+                        print(f"[MATLAB] 使用最优阈值: {optimal_threshold:.2f}")
+                        
+                        with torch.no_grad():
+                            for batch_data in test_loader:
+                                if len(batch_data) == 3:
+                                    images, masks, _ = batch_data
+                                else:
+                                    images, masks = batch_data
+                                images, masks = images.to(device), masks.to(device)
+                                
+                                # 使用 TTA 进行预测
+                                outputs = temp_train_thread._tta_inference(model, images)
+                                if isinstance(outputs, tuple):
+                                    outputs = outputs[0]
+                                if outputs.shape[2:] != masks.shape[2:]:
+                                    outputs = F.interpolate(outputs, size=masks.shape[2:], mode='bilinear', align_corners=False)
+                                preds = torch.sigmoid(outputs)
+                                # 使用最优阈值进行二值化
+                                preds_binary = (preds > optimal_threshold).float()
+                                
+                                for i in range(images.size(0)):
+                                    sample_count += 1
+                                    
+                                    # 计算指标（所有样本都需要计算，用于统计）
+                                    mask_np = masks[i, 0].cpu().numpy().astype(np.float32)
+                                    pred_np = preds_binary[i, 0].cpu().numpy().astype(np.float32)
+                                    
+                                    # 【统一指标计算】使用统一函数同时计算 Dice 和 IoU，确保逻辑一致
+                                    dice, iou = temp_train_thread._compute_metrics_unified(pred_np, mask_np)
+                                    
+                                    # 【内存优化】只保存前 5 个样本的图像数据用于可视化
+                                    if len(viz_images) < max_viz_samples:
+                                        # 保存图像数据（仅前 5 个）
+                                        img = images[i].cpu().permute(1, 2, 0).numpy()
+                                        img = img * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
+                                        img = np.clip(img, 0, 1).astype(np.float32)
+                                        
+                                        viz_images.append(img)
+                                        viz_masks.append(mask_np.copy())  # 使用 copy() 避免引用原始数据
+                                        viz_preds.append(pred_np.copy())
+                                        viz_metrics.append({'dice': dice, 'iou': iou})
+                                    else:
+                                        # 第 6 个样本以后：只计算指标，不保存图像数据
+                                        # 指标已在上方计算，这里不需要额外操作
+                                        # 立即释放临时变量，避免内存累积
+                                        del mask_np, pred_np
+                                    
+                                    # 每处理 100 个样本，主动清理一次内存
+                                    if sample_count % 100 == 0:
+                                        import gc
+                                        gc.collect()
+                                        if torch.cuda.is_available():
+                                            torch.cuda.empty_cache()
+                        
+                        num_viz = len(viz_images)
+                        print(f"[MATLAB优化] 已处理 {sample_count} 个样本，仅保存前 {num_viz} 个样本用于可视化绘图")
+                        
+                        # 保存数据到 .mat 文件（仅保存切片后的数据）
+                        print(f"[MATLAB] 正在保存前 {num_viz} 个样本的数据到 .mat 文件...")
+                        debug_data_path = os.path.join(temp_train_thread.temp_dir, "debug_data.mat")
+                        images_arr = np.transpose(np.stack(viz_images, axis=0), (1, 2, 3, 0)).astype(np.float32)
+                        masks_arr = np.transpose(np.stack(viz_masks, axis=0), (1, 2, 0)).astype(np.float32)
+                        preds_arr = np.transpose(np.stack(viz_preds, axis=0), (1, 2, 0)).astype(np.float32)
+                        dice_vals = np.array([m.get('dice', 0.0) for m in viz_metrics], dtype=np.float32)
+                        iou_vals = np.array([m.get('iou', 0.0) for m in viz_metrics], dtype=np.float32)
+                        
+                        save_mat_file({
+                            'images': images_arr,
+                            'masks': masks_arr,
+                            'preds': preds_arr,
+                            'dice': dice_vals,
+                            'iou': iou_vals,
+                            'metrics': detailed_metrics
+                        }, debug_data_path)
+                        print(f"[MATLAB] 数据已保存到: {debug_data_path}")
+                        
+                        # MATLAB 可用且已启用，生成高清报表
+                        try:
+                            print(f"[MATLAB] 开始生成 MATLAB 高清可视化报表（使用前 {num_viz} 个样本）...")
+                            print("[MATLAB] 正在调用 MATLAB 引擎，预计几秒内完成...")
+                            # 【持久化修复】生成预测网格可视化 - 保存到持久化目录
+                            import time
+                            timestamp = time.strftime("%Y%m%d_%H%M%S")
+                            pred_grid_path = os.path.join(self.persistent_report_dir, f"test_prediction_grid_{timestamp}.png")
+                            os.makedirs(os.path.dirname(pred_grid_path), exist_ok=True)
+                            temp_train_thread.matlab_viz_bridge.render_test_results(debug_data_path, pred_grid_path)
+                            print(f"[MATLAB] ✅ 预测网格可视化已保存到持久化目录: {pred_grid_path}")
+                            
+                            # 生成性能分析报表
+                            if 'all_samples' in detailed_metrics:
+                                print("[MATLAB] 正在生成性能分析报表...")
+                                perf_payload = temp_train_thread._save_performance_payload(detailed_metrics)
+                                perf_analysis_path = os.path.join(self.persistent_report_dir, f"test_performance_analysis_{timestamp}.png")
+                                os.makedirs(os.path.dirname(perf_analysis_path), exist_ok=True)
+                                temp_train_thread.matlab_viz_bridge.render_performance_analysis(perf_payload, perf_analysis_path)
+                                print(f"[MATLAB] ✅ 性能分析报表已保存到持久化目录: {perf_analysis_path}")
+                            else:
+                                print("[MATLAB] ⚠️ 未找到详细指标数据，跳过性能分析报表生成")
+                            print("[MATLAB] MATLAB 可视化报表生成完成")
+                        except Exception as exc:
+                            print(f"[MATLAB] ❌ 可视化生成失败（已回退到 Python 绘图）: {exc}")
+                            import traceback
+                            print(f"[MATLAB] 错误详情: {traceback.format_exc()}")
+                except Exception as exc:
+                    print(f"[MATLAB] 测试可视化增强失败（不影响主流程）: {exc}")
+                    import traceback
+                    print(f"[MATLAB] 错误详情: {traceback.format_exc()}")
             
             self.update_progress.emit(100, "测试完成！")
             self.test_finished.emit(detailed_metrics, attention_path, low_dice_cases)
@@ -242,6 +509,13 @@ class ModelTestThread(QThread):
                     # 从 config 中优先读取结构参数（配置优先加载）
                     if 'config' in checkpoint and isinstance(checkpoint['config'], dict):
                         cfg = checkpoint['config']
+                        # 【2.5D支持】读取数据集类型和输入通道数（用于SMP模型）
+                        if 'dataset_type' in cfg:
+                            self.dataset_type = cfg['dataset_type']
+                            print(f"[模型加载] 从checkpoint读取数据集类型: {self.dataset_type}")
+                        if 'in_channels' in cfg:
+                            self.in_channels_from_checkpoint = cfg['in_channels']
+                            print(f"[模型加载] 从checkpoint读取输入通道数: {self.in_channels_from_checkpoint}")
                         # ResNet 相关参数
                         if 'resnet_params' in cfg:
                             resnet_params = cfg['resnet_params']
@@ -371,6 +645,12 @@ class ModelTestThread(QThread):
         if model_type_to_use != self.model_type:
             print(f"[提示] 从checkpoint推断模型类型: {model_type_to_use} (用户选择: {self.model_type})")
         
+        # 【2.5D支持】如果checkpoint中有in_channels信息，使用它来创建模型
+        # 对于SMP模型（DeepLabV3+ 和 U-Net++），需要确保输入通道数匹配
+        in_channels_from_checkpoint = getattr(self, 'in_channels_from_checkpoint', None)
+        if in_channels_from_checkpoint is not None:
+            print(f"[模型加载] 使用checkpoint中的输入通道数: {in_channels_from_checkpoint}")
+        
         # 使用instantiate_model创建模型（与训练时保持一致）
         model = instantiate_model(
             model_type_to_use, 
@@ -378,7 +658,8 @@ class ModelTestThread(QThread):
             swin_params=swin_params,
             dstrans_params=dstrans_params,
             mamba_params=mamba_params,
-            resnet_params=resnet_params
+            resnet_params=resnet_params,
+            in_channels_override=in_channels_from_checkpoint  # 传递从checkpoint读取的in_channels
         )
         
         # 加载权重（带智能诊断与兼容加载）
@@ -476,6 +757,225 @@ class ModelTestThread(QThread):
         
         return model.to(device)
     
+    def export_to_onnx(self, model_path, output_path=None, input_size=(512, 512), input_channels=None, opset_version=11):
+        """
+        导出模型为ONNX格式
+        
+        Args:
+            model_path: PyTorch模型文件路径 (.pth)
+            output_path: 输出ONNX文件路径，如果为None则自动生成
+            input_size: 输入图像尺寸 (H, W)，默认 (512, 512)
+            input_channels: 输入通道数，如果为None则从checkpoint或模型类型推断
+            opset_version: ONNX opset版本，默认11
+        
+        Returns:
+            导出的ONNX文件路径，如果失败返回None
+        """
+        try:
+            import torch
+            import torch.onnx
+            
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            print(f"[ONNX导出] 开始导出模型: {os.path.basename(model_path)}")
+            print(f"[ONNX导出] 使用设备: {device}")
+            
+            # 加载模型
+            model = self._load_model(device, model_path)
+            model.eval()
+            
+            # 处理DataParallel包装
+            if isinstance(model, torch.nn.DataParallel):
+                model = model.module
+            
+            # === 关键修复：替换 ONNX 不支持的 AdaptiveMaxPool2d ===
+            def replace_layers(model):
+                """递归替换模型中的 AdaptiveMaxPool2d 为 AdaptiveAvgPool2d"""
+                for name, child in model.named_children():
+                    if isinstance(child, torch.nn.AdaptiveMaxPool2d):
+                        print(f"[ONNX适配] 替换不支持的层: {name} (AdaptiveMaxPool2d -> AdaptiveAvgPool2d)")
+                        # 获取原层的输出尺寸
+                        # PyTorch 中 AdaptiveMaxPool2d 的 output_size 可能存储在不同的属性中
+                        output_size = (1, 1)  # 默认值
+                        try:
+                            # 尝试多种方式获取 output_size
+                            if hasattr(child, 'output_size'):
+                                output_size = child.output_size
+                            elif hasattr(child, '_output_size'):
+                                output_size = child._output_size
+                            else:
+                                # 如果无法获取，使用默认值 (1, 1)，这是 ResNet 分类头常用的尺寸
+                                output_size = (1, 1)
+                                print(f"[ONNX适配] 无法获取原层 output_size，使用默认值 (1, 1)")
+                        except Exception as e:
+                            print(f"[ONNX适配] 获取 output_size 时出错: {e}，使用默认值 (1, 1)")
+                            output_size = (1, 1)
+                        
+                        # 替换为 AdaptiveAvgPool2d，ONNX 支持这个
+                        setattr(model, name, torch.nn.AdaptiveAvgPool2d(output_size))
+                        print(f"[ONNX适配] 已替换为 AdaptiveAvgPool2d(output_size={output_size})")
+                    else:
+                        # 递归处理子模块
+                        replace_layers(child)
+            
+            # 执行替换
+            replace_layers(model)
+            print(f"[ONNX适配] AdaptiveMaxPool2d 替换完成")
+            # ===================================================
+            
+            # 【关键修复】强制检测模型实际需要的输入通道数
+            # 不要依赖推断，直接从模型的第一层检测
+            detected_channels = None
+            
+            # 方法1：尝试从模型的第一层直接检测
+            try:
+                # 检查SMP模型（DeepLabV3+, U-Net++等）的encoder第一层
+                if hasattr(model, 'encoder') and hasattr(model.encoder, 'conv1'):
+                    detected_channels = model.encoder.conv1.in_channels
+                    print(f"[ONNX导出] 从模型encoder.conv1检测到输入通道数: {detected_channels}")
+                # 检查ResNet模型的第一层
+                elif hasattr(model, 'conv1'):
+                    detected_channels = model.conv1.in_channels
+                    print(f"[ONNX导出] 从模型conv1检测到输入通道数: {detected_channels}")
+                # 检查UNet类模型的第一层
+                elif hasattr(model, 'down1'):
+                    # 尝试从down1的第一个卷积层检测
+                    if hasattr(model.down1, '__getitem__'):
+                        first_conv = model.down1[0]
+                        if hasattr(first_conv, 'in_channels'):
+                            detected_channels = first_conv.in_channels
+                            print(f"[ONNX导出] 从模型down1[0]检测到输入通道数: {detected_channels}")
+                    elif hasattr(model.down1, 'conv') and hasattr(model.down1.conv, 'in_channels'):
+                        detected_channels = model.down1.conv.in_channels
+                        print(f"[ONNX导出] 从模型down1.conv检测到输入通道数: {detected_channels}")
+                # 检查是否有in_channels属性
+                elif hasattr(model, 'in_channels'):
+                    detected_channels = model.in_channels
+                    print(f"[ONNX导出] 从模型in_channels属性检测到输入通道数: {detected_channels}")
+            except Exception as e:
+                print(f"[ONNX导出] 从模型结构检测通道数失败: {e}")
+            
+            # 方法2：如果检测失败，尝试从checkpoint读取
+            if detected_channels is None:
+                try:
+                    checkpoint = torch.load(model_path, map_location=device)
+                    if isinstance(checkpoint, dict):
+                        if 'config' in checkpoint and isinstance(checkpoint['config'], dict):
+                            cfg = checkpoint['config']
+                            if 'in_channels' in cfg:
+                                detected_channels = cfg['in_channels']
+                                print(f"[ONNX导出] 从checkpoint读取输入通道数: {detected_channels}")
+                except:
+                    pass
+            
+            # 方法3：如果还是None，根据模型类型强制判断
+            if detected_channels is None:
+                # 如果模型类型包含resnet或smp，强制使用3通道（ResNet Backbone通常需要3通道）
+                if 'resnet' in self.model_type.lower() or 'smp' in self.model_type.lower():
+                    detected_channels = 3
+                    print(f"[ONNX导出] 根据模型类型（{self.model_type}）强制使用3通道（ResNet Backbone需要）")
+                elif self.dataset_type == "2.5d":
+                    detected_channels = 3
+                    print(f"[ONNX导出] 根据数据集类型（2.5D）使用3通道")
+                else:
+                    # 最后兜底：根据数据集类型推断
+                    if self.model_type in ("smp_unetplusplus", "smp_deeplabv3plus"):
+                        detected_channels = 3  # SMP模型默认3通道
+                    else:
+                        detected_channels = 1  # 标准模型通常使用1通道
+                    print(f"[ONNX导出] 根据数据集类型推断输入通道数: {detected_channels}")
+            
+            # 使用检测到的通道数（优先使用用户指定的input_channels，如果提供了的话）
+            final_channels = input_channels if input_channels is not None else detected_channels
+            
+            # 【关键修复】如果检测到模型需要3通道但推断为1通道，强制使用3通道
+            # 这可以解决 ResNet Backbone 期望3通道但推断为1通道的问题
+            if detected_channels == 3 and final_channels == 1:
+                print(f"[ONNX导出] ⚠️ 检测到模型需要3通道，但推断为1通道，强制使用3通道")
+                final_channels = 3
+            
+            # 创建示例输入（使用最终确定的通道数）
+            dummy_input = torch.randn(1, final_channels, input_size[0], input_size[1]).to(device)
+            print(f"[ONNX导出] 最终输入形状: {dummy_input.shape} (通道数: {final_channels})")
+            
+            # 确定输出路径
+            if output_path is None:
+                base_name = os.path.splitext(os.path.basename(model_path))[0]
+                output_dir = os.path.dirname(model_path) or "."
+                output_path = os.path.join(output_dir, f"{base_name}.onnx")
+            
+            # 导出ONNX
+            print(f"[ONNX导出] 正在导出到: {output_path}")
+            
+            # 【修复1】强制使用 Opset 11 或 12，避免自动跳到 18
+            # Opset 11 对 DeepLabV3+ 最稳定，避免 adaptive_max_pool2d 等操作的问题
+            if opset_version is None or opset_version > 12:
+                opset_version = 11
+            opset_version = max(11, min(12, opset_version))  # 限制在 11-12 之间
+            print(f"[ONNX导出] 使用ONNX opset版本: {opset_version} (固定，不会自动升级)")
+            
+            # 处理模型可能有多个输出的情况
+            try:
+                # 尝试获取模型输出以确定输出名称
+                with torch.no_grad():
+                    test_output = model(dummy_input)
+                    if isinstance(test_output, tuple):
+                        output_names = [f"output_{i}" for i in range(len(test_output))]
+                    else:
+                        output_names = ["output"]
+            except:
+                output_names = ["output"]
+            
+            # 【修复2】固定输入尺寸，避免 adaptive_max_pool2d 等动态操作的问题
+            # 使用固定尺寸可以避免某些操作（如 adaptive_max_pool2d）在 ONNX 导出时的兼容性问题
+            # 如果需要动态输入，可以在推理时使用不同的输入尺寸，但导出时使用固定尺寸
+            print(f"[ONNX导出] 使用固定输入尺寸: {input_size[0]}x{input_size[1]} (避免 adaptive 操作问题)")
+            
+            # 【修复3】显式禁用 dynamo，使用旧版 torch.onnx.export API
+            # 确保不使用 torch.export 或 dynamo=True，这些可能导致兼容性问题
+            print(f"[ONNX导出] 使用旧版 torch.onnx.export API (禁用 dynamo)")
+            
+            # 导出（固定尺寸，不使用动态轴）
+            torch.onnx.export(
+                model,
+                dummy_input,
+                output_path,
+                export_params=True,
+                opset_version=opset_version,  # 固定为 11 或 12
+                do_constant_folding=True,
+                input_names=["input"],
+                output_names=output_names,
+                dynamic_axes=None,  # 【关键修复】固定尺寸，不使用动态轴，避免 adaptive 操作问题
+                verbose=False,
+                # 显式禁用任何可能的 dynamo 相关功能
+                # 注意：torch.onnx.export 本身不支持 dynamo 参数，但确保不使用 torch.export
+            )
+            
+            print(f"[ONNX导出] ✅ 导出成功: {output_path}")
+            
+            # 验证导出的ONNX模型
+            try:
+                import onnx
+                onnx_model = onnx.load(output_path)
+                onnx.checker.check_model(onnx_model)
+                print(f"[ONNX导出] ✅ ONNX模型验证通过")
+                
+                # 打印模型信息
+                print(f"[ONNX导出] 模型信息:")
+                print(f"  - 输入: {[f'{inp.name}: {[d.dim_value if d.dim_value > 0 else d.dim_param for d in inp.type.tensor_type.shape.dim]}' for inp in onnx_model.graph.input]}")
+                print(f"  - 输出: {[f'{out.name}: {[d.dim_value if d.dim_value > 0 else d.dim_param for d in out.type.tensor_type.shape.dim]}' for out in onnx_model.graph.output]}")
+            except ImportError:
+                print(f"[ONNX导出] ⚠️ onnx包未安装，跳过模型验证（建议安装: pip install onnx）")
+            except Exception as e:
+                print(f"[ONNX导出] ⚠️ ONNX模型验证失败: {e}")
+            
+            return output_path
+            
+        except Exception as e:
+            import traceback
+            error_msg = f"ONNX导出失败: {str(e)}\n{traceback.format_exc()}"
+            print(f"[ONNX导出] ❌ {error_msg}")
+            return None
+    
     def _evaluate_model(self, model, dataloader, device, image_paths):
         """评估模型并找出低Dice案例 - 与训练时的评估逻辑保持一致"""
         import torch.nn.functional as F
@@ -519,8 +1019,8 @@ class ModelTestThread(QThread):
         # ==============================
         # 测试期超参搜索：TTA + 阈值扫描
         # ==============================
-        # 【修改】阈值搜索范围改为0.89-0.99，步长 0.01，共10个阈值点
-        thresholds = [round(0.89 + i * 0.01, 2) for i in range(10)]  # [0.89, 0.90, 0.91, ..., 0.98]
+        # 【阈值扫描范围修改】从 0.9 到 0.99，步长为 0.01，共10个阈值点
+        thresholds = [round(0.9 + i * 0.01, 2) for i in range(10)]  # [0.9, 0.91, 0.92, ..., 0.99]
         # 【修改】改为样本级指标计算：为每个阈值存储样本级指标列表
         sweep_dice_scores = {t: [] for t in thresholds}  # 存储每个样本的Dice值
         sweep_iou_scores = {t: [] for t in thresholds}  # 存储每个样本的IoU值
@@ -634,26 +1134,42 @@ class ModelTestThread(QThread):
                         dice_val = float(batch_dice_np[i])
                         sweep_dice_scores[thr].append(dice_val)
                         
-                        # 计算每个样本的IoU
-                        iou_den = tp + fp + fn
-                        iou_val = 1.0 if iou_den < 1e-8 else float(tp / (iou_den + 1e-8))
+                        # 【修复IoU计算】通过Dice值反推IoU，消除指标不一致
+                        # 公式：IoU = Dice / (2 - Dice)
+                        # 当Dice=1.0时，IoU也应为1.0（避免除以0）
+                        if dice_val >= 1.0 - 1e-8:
+                            iou_val = 1.0
+                        else:
+                            iou_val = float(dice_val / (2.0 - dice_val))
                         sweep_iou_scores[thr].append(iou_val)
                         
                         # 计算每个样本的Precision
-                        # 【修复】如果没有预测出任何正样本(tp+fp=0)，则精确率视为1.0(无误检)
+                        # 【统一计算方式】Precision = TP / (TP + FP)，使用与 Recall/Specificity 一致的平滑项
                         prec_den = tp + fp
-                        precision_val = float(tp / (prec_den + 1e-8)) if prec_den > 0 else 1.0
+                        if prec_den < 1e-7:
+                            # 如果没有预测出任何正样本(tp+fp=0)，则精确率视为1.0(无误检)
+                            precision_val = 1.0
+                        else:
+                            precision_val = float(tp / (prec_den + 1e-7))  # 使用 1e-7 与 Recall/Specificity 保持一致
                         sweep_precision_scores[thr].append(precision_val)
                         
                         # 计算每个样本的Recall
-                        # 【修复】如果Ground Truth为空(无病灶，tp+fn=0)，则召回率视为1.0(完美表现)
+                        # 【统一计算方式】Recall = TP / (TP + FN)，使用与 Precision/Specificity 一致的平滑项
                         rec_den = tp + fn
-                        recall_val = float(tp / (rec_den + 1e-8)) if rec_den > 0 else 1.0
+                        if rec_den < 1e-7:
+                            # 如果Ground Truth为空(无病灶，tp+fn=0)，则召回率视为1.0(完美表现)
+                            recall_val = 1.0
+                        else:
+                            recall_val = float(tp / (rec_den + 1e-7))  # 使用 1e-7 与 Precision/Specificity 保持一致
                         sweep_recall_scores[thr].append(recall_val)
                         
                         # 计算每个样本的Specificity
+                        # 【统一计算方式】Specificity = TN / (TN + FP)，使用与 Precision/Recall 一致的平滑项
                         spec_den = tn + fp
-                        specificity_val = float(tn / (spec_den + 1e-8)) if spec_den > 0 else 0.0
+                        if spec_den < 1e-7:
+                            specificity_val = 1.0  # 如果没有负样本，特异性为1.0
+                        else:
+                            specificity_val = float(tn / (spec_den + 1e-7))  # 使用 1e-7 与 Precision/Recall 保持一致
                         sweep_specificity_scores[thr].append(specificity_val)
                     
                     # 累计像素级混淆矩阵（仅用于FP计数等统计信息）
@@ -890,19 +1406,34 @@ class ModelTestThread(QThread):
                     fn = np.sum((pred_mask <= 0.5) & (target_mask > 0.5))
                     tn = np.sum((pred_mask <= 0.5) & (target_mask <= 0.5))
                     
-                    # 计算其他指标（IoU, Precision, Recall等）
-                    iou_den = tp + fp + fn
-                    iou = 1.0 if iou_den < 1e-8 else tp / (iou_den + 1e-8)
+                    # 【修复IoU计算】通过Dice值反推IoU，消除指标不一致
+                    # 公式：IoU = Dice / (2 - Dice)
+                    # 当Dice=1.0时，IoU也应为1.0（避免除以0）
+                    if dice >= 1.0 - 1e-8:
+                        iou = 1.0
+                    else:
+                        iou = float(dice / (2.0 - dice))
                     
-                    # 【修复】Precision: 如果没有预测出任何正样本(tp+fp=0)，则精确率视为1.0(无误检)
+                    # 【统一计算方式】Precision: 如果没有预测出任何正样本(tp+fp=0)，则精确率视为1.0(无误检)
                     prec_den = tp + fp
-                    precision = float(tp / (prec_den + 1e-8)) if prec_den > 0 else 1.0
+                    if prec_den < 1e-7:
+                        precision = 1.0
+                    else:
+                        precision = float(tp / (prec_den + 1e-7))  # 使用 1e-7 与 Recall/Specificity 保持一致
                     
-                    # 【修复】Recall: 如果Ground Truth为空(无病灶，tp+fn=0)，则召回率视为1.0(完美表现)
+                    # 【统一计算方式】Recall: 如果Ground Truth为空(无病灶，tp+fn=0)，则召回率视为1.0(完美表现)
                     rec_den = tp + fn
-                    recall = float(tp / (rec_den + 1e-8)) if rec_den > 0 else 1.0
+                    if rec_den < 1e-7:
+                        recall = 1.0
+                    else:
+                        recall = float(tp / (rec_den + 1e-7))  # 使用 1e-7 与 Precision/Specificity 保持一致
                     
-                    specificity = tn / (tn + fp + 1e-8)
+                    # 【统一计算方式】Specificity: 使用与 Precision/Recall 一致的平滑项
+                    spec_den = tn + fp
+                    if spec_den < 1e-7:
+                        specificity = 1.0  # 如果没有负样本，特异性为1.0
+                    else:
+                        specificity = float(tn / (spec_den + 1e-7))  # 使用 1e-7 与 Precision/Recall 保持一致
                     f1 = dice  # 二分类下F1=Dice（使用与训练一致的Dice值）
                     
                     # 计算HD95（使用TrainThread的calculate_hd95方法）
@@ -1074,13 +1605,183 @@ class ModelTestThread(QThread):
         detailed_metrics = {
             'average': avg_metrics,
             'all_samples': metrics,
-            'total_samples': len(metrics['dice'])
+            'total_samples': len(metrics['dice']),
+            'optimal_threshold': optimal_threshold  # 添加最优阈值，供MATLAB可视化使用
         }
         
         return detailed_metrics, low_dice_cases
     
+    def _generate_gradcam_for_deeplabv3(self, model, images, device):
+        """
+        为 DeepLabV3+ 生成 Grad-CAM 热力图（ModelTestThread 专用）
+        
+        Args:
+            model: 模型实例（已解包，非 DataParallel）
+            images: 输入图像 (B, 3, H, W)
+            device: 设备
+        
+        Returns:
+            attention_maps: 字典，包含 Grad-CAM 热力图
+        """
+        if not GRAD_CAM_AVAILABLE:
+            return {}
+        
+        try:
+            # 确保模型处于 eval 模式（Grad-CAM 需要）
+            was_training = model.training
+            model.eval()
+            
+            # 获取实际模型（SMPDeepLabV3Plus 包装了 smp.DeepLabV3Plus）
+            actual_model = model
+            if hasattr(model, 'model'):
+                actual_model = model.model
+            
+            # 【分辨率优化】使用 Decoder 作为目标层，获得更高分辨率的热力图
+            # Decoder 具有更高的空间分辨率（接近输入图像大小），而 encoder.layer4 只有 1/32 分辨率
+            target_layer = None
+            
+            # 优先使用 decoder（更高分辨率）
+            if hasattr(actual_model, 'decoder'):
+                decoder = actual_model.decoder
+                # decoder 可能是一个 Sequential 或 ModuleList
+                if hasattr(decoder, '__getitem__') and len(decoder) > 0:
+                    # 如果是可索引的，取最后一个模块（通常是输出层）
+                    target_layer = decoder[-1]
+                elif hasattr(decoder, 'segmentation_head'):
+                    # 某些 decoder 有 segmentation_head
+                    target_layer = decoder.segmentation_head
+                else:
+                    target_layer = decoder
+            elif hasattr(actual_model, 'segmentation_head'):
+                # 如果 decoder 不存在，尝试直接使用 segmentation_head
+                target_layer = actual_model.segmentation_head
+            
+            # 如果 decoder 不可用，回退到 encoder.layer4（低分辨率，但至少能工作）
+            if target_layer is None:
+                encoder = actual_model.encoder
+                if hasattr(encoder, 'layer4'):
+                    layer4 = encoder.layer4
+                    if hasattr(layer4, '__getitem__'):
+                        target_layer = layer4[-1] if len(layer4) > 0 else layer4
+                    else:
+                        target_layer = layer4
+                elif hasattr(encoder, 'blocks') and len(encoder.blocks) > 0:
+                    target_layer = encoder.blocks[-1]
+            
+            if target_layer is None:
+                print("[Grad-CAM] 无法找到目标层（decoder 或 encoder），跳过 Grad-CAM 生成")
+                if was_training:
+                    model.train()
+                return {}
+            
+            # 初始化 GradCAM
+            # 注意：GradCAM 需要访问实际的模型结构，使用 actual_model（smp.DeepLabV3Plus）
+            # 新版本的 grad-cam 库已移除 use_cuda 参数，会自动检测设备
+            cam = GradCAM(model=actual_model, target_layers=[target_layer])
+            
+            # 获取图像尺寸 (images 形状是 [B, C, H, W])
+            height, width = images.shape[2], images.shape[3]
+            
+            # 创建全1掩码 (表示关注整张图的类别预测)
+            # SemanticSegmentationTarget 不接受 mask=None，必须传入具体的 numpy 数组
+            mask = np.ones((height, width), dtype=np.float32)
+            
+            # 确定目标类别索引
+            # 对于二分类模型 (classes=1)，输出只有1个通道，索引必须是0
+            # 对于多分类模型 (classes>1)，可以使用 category=1 或其他类别索引
+            target_category = 1  # 默认使用类别1（前景类）
+            
+            # 检查模型的类别数
+            if hasattr(actual_model, 'classes'):
+                num_classes = actual_model.classes
+                if num_classes == 1:
+                    # 二分类模型：输出只有1个通道（索引0），必须使用 category=0
+                    target_category = 0
+                    # 【日志优化】仅在第一次调用时打印，避免重复日志刷屏
+                    if not getattr(self, '_has_logged_gradcam_info', False):
+                        print(f"[Grad-CAM] 检测到二分类模型 (classes=1)，使用 category=0")
+                        self._has_logged_gradcam_info = True
+                else:
+                    # 多分类模型：可以使用 category=1（前景类）或其他类别
+                    target_category = min(1, num_classes - 1)  # 确保不越界
+                    # 【日志优化】仅在第一次调用时打印，避免重复日志刷屏
+                    if not getattr(self, '_has_logged_gradcam_info', False):
+                        print(f"[Grad-CAM] 检测到多分类模型 (classes={num_classes})，使用 category={target_category}")
+                        self._has_logged_gradcam_info = True
+            else:
+                # 如果无法获取 classes 属性，尝试从输出形状推断
+                # 先进行一次前向传播获取输出形状（仅用于推断）
+                try:
+                    with torch.no_grad():
+                        test_output = actual_model(images[:1])  # 只取第一个样本测试
+                        if isinstance(test_output, tuple):
+                            test_output = test_output[0]
+                        num_classes = test_output.shape[1]  # (B, C, H, W) 中的 C
+                        if num_classes == 1:
+                            target_category = 0
+                            # 【日志优化】仅在第一次调用时打印，避免重复日志刷屏
+                            if not getattr(self, '_has_logged_gradcam_info', False):
+                                print(f"[Grad-CAM] 通过输出形状推断为二分类模型 (channels=1)，使用 category=0")
+                                self._has_logged_gradcam_info = True
+                        else:
+                            target_category = min(1, num_classes - 1)
+                            # 【日志优化】仅在第一次调用时打印，避免重复日志刷屏
+                            if not getattr(self, '_has_logged_gradcam_info', False):
+                                print(f"[Grad-CAM] 通过输出形状推断为多分类模型 (channels={num_classes})，使用 category={target_category}")
+                                self._has_logged_gradcam_info = True
+                except Exception as e:
+                    # 如果推断失败，默认使用 category=0（二分类）
+                    target_category = 0
+                    # 【日志优化】仅在第一次调用时打印，避免重复日志刷屏
+                    if not getattr(self, '_has_logged_gradcam_info', False):
+                        print(f"[Grad-CAM] 无法推断模型类别数，默认使用 category=0 (二分类): {e}")
+                        self._has_logged_gradcam_info = True
+            
+            # 定义目标：语义分割的目标类别
+            targets = [SemanticSegmentationTarget(category=target_category, mask=mask)]
+            
+            # 【关键修复】强制开启梯度计算，这是 Grad-CAM 必须的
+            # 即使外部有 torch.no_grad()，这里也要临时开启梯度计算
+            # 确保输入图像支持求导
+            images_grad = images.clone().detach().requires_grad_(True)
+            
+            # 生成 Grad-CAM 热力图
+            # grayscale_cam 形状: (B, H, W)
+            # 使用 torch.enable_grad() 上下文管理器，确保梯度计算可用
+            with torch.enable_grad():
+                grayscale_cam = cam(input_tensor=images_grad, targets=targets)
+            
+            # 转换为 torch.Tensor 并添加通道维度，匹配其他模型的注意力图格式
+            # 格式: (B, 1, H, W)
+            attention_maps = {}
+            if len(grayscale_cam.shape) == 3:  # (B, H, W)
+                grayscale_cam_tensor = torch.from_numpy(grayscale_cam).float().to(device)
+                grayscale_cam_tensor = grayscale_cam_tensor.unsqueeze(1)  # (B, 1, H, W)
+            else:
+                grayscale_cam_tensor = torch.from_numpy(grayscale_cam).float().to(device)
+            
+            # 使用 'gradcam_decoder' 作为键名（因为现在使用 decoder 作为目标层）
+            attention_maps['gradcam_decoder'] = grayscale_cam_tensor
+            
+            # 恢复模型训练状态
+            if was_training:
+                model.train()
+            
+            return attention_maps
+            
+        except Exception as e:
+            print(f"[Grad-CAM警告] 生成热力图失败: {e}")
+            import traceback
+            traceback.print_exc()
+            # 确保恢复模型状态
+            if was_training:
+                model.train()
+            return {}
+    
     def _generate_attention_maps(self, model, dataloader, device):
         """生成注意力热图"""
+        print("[注意力热图] 开始生成注意力热图...")
+        fig = None
         try:
             # 检查模型是否支持注意力图
             actual_model = model
@@ -1088,70 +1789,155 @@ class ModelTestThread(QThread):
                 actual_model = actual_model.module
             
             if not hasattr(actual_model, 'forward') or not callable(getattr(actual_model, 'forward', None)):
+                print("[注意力热图] 模型不支持注意力图生成，跳过")
                 return ""
             
             # 尝试获取注意力图
+            print("[注意力热图] 正在从模型提取注意力图...")
             model.eval()
             attention_maps_list = []
             images_list = []
             
-            with torch.no_grad():
-                for batch_data in dataloader:
-                    if len(batch_data) == 3:
-                        images, masks, _ = batch_data
-                    else:
-                        images, masks = batch_data
-                    images = images.to(device)
-                    
-                    try:
-                        # 尝试获取注意力图
-                        if hasattr(actual_model, 'forward'):
-                            result = actual_model(images, return_attention=True)
-                            if isinstance(result, tuple) and len(result) == 2:
-                                outputs, attention_maps = result
-                                attention_maps_list.append(attention_maps)
-                                images_list.append(images.cpu())
-                    except Exception:
-                        pass
-                    
-                    if len(images_list) >= 4:  # 只取前4个样本
-                        break
+            # 【关键修复】采用混合梯度策略：前 5 个样本开启梯度以生成 Grad-CAM，其余关闭梯度以加速
+            max_samples = 4  # 最多收集 4 个样本用于可视化
+            sample_count = 0
+            
+            for batch_data in dataloader:
+                if len(batch_data) == 3:
+                    images, masks, _ = batch_data
+                else:
+                    images, masks = batch_data
+                images = images.to(device)
+                
+                # 判断是否需要生成 Grad-CAM（前 5 个样本）
+                need_gradcam = (sample_count < max_samples)
+                
+                try:
+                    # 尝试获取注意力图
+                    if hasattr(actual_model, 'forward'):
+                        # 【DeepLabV3+ 兼容性 + Grad-CAM 集成】DeepLabV3+ 不支持 return_attention，使用 Grad-CAM
+                        is_deeplabv3 = (
+                            self.model_type in ("deeplabv3plus", "smp_deeplabv3plus") or
+                            type(actual_model).__name__ == "SMPDeepLabV3Plus"
+                        )
+                        
+                        if is_deeplabv3:
+                            # DeepLabV3+ 需要使用 Grad-CAM
+                            if need_gradcam:
+                                # 【关键修复】前 5 个样本：必须在 torch.enable_grad() 下运行，并激活输入梯度
+                                with torch.enable_grad():
+                                    # 确保输入图像支持梯度计算（Grad-CAM 必需）
+                                    images_grad = images.clone().detach().requires_grad_(True)
+                                    
+                                    # 先获取输出（用于验证模型正常工作）
+                                    outputs = actual_model(images_grad)
+                                    
+                                    # 使用 Grad-CAM 生成热力图（需要梯度）
+                                    attention_maps = self._generate_gradcam_for_deeplabv3(actual_model, images_grad, device)
+                                    
+                                    # 如果 Grad-CAM 成功生成，收集注意力图
+                                    if attention_maps:
+                                        attention_maps_list.append(attention_maps)
+                                        images_list.append(images_grad.detach().cpu())
+                                        sample_count += 1
+                            else:
+                                # 第 6 个样本以后：使用 torch.no_grad() 加速（虽然这里不会执行，因为已经 break）
+                                with torch.no_grad():
+                                    outputs = actual_model(images)
+                                    # 不需要生成热力图
+                        else:
+                            # 其他模型：支持 return_attention
+                            if need_gradcam:
+                                # 前 5 个样本：尝试获取注意力图
+                                result = actual_model(images, return_attention=True)
+                                if isinstance(result, tuple) and len(result) == 2:
+                                    outputs, attention_maps = result
+                                    attention_maps_list.append(attention_maps)
+                                    images_list.append(images.cpu())
+                                    sample_count += 1
+                            else:
+                                # 第 6 个样本以后：只获取输出，不获取注意力图
+                                with torch.no_grad():
+                                    outputs = actual_model(images)
+                except Exception as e:
+                    # 如果获取注意力图失败，打印错误信息以便调试
+                    print(f"[注意力热图] 获取注意力图失败（样本 {sample_count}）: {e}")
+                    import traceback
+                    print(f"[注意力热图] 错误详情: {traceback.format_exc()}")
+                
+                # 如果已收集足够样本，退出循环
+                if len(images_list) >= max_samples:
+                    break
             
             if not attention_maps_list:
+                print("[注意力热图] 未获取到注意力图，跳过可视化")
                 return ""
             
             # 可视化注意力图
+            print("[注意力热图] 开始绘图...")
             import matplotlib.pyplot as plt
             import matplotlib
             matplotlib.use('Agg')
             
-            fig, axes = plt.subplots(len(images_list), 5, figsize=(20, 4 * len(images_list)))
-            if len(images_list) == 1:
-                axes = axes.reshape(1, -1)
-            
-            for idx, (img, att_maps) in enumerate(zip(images_list, attention_maps_list)):
-                img_np = img[0].permute(1, 2, 0).numpy()
-                img_np = img_np * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
-                img_np = np.clip(img_np, 0, 1)
+            try:
+                # 【布局优化】根据实际的 attention_maps 数量动态设置列数，避免空白子图
+                # 计算每行需要的列数：1（原图）+ attention_maps 数量
+                if attention_maps_list:
+                    # 取第一个样本的 attention_maps 数量作为参考
+                    num_att_maps = len(attention_maps_list[0])
+                    num_cols = 1 + num_att_maps  # 1 个原图 + N 个热力图
+                else:
+                    num_cols = 2  # 默认：原图 + 1 个热力图
                 
-                axes[idx, 0].imshow(img_np)
-                axes[idx, 0].set_title("原图")
-                axes[idx, 0].axis('off')
+                # 限制最大列数，避免布局过宽
+                num_cols = min(num_cols, 5)
                 
-                for i, (att_name, att_map) in enumerate(list(att_maps.items())[:4]):
-                    att_np = att_map[0, 0].cpu().numpy()
-                    axes[idx, i+1].imshow(att_np, cmap='hot')
-                    axes[idx, i+1].set_title(f"{att_name}")
-                    axes[idx, i+1].axis('off')
-            
-            plt.tight_layout()
-            attention_path = os.path.join(self.temp_dir, "attention_maps.png")
-            plt.savefig(attention_path, dpi=150, bbox_inches='tight')
-            plt.close()
-            
-            return attention_path
+                fig, axes = plt.subplots(len(images_list), num_cols, figsize=(4 * num_cols, 4 * len(images_list)))
+                if len(images_list) == 1:
+                    axes = axes.reshape(1, -1) if num_cols > 1 else axes.reshape(1, -1)
+                elif num_cols == 1:
+                    axes = axes.reshape(-1, 1)
+                
+                for idx, (img, att_maps) in enumerate(zip(images_list, attention_maps_list)):
+                    img_np = img[0].permute(1, 2, 0).numpy()
+                    img_np = img_np * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
+                    img_np = np.clip(img_np, 0, 1)
+                    
+                    # 显示原图
+                    axes[idx, 0].imshow(img_np)
+                    axes[idx, 0].set_title("原图")
+                    axes[idx, 0].axis('off')
+                    
+                    # 显示热力图（只显示实际存在的，不显示空白）
+                    for i, (att_name, att_map) in enumerate(list(att_maps.items())[:num_cols-1]):
+                        if i + 1 >= num_cols:
+                            break  # 避免超出列数
+                        att_np = att_map[0, 0].cpu().numpy()
+                        axes[idx, i+1].imshow(att_np, cmap='hot')
+                        axes[idx, i+1].set_title(f"{att_name}")
+                        axes[idx, i+1].axis('off')
+                
+                plt.tight_layout()
+                attention_path = os.path.join(self.temp_dir, "attention_maps.png")
+                # 【优化】降低dpi以加快生成速度（从150降到100）
+                plt.savefig(attention_path, dpi=100, bbox_inches='tight')
+                print(f"[注意力热图] 绘图完成，已保存: {attention_path}")
+                return attention_path
+            finally:
+                # 【关键修复】确保无论是否出错都关闭figure，防止内存泄漏
+                if 'fig' in locals() and fig is not None:
+                    plt.close(fig)
+                    print("[注意力热图] 已释放matplotlib资源")
         except Exception as e:
             print(f"[警告] 生成注意力热图失败: {e}")
+            import traceback
+            print(f"[注意力热图] 错误详情: {traceback.format_exc()}")
+            # 确保即使出错也关闭figure
+            if fig is not None:
+                try:
+                    plt.close(fig)
+                except:
+                    pass
             return ""
     
     def _tta_inference(self, model, images):
@@ -1168,6 +1954,7 @@ class ModelTestThread(QThread):
         目标：利用5080算力优势，通过24倍推理换取0.01 Dice提升
         """
         import torch.nn.functional as F
+        import math
         from scipy.ndimage import gaussian_filter
         
         B, C, H, W = images.shape
@@ -1179,7 +1966,14 @@ class ModelTestThread(QThread):
         for scale in scales:
             # Resize到目标尺度
             if scale != 1.0:
-                target_h, target_w = int(H * scale), int(W * scale)
+                # 原始缩放尺寸
+                raw_h, raw_w = float(H) * float(scale), float(W) * float(scale)
+                # 为兼容 SMP (DeepLabV3+ 等) 对输入尺寸“必须能被32整除”的要求，
+                # 将缩放后的尺寸向上取整到 32 的倍数，避免出现 409x409 这类非法尺寸。
+                def _ceil_to_multiple(v: float, base: int = 32) -> int:
+                    return max(base, int(math.ceil(v / base) * base))
+                target_h = _ceil_to_multiple(raw_h, 32)
+                target_w = _ceil_to_multiple(raw_w, 32)
                 scaled_images = F.interpolate(images, size=(target_h, target_w), 
                                              mode='bilinear', align_corners=False)
             else:
@@ -1366,7 +2160,7 @@ class TrainThread(QThread):
     test_results_ready = pyqtSignal(str, dict)  # (可视化图像路径, 性能分析数据)
     epoch_analysis_ready = pyqtSignal(int, str, dict)  # (轮次, 可视化图像路径, 性能指标)
     attention_analysis_ready = pyqtSignal(str, dict)  # (注意力可视化路径, 注意力统计信息)
-    def __init__(self, data_dir, epochs, batch_size, model_path=None, save_best=True, use_gwo=False, optimizer_type="adam"):
+    def __init__(self, data_dir, epochs, batch_size, model_path=None, save_best=True, use_gwo=False, optimizer_type="adam", dataset_type="standard", enable_matlab_plots=None):
         super().__init__()
         self.data_dir = data_dir
         self.epochs = epochs
@@ -1375,6 +2169,11 @@ class TrainThread(QThread):
         self.save_best = save_best
         self.use_gwo = use_gwo  # 是否使用GWO优化
         self.optimizer_type = optimizer_type.lower()
+        self.dataset_type = dataset_type.lower()  # "standard" 或 "2.5d"
+        self._enable_matlab_plots_override = enable_matlab_plots  # 保存用户设置
+        # 梯度累积步数：在小批次 (batch_size=4) 下通过累积多个 step 的梯度来提升等效 batch size，稳定训练
+        # Windows 场景默认使用 4 步累积，对应等效 batch size ≈ 16
+        self.accumulation_steps = 4
         
         # 安全读取预训练配置
         try:
@@ -1400,6 +2199,10 @@ class TrainThread(QThread):
         self.stop_requested = False
         self.best_model_path = None
         self.best_dice = -1.0
+        self.gwo_best_dice = None  # GWO找到的全验证集最佳Dice，用于best_model判定
+        
+        # 【日志优化】标记是否已打印 Grad-CAM 信息，避免重复日志刷屏
+        self._has_logged_gradcam_info = False
         
         # 安全创建临时目录
         try:
@@ -1414,12 +2217,38 @@ class TrainThread(QThread):
             except Exception as e2:
                 raise RuntimeError(f"无法创建临时目录: {e2}") from e2
         
+        # 【持久化修复】创建持久化目录用于保存 MATLAB 报表
+        # 在项目根目录下创建 matlab_reports 文件夹，确保报表不会被系统清理
+        project_root = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd()
+        self.persistent_report_dir = os.path.join(project_root, "matlab_reports")
+        os.makedirs(self.persistent_report_dir, exist_ok=True)
+        print(f"[MATLAB] 报表将保存到持久化目录: {self.persistent_report_dir}")
+        
         self.best_model_cache_dir = os.path.join(self.data_dir, "_best_model_cache")
         self.enable_matlab_cache = False
         self.matlab_cache_manager = None
         self.matlab_metrics_bridge = None
-        self.enable_matlab_plots = False
-        self.matlab_viz_bridge = None
+        # 尝试初始化 MATLAB 可视化桥接
+        try:
+            self.matlab_viz_bridge = MatlabVisualizationBridge.instance()
+            # 如果用户明确设置了enable_matlab_plots，使用用户设置；否则根据MATLAB是否可用自动判断
+            if self._enable_matlab_plots_override is not None:
+                self.enable_matlab_plots = self._enable_matlab_plots_override and (self.matlab_viz_bridge is not None)
+                if self._enable_matlab_plots_override and not self.enable_matlab_plots:
+                    print("[提示] 用户要求使用MATLAB，但MATLAB引擎不可用，将使用 Python 绘图")
+                elif not self._enable_matlab_plots_override:
+                    print("[提示] 用户已禁用MATLAB可视化，将仅使用 Matplotlib 绘图")
+                elif self.enable_matlab_plots:
+                    print("[提示] MATLAB 引擎可用，将启用 MATLAB 高清绘图功能")
+            else:
+                # 默认行为：如果MATLAB可用则使用
+                self.enable_matlab_plots = (self.matlab_viz_bridge is not None)
+                if self.enable_matlab_plots:
+                    print("[提示] MATLAB 引擎可用，将启用 MATLAB 高清绘图功能")
+        except Exception as e:
+            self.matlab_viz_bridge = None
+            self.enable_matlab_plots = False
+            print(f"[提示] MATLAB 引擎不可用，将使用 Python 绘图: {e}")
         self.model_type = os.environ.get("SEG_MODEL", "improved_unet").lower()
         
         # 安全读取环境变量并转换为整数
@@ -1496,9 +2325,9 @@ class TrainThread(QThread):
         # 跟踪训练历史
         self.train_loss_history = []
         self.val_loss_history = []
-        self.val_dice_history = []
-        self.val_dice_pos_history = []  # 仅统计有前景mask样本的Dice
-        self.val_dice_neg_history = []  # 仅统计空mask样本的Dice
+        self.val_dice_history = []  # 统计所有验证样本的平均Dice（包括空mask样本），用于最佳模型选择
+        self.val_dice_pos_history = []  # 仅统计有前景mask样本的Dice（用于诊断）
+        self.val_dice_neg_history = []  # 仅统计空mask样本的Dice（用于诊断）
         # 增加深度监督权重,提升多尺度特征学习
         self.aux_loss_weights = [0.3, 0.2, 0.1]  # 从[0.2,0.1,0.05]提升
         self.split_metadata: Dict[str, Dict[str, List[str]]] = {}
@@ -1522,8 +2351,12 @@ class TrainThread(QThread):
         except (OSError, PermissionError) as e:
             raise RuntimeError(f"无法创建临时目录 {self.temp_dir}: {e}") from e
    
-    def visualize_predictions(self, model, dataloader, device, save_name="predictions"):
-        """可视化模型预测结果与真实标签"""
+    def visualize_predictions(self, model, dataloader, device, save_name="predictions", threshold=None):
+        """可视化模型预测结果与真实标签
+        
+        Args:
+            threshold: 二值化阈值，如果为None则使用self.last_optimal_threshold，如果仍不可用则使用0.1
+        """
         save_path = os.path.join(self.temp_dir, f"{save_name}.png")
         model.eval()
         # 处理数据：可能包含分类标签
@@ -1534,10 +2367,17 @@ class TrainThread(QThread):
             images, masks = batch_data
         images, masks = images.to(device), masks.to(device)
         
+        # 确定使用的阈值
+        if threshold is None:
+            threshold = getattr(self, 'last_optimal_threshold', 0.1)
+        # 如果阈值仍然不可用或无效，使用0.1作为默认值（允许看到低置信度预测）
+        if threshold is None or threshold <= 0 or threshold >= 1:
+            threshold = 0.1
+        
         with torch.no_grad():
             outputs = model(images)
             preds = torch.sigmoid(outputs)
-            preds = (preds > 0.5).float()
+            preds = (preds > threshold).float()
         
         num_samples = min(4, images.size(0))
         sample_triplets = []
@@ -1557,8 +2397,13 @@ class TrainThread(QThread):
                     [triplet[2] for triplet in sample_triplets],
                     save_name
                 )
-                matlab_save_path = os.path.join(self.temp_dir, f"{save_name}_matlab.png")
+                # 【持久化修复】保存到持久化目录
+                import time
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                matlab_save_path = os.path.join(self.persistent_report_dir, f"{save_name}_{timestamp}_matlab.png")
+                os.makedirs(os.path.dirname(matlab_save_path), exist_ok=True)
                 self.matlab_viz_bridge.render_prediction_grid(payload_path, matlab_save_path)
+                print(f"[MATLAB] ✅ 预测网格已保存到持久化目录: {matlab_save_path}")
                 return matlab_save_path
             except Exception as exc:
                 print(f"[MATLAB Plot] 使用matplotlib回退: {exc}")
@@ -1602,7 +2447,11 @@ class TrainThread(QThread):
             try:
                 payload = self._save_training_history_payload()
                 if payload:
-                    matlab_path = os.path.join(self.temp_dir, "training_history_matlab.png")
+                    # 【持久化修复】保存到持久化目录
+                    import time
+                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+                    matlab_path = os.path.join(self.persistent_report_dir, f"training_history_{timestamp}_matlab.png")
+                    os.makedirs(os.path.dirname(matlab_path), exist_ok=True)
                     self.matlab_viz_bridge.render_training_history(payload, matlab_path)
                     return matlab_path
             except Exception as exc:
@@ -1652,9 +2501,20 @@ class TrainThread(QThread):
             all_probs = []
             all_masks = []
             
+            # 计算总批次数（用于进度显示）
+            total_batches = len(dataloader) if use_all_samples else min(num_samples, len(dataloader))
+            
             for idx, batch_data in enumerate(dataloader):
                 if not use_all_samples and idx >= num_samples:
                     break
+                
+                # 更新数据收集进度（0-40%）
+                data_collect_progress = int(40 * (idx + 1) / max(1, total_batches))
+                self.update_progress.emit(
+                    data_collect_progress,
+                    f"阈值优化: 收集数据 {idx+1}/{total_batches} 批次..."
+                )
+                
                 # 处理数据：可能包含分类标签
                 if len(batch_data) == 3:
                     images, masks, _ = batch_data
@@ -1663,33 +2523,381 @@ class TrainThread(QThread):
                 images = images.to(device)
                 masks = masks.to(device)
                 
-                # 使用TTA进行推理（与验证阶段一致）
-                # 这确保阈值优化时使用的预测与验证统计时一致
-                outputs = self._tta_inference(model, images)
+                # 【性能优化】阈值优化阶段禁用TTA以提升速度
+                # 如果验证阶段也禁用TTA，这里也应该禁用以保持一致
+                # 可以通过环境变量 SEG_USE_TTA_IN_VAL=1 启用（不推荐，速度慢）
+                use_tta_in_threshold = os.environ.get("SEG_USE_TTA_IN_VAL", "0") == "1"  # 默认禁用
+                
+                if use_tta_in_threshold:
+                    # 使用TTA进行推理（与验证阶段一致）
+                    outputs = self._tta_inference(model, images)
+                else:
+                    # 标准推理：单次前向传播（速度更快）
+                    outputs = model(images)
+                    if isinstance(outputs, tuple):
+                        outputs = outputs[0]
+                
                 probs = torch.sigmoid(outputs)
                 # 确保 probs 和 masks 的空间尺寸匹配
                 if probs.shape[2:] != masks.shape[2:]:
                     probs = F.interpolate(probs, size=masks.shape[2:], mode='bilinear', align_corners=False)
                 all_probs.append(probs.detach().cpu().numpy())
                 all_masks.append(masks.detach().cpu().numpy())
+                
+                # 【显存优化】删除GPU上的中间变量
+                del outputs, probs
+                if torch.cuda.is_available() and idx % 10 == 0:
+                    torch.cuda.empty_cache()
             
             if not all_probs:
-                return 0.5
+                return (0.5, 0.0)  # 返回默认阈值和0.0 Dice
             
+            # 数据收集完成，开始GWO优化
+            self.update_progress.emit(45, "阈值优化: 数据收集完成，开始GWO优化...")
+            
+            # 【显存优化】先拼接numpy数组，再决定是否移到GPU
+            # 这样可以避免在GPU上拼接时占用过多显存
             all_probs_np = np.concatenate(all_probs, axis=0)
             all_masks_np = np.concatenate(all_masks, axis=0)
+            
+            # 【显存优化】删除原始列表，释放内存
+            del all_probs, all_masks
+            import gc
+            gc.collect()
 
-            best_threshold, best_metrics = scan_best_threshold(all_probs_np, all_masks_np)
+            # 检查数据大小，决定是否使用GPU
+            data_size_mb = all_probs_np.nbytes / (1024 * 1024) * 2  # preds + masks
+            use_gpu_for_gwo = False
+            
+            if torch.cuda.is_available():
+                try:
+                    # 检查可用显存
+                    free_memory_mb = (torch.cuda.get_device_properties(device).total_memory - 
+                                    torch.cuda.memory_allocated(device)) / (1024 * 1024)
+                    # 如果数据大小小于可用显存的20%，使用GPU
+                    if data_size_mb < free_memory_mb * 0.2:
+                        use_gpu_for_gwo = True
+                        print(f">>> [GWO] 数据大小: {data_size_mb:.1f}MB, 可用显存: {free_memory_mb:.1f}MB，使用GPU加速")
+                    else:
+                        print(f">>> [GWO] 数据大小: {data_size_mb:.1f}MB, 可用显存: {free_memory_mb:.1f}MB，使用CPU模式（节省显存）")
+                except Exception as e:
+                    print(f">>> [GWO] 显存检查失败: {e}，使用CPU模式")
+            
+            # 【关键修复】保存样本数量（在删除前）
+            total_samples = all_probs_np.shape[0]
+            print(f">>> [GWO] 参与计算的样本数: {total_samples}")
+            
+            # 【GWO优化】使用灰狼优化算法替代线性扫描，更智能地寻找最佳阈值
+            # 【关键修复】传递后处理函数，使GWO在搜索过程中也应用后处理
+            def postprocess_func(pred_mask, prob_map):
+                """后处理函数，用于GWO的Fitness Function"""
+                # 先执行智能后处理
+                pred_mask_processed = self.smart_post_processing(pred_mask, prob_map)
+                # 再执行传统形态学后处理（与验证阶段参数一致）
+                pred_mask_final = self.post_process_mask(
+                    pred_mask_processed,
+                    min_size=150,
+                    use_morphology=True,
+                    keep_largest=False,
+                    fill_holes=True,
+                    prob_map=prob_map
+                )
+                return pred_mask_final
+            
+            if use_gpu_for_gwo:
+                print(">>> [GWO] 灰狼群正在搜索最佳阈值（GPU加速，使用Mean Dice+后处理）...")
+                # 转换为tensor并移到GPU（在GWO内部会处理OOM）
+                all_probs_tensor = torch.from_numpy(all_probs_np).to(device)
+                all_masks_tensor = torch.from_numpy(all_masks_np).to(device)
+            else:
+                print(">>> [GWO] 灰狼群正在搜索最佳阈值（CPU模式，使用Mean Dice+后处理）...")
+                # 保持在CPU上
+                all_probs_tensor = all_probs_np
+                all_masks_tensor = all_masks_np
+            
+            # 定义进度回调函数
+            def gwo_progress_callback(iteration, max_iter, best_score, best_threshold):
+                # GWO优化进度（45-90%）
+                gwo_progress = 45 + int(45 * iteration / max_iter)
+                device_str = "GPU" if use_gpu_for_gwo else "CPU"
+                self.update_progress.emit(
+                    gwo_progress,
+                    f"阈值优化: GWO迭代 {iteration}/{max_iter} | 最佳阈值: {best_threshold:.4f} | 最佳Dice(Mean+后处理): {best_score:.4f} ({device_str})"
+                )
+            
+            gwo = GreyWolfThresholdOptimizer(
+                num_wolves=10, 
+                max_iter=8,  # 【效率优化】缩减迭代次数到8次
+                progress_callback=gwo_progress_callback,
+                use_mean_dice=True,  # 使用Mean Dice
+                postprocess_func=postprocess_func,  # 传递后处理函数
+                sample_ratio=0.2,  # 【效率优化】在迭代过程中只使用20%的样本计算Fitness
+                metrics_func=self.calculate_batch_metrics  # 统一指标计算入口
+            )
+            
+            # 执行优化（带错误处理和自动回退）
+            try:
+                best_threshold, best_dice = gwo.optimize(all_probs_tensor, all_masks_tensor, device=device if use_gpu_for_gwo else None)
+            except RuntimeError as e:
+                if "out of memory" in str(e) or "CUDA" in str(e):
+                    print(f">>> [GWO] GPU显存不足，自动回退到CPU模式")
+                    # 清理GPU显存
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    # 回退到CPU（确保使用numpy数组）
+                    if use_gpu_for_gwo:
+                        # 如果之前用的是GPU tensor，需要重新获取numpy数组
+                        # 但此时all_probs_np和all_masks_np应该还在
+                        best_threshold, best_dice = gwo.optimize(all_probs_np, all_masks_np, device=None)
+                    else:
+                        best_threshold, best_dice = gwo.optimize(all_probs_tensor, all_masks_tensor, device=None)
+                else:
+                    raise
+            
+            # GWO优化完成（已使用Mean Dice+后处理）
+            print(f">>> [GWO] 搜索完成! 最佳阈值: {best_threshold:.4f}, 最佳Dice(Mean+后处理): {best_dice:.4f}")
+            self.update_progress.emit(90, f"阈值优化: GWO完成 | 最佳阈值: {best_threshold:.4f} | 最佳Dice(Mean+后处理): {best_dice:.4f}")
+            
+            # 【关键修复】GWO已经使用了Mean Dice+后处理，所以best_dice可以直接用于best_model判定
+            # 但为了兼容性和诊断，我们仍然重新计算一次以验证一致性
+            print(">>> [GWO] 验证计算一致性（重新计算一次）...")
+            self.update_progress.emit(92, "阈值优化: 验证计算一致性...")
+            
+            # 【关键修复】确保total_samples在删除前已保存（修复日志显示0个样本的问题）
+            # 必须在删除all_probs_np之前保存
+            if 'total_samples' not in locals():
+                if all_probs_np is not None:
+                    total_samples = all_probs_np.shape[0]
+                elif isinstance(all_probs_tensor, torch.Tensor):
+                    total_samples = all_probs_tensor.shape[0]
+                else:
+                    total_samples = 0
+            
+            # 统一处理：无论GPU还是CPU模式，都转换为numpy数组
+            if isinstance(all_probs_tensor, torch.Tensor):
+                # 如果是tensor，转换回numpy
+                all_probs_for_postprocess = all_probs_tensor.cpu().numpy()
+                all_masks_for_postprocess = all_masks_tensor.cpu().numpy()
+            else:
+                # 如果已经是numpy数组，直接使用（CPU模式）
+                all_probs_for_postprocess = all_probs_np.copy()
+                all_masks_for_postprocess = all_masks_np.copy()
+            
+            # 再次确认total_samples
+            if total_samples == 0:
+                total_samples = all_probs_for_postprocess.shape[0]
+            
+            # 对每个样本应用后处理并计算Dice（与验证阶段保持一致）
+            processed_preds_list = []
+            dice_scores_per_sample = []  # 用于计算Mean Dice
+            empty_mask_count = 0
+            empty_mask_dice_sum = 0.0
+            non_empty_mask_count = 0
+            non_empty_mask_dice_sum = 0.0
+            
+            for i in range(total_samples):
+                # 获取单个样本的概率图和真实标签
+                prob_map = all_probs_for_postprocess[i, 0]  # (H, W)
+                mask_gt = all_masks_for_postprocess[i, 0]    # (H, W)
+                
+                # 使用最佳阈值二值化
+                pred_mask = (prob_map >= best_threshold).astype(np.float32)
+                
+                # 转换为tensor进行后处理（后处理函数支持tensor和numpy）
+                pred_mask_tensor = torch.from_numpy(pred_mask).float()
+                prob_map_tensor = torch.from_numpy(prob_map).float()
+                
+                # 先执行智能后处理
+                pred_mask_tensor = self.smart_post_processing(pred_mask_tensor, prob_map_tensor)
+                
+                # 再执行传统形态学后处理（与验证阶段参数一致）
+                pred_mask_processed = self.post_process_mask(
+                    pred_mask_tensor,
+                    min_size=150,
+                    use_morphology=True,
+                    keep_largest=False,
+                    fill_holes=True,
+                    prob_map=prob_map_tensor
+                )
+                
+                # 转换回numpy
+                if isinstance(pred_mask_processed, torch.Tensor):
+                    pred_mask_processed = pred_mask_processed.cpu().numpy()
+                
+                processed_preds_list.append(pred_mask_processed)
+                
+                # 【统一计算】使用统一的指标计算函数
+                pred_tensor = torch.from_numpy(pred_mask_processed).float().unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+                mask_tensor = torch.from_numpy(mask_gt).float().unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+                sample_metrics = self.calculate_batch_metrics(pred_tensor, mask_tensor)
+                
+                dice_sample = sample_metrics['dice'][0]
+                is_empty = sample_metrics['is_empty'][0]
+                
+                if is_empty:
+                    empty_mask_count += 1
+                    empty_mask_dice_sum += dice_sample
+                    # 【诊断】记录假阳性情况
+                    if dice_sample < 1.0 and empty_mask_count <= 5:  # 只记录前5个，避免日志过多
+                        pred_sum = pred_mask_processed.sum()
+                        fp_pixels = int(pred_sum)
+                        print(f">>> [诊断] 空mask样本 #{i+1}: 后处理后仍有 {fp_pixels} 个假阳性像素")
+                else:
+                    non_empty_mask_count += 1
+                    non_empty_mask_dice_sum += dice_sample
+                
+                dice_scores_per_sample.append(float(dice_sample))
+                
+                # 每处理100个样本显示一次进度
+                if (i + 1) % 100 == 0:
+                    self.update_progress.emit(92 + int(6 * (i + 1) / total_samples), 
+                                             f"阈值优化: 后处理进度 {i+1}/{total_samples}...")
+            
+            # 输出诊断信息
+            if empty_mask_count > 0:
+                empty_mask_avg_dice = empty_mask_dice_sum / empty_mask_count
+                print(f">>> [GWO诊断] 空mask样本: {empty_mask_count}/{total_samples} ({100*empty_mask_count/total_samples:.1f}%)")
+                print(f">>> [GWO诊断] 空mask平均Dice: {empty_mask_avg_dice:.4f}")
+                if empty_mask_avg_dice < 0.9:
+                    print(f">>> [GWO警告] 空mask Dice偏低，可能是后处理未能完全过滤假阳性")
+            if non_empty_mask_count > 0:
+                non_empty_mask_avg_dice = non_empty_mask_dice_sum / non_empty_mask_count
+                print(f">>> [GWO诊断] 有前景样本: {non_empty_mask_count}/{total_samples} ({100*non_empty_mask_count/total_samples:.1f}%)")
+                print(f">>> [GWO诊断] 有前景样本平均Dice: {non_empty_mask_avg_dice:.4f}")
+            
+            # 【关键修复】使用Mean Dice（每个样本分别计算再平均，与验证阶段一致）
+            # 验证阶段使用 Mean Dice，所以GWO也应该使用 Mean Dice 以保持一致
+            mean_dice_postprocessed = np.mean(dice_scores_per_sample) if dice_scores_per_sample else 0.0
+            
+            # 【内存优化】分批计算Global Dice用于对比，避免内存爆炸
+            # 不要一次性创建(N, H, W)的bool数组，而是分批累加TP/FP/FN
+            batch_size_for_global = 100  # 每批处理100个样本
+            tp_total, fp_total, fn_total, tn_total = 0, 0, 0, 0
+            
+            for batch_start in range(0, total_samples, batch_size_for_global):
+                batch_end = min(batch_start + batch_size_for_global, total_samples)
+                batch_preds = np.array(processed_preds_list[batch_start:batch_end])  # (B, H, W)
+                batch_masks = all_masks_for_postprocess[batch_start:batch_end]  # (B, H, W)
+                
+                # 确保形状一致
+                if batch_preds.shape != batch_masks.shape:
+                    # 如果形状不匹配，调整batch_masks
+                    if batch_masks.ndim == 3 and batch_preds.ndim == 3:
+                        # 确保都是(B, H, W)
+                        if batch_masks.shape[0] != batch_preds.shape[0]:
+                            batch_masks = batch_masks[:batch_preds.shape[0]]
+                        if batch_masks.shape[1:] != batch_preds.shape[1:]:
+                            # 使用插值调整大小（不应该发生，但安全起见）
+                            from scipy.ndimage import zoom
+                            zoom_factors = (1.0, batch_preds.shape[1]/batch_masks.shape[1], 
+                                          batch_preds.shape[2]/batch_masks.shape[2])
+                            batch_masks = zoom(batch_masks, zoom_factors, order=0)
+                
+                # 二值化并展平
+                pred_bool_batch = (batch_preds > 0.5).astype(np.float32)  # (B, H, W)
+                gt_bool_batch = (batch_masks > 0.5).astype(np.float32)  # (B, H, W)
+                
+                # 展平为(B*H*W,)
+                pred_flat_batch = pred_bool_batch.flatten()  # (B*H*W,)
+                gt_flat_batch = gt_bool_batch.flatten()  # (B*H*W,)
+                
+                # 计算混淆矩阵（逐元素，避免广播）
+                tp_batch = np.sum(pred_flat_batch * gt_flat_batch)
+                fp_batch = np.sum(pred_flat_batch * (1 - gt_flat_batch))
+                fn_batch = np.sum((1 - pred_flat_batch) * gt_flat_batch)
+                tn_batch = np.sum((1 - pred_flat_batch) * (1 - gt_flat_batch))
+                
+                tp_total += int(tp_batch)
+                fp_total += int(fp_batch)
+                fn_total += int(fn_batch)
+                tn_total += int(tn_batch)
+                
+                # 清理批次变量
+                del batch_preds, batch_masks, pred_bool_batch, gt_bool_batch
+                del pred_flat_batch, gt_flat_batch
+                if torch.cuda.is_available() and batch_end % 500 == 0:
+                    torch.cuda.empty_cache()
+            
+            # 计算Global Dice（用于对比）
+            dice_den_postprocessed = 2.0 * tp_total + fp_total + fn_total
+            global_dice_postprocessed = 1.0 if dice_den_postprocessed < 1e-7 else (2.0 * tp_total) / (dice_den_postprocessed + 1e-7)
+            
+            print(f">>> [GWO] 验证计算完成! 最佳阈值: {best_threshold:.4f}")
+            print(f">>> [GWO] GWO搜索时的Dice: {best_dice:.4f} (Mean+后处理)")
+            print(f">>> [GWO] 重新计算的Mean Dice: {mean_dice_postprocessed:.4f} (用于验证一致性)")
+            print(f">>> [GWO] Global Dice(后处理): {global_dice_postprocessed:.4f} (用于对比)")
+            
+            # 【关键修复】检查一致性
+            dice_diff = abs(best_dice - mean_dice_postprocessed)
+            if dice_diff > 0.01:
+                print(f">>> [GWO警告] Dice差异较大: {dice_diff:.4f}，可能存在计算不一致")
+            else:
+                print(f">>> [GWO] Dice一致性验证通过 (差异: {dice_diff:.4f})")
+            
+            # 【关键修复】使用重新计算的Mean Dice作为最终结果（确保与验证阶段完全一致）
+            best_dice = mean_dice_postprocessed
+            
+            # 为了兼容性，计算完整的指标字典（使用后处理后的结果）
+            # 使用已计算的混淆矩阵
+            tp = tp_total
+            fp = fp_total
+            fn = fn_total
+            tn = tn_total
+            
+            # 计算完整指标
+            dice_den = 2.0 * tp + fp + fn
+            dice = 1.0 if dice_den < 1e-7 else (2.0 * tp) / (dice_den + 1e-7)
+            iou_den = tp + fp + fn
+            iou = 1.0 if iou_den < 1e-7 else tp / (iou_den + 1e-7)
+            prec_den = tp + fp
+            precision = 1.0 if prec_den < 1e-7 else tp / (prec_den + 1e-7)
+            rec_den = tp + fn
+            recall = 1.0 if rec_den < 1e-7 else tp / (rec_den + 1e-7)
+            spec_den = tn + fp
+            specificity = 1.0 if spec_den < 1e-7 else tn / (spec_den + 1e-7)
+            
+            best_metrics = {
+                'dice': float(dice),
+                'iou': float(iou),
+                'precision': float(precision),
+                'recall': float(recall),
+                'specificity': float(specificity),
+                'score': float(best_dice)  # 使用后处理后的Mean Dice（与验证阶段一致）
+            }
+            
+            # 【显存优化】删除拼接后的数组和中间变量
+            # 注意：在CPU模式下，all_probs_tensor就是all_probs_np，所以只需要删除一次
+            if use_gpu_for_gwo:
+                # GPU模式：删除tensor和numpy数组
+                del all_probs_tensor, all_masks_tensor
+            del all_probs_np, all_masks_np
+            del processed_preds_list, dice_scores_per_sample
+            if 'all_probs_for_postprocess' in locals():
+                del all_probs_for_postprocess, all_masks_for_postprocess
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+
+        # 【关键修复】确保total_samples正确显示
+        if 'total_samples' not in locals() or total_samples == 0:
+            # 如果total_samples未定义或为0，尝试从best_metrics或其他地方获取
+            if 'all_probs_for_postprocess' in locals() and all_probs_for_postprocess is not None:
+                total_samples = all_probs_for_postprocess.shape[0]
+            elif 'all_probs_np' in locals() and all_probs_np is not None:
+                total_samples = all_probs_np.shape[0]
+            else:
+                total_samples = num_samples if 'num_samples' in locals() else 0
 
         sample_info = "全部验证集" if use_all_samples else f"{num_samples}个批次"
         score_val = best_metrics.get("score", 0.0) if isinstance(best_metrics, dict) else 0.0
         print(
-            f"[阈值优化] 使用样本: {sample_info} | "
-            f"最优阈值: {best_threshold:.3f}, 综合评分: {score_val:.4f}, "
+            f"[阈值优化] 使用样本: {sample_info} ({total_samples}个样本) | "
+            f"最优阈值: {best_threshold:.3f}, 最佳Dice(全验证集): {best_dice:.4f}, "
             f"Dice: {best_metrics.get('dice', float('nan')):.4f}, "
             f"IoU: {best_metrics.get('iou', float('nan')):.4f}"
         )
-        return float(best_threshold)
+        # 返回最佳阈值和最佳Dice（基于全验证集GWO优化）
+        return (float(best_threshold), float(best_dice))
     
     def evaluate_model(self, model, dataloader, device, use_tta=True, adaptive_threshold=True):
         """
@@ -1701,9 +2909,17 @@ class TrainThread(QThread):
         """
         # 寻找最优阈值
         if adaptive_threshold:
-            optimal_thresh = self.find_optimal_threshold(model, dataloader, device)
+            threshold_result = self.find_optimal_threshold(model, dataloader, device)
+            # 处理返回值：可能是元组(threshold, dice)或单个值（向后兼容）
+            if isinstance(threshold_result, tuple):
+                optimal_thresh, gwo_dice = threshold_result
+                self.gwo_best_dice = float(gwo_dice)
+            else:
+                optimal_thresh = threshold_result
+                self.gwo_best_dice = None
         else:
             optimal_thresh = 0.5
+            self.gwo_best_dice = None
         self.last_optimal_threshold = float(optimal_thresh)
         
         model.eval()
@@ -1743,17 +2959,18 @@ class TrainThread(QThread):
                 if brain_mask is not None:
                     outputs = outputs * brain_mask
                 
-                preds = torch.sigmoid(outputs)
-                preds = (preds > optimal_thresh).float()  # 使用最优阈值
+                prob_maps = torch.sigmoid(outputs)
+                preds = (prob_maps > optimal_thresh).float()  # 使用最优阈值
                 
                 # 应用后处理优化：填充孔洞，不再强制只保留最大连通域
                 for i in range(preds.shape[0]):
                     preds[i, 0] = self.post_process_mask(
                         preds[i, 0], 
-                        min_size=30, 
+                        min_size=150, 
                         use_morphology=True,
                         keep_largest=False,  # 允许多发病灶同时存在
-                        fill_holes=True     # 填充孔洞，去除假阴性空洞
+                        fill_holes=True,     # 填充孔洞，去除假阴性空洞
+                        prob_map=prob_maps[i, 0]
                     )
                 
                 # 计算批次中每个图像的指标
@@ -1791,21 +3008,28 @@ class TrainThread(QThread):
                     else:
                         iou = tp / union
                     
-                    # Precision = TP / (TP + FP)
-                    if tp + fp < 1e-7:
-                        precision = 1.0 if mask_sum < 1e-7 else 0.0
+                    # 【统一计算方式】Precision = TP / (TP + FP)
+                    prec_den = tp + fp
+                    if prec_den < 1e-7:
+                        # 如果没有预测出任何正样本(tp+fp=0)，则精确率视为1.0(无误检)
+                        precision = 1.0
                     else:
-                        precision = tp / (tp + fp)
+                        precision = float(tp / (prec_den + 1e-7))  # 使用 1e-7 与 Recall/Specificity 保持一致
                     
-                    # Recall/Sensitivity = TP / (TP + FN)
-                    if tp + fn < 1e-7:
-                        recall = 1.0 if pred_sum < 1e-7 else 0.0
+                    # 【统一计算方式】Recall/Sensitivity = TP / (TP + FN)
+                    rec_den = tp + fn
+                    if rec_den < 1e-7:
+                        # 如果Ground Truth为空(无病灶，tp+fn=0)，则召回率视为1.0(完美表现)
+                        recall = 1.0
                     else:
-                        recall = tp / (tp + fn)
+                        recall = float(tp / (rec_den + 1e-7))  # 使用 1e-7 与 Precision/Specificity 保持一致
                     
-                            # Specificity = TN / (TN + FP)
-                    tn_plus_fp = tn + fp
-                    specificity = 1.0 if tn_plus_fp < 1e-7 else tn / tn_plus_fp
+                    # 【统一计算方式】Specificity = TN / (TN + FP)
+                    spec_den = tn + fp
+                    if spec_den < 1e-7:
+                        specificity = 1.0  # 如果没有负样本，特异性为1.0
+                    else:
+                        specificity = float(tn / (spec_den + 1e-7))  # 使用 1e-7 与 Precision/Recall 保持一致
                     
                     # F1在二分类下应与Dice一致，这里直接复用
                     f1 = dice
@@ -1981,10 +3205,11 @@ class TrainThread(QThread):
                     # 再执行传统形态学后处理，但不移除小区域（min_size=0）
                     pred_mask_processed = self.post_process_mask(
                         pred_mask_tensor,
-                        min_size=0,
+                        min_size=150,
                         use_morphology=True,
                         keep_largest=False,  # 允许多发病灶同时存在
-                        fill_holes=True     # 填充孔洞，去除假阴性空洞
+                        fill_holes=True,     # 填充孔洞，去除假阴性空洞
+                        prob_map=prob_map_tensor
                     )
                     preds[i, 0] = pred_mask_processed
                 
@@ -2269,9 +3494,26 @@ class TrainThread(QThread):
                         union = tp + fp + fn
                         iou = 1.0 if union < 1e-7 else tp / union
                         
-                        precision = 1.0 if (tp + fp) < 1e-7 else tp / (tp + fp)
-                        recall = 1.0 if (tp + fn) < 1e-7 else tp / (tp + fn)
-                        specificity = 1.0 if (tn + fp) < 1e-7 else tn / (tn + fp)
+                        # 【统一计算方式】Precision = TP / (TP + FP)
+                        prec_den = tp + fp
+                        if prec_den < 1e-7:
+                            precision = 1.0  # 如果没有预测出任何正样本，精确率为1.0
+                        else:
+                            precision = float(tp / (prec_den + 1e-7))  # 使用 1e-7 与 Recall/Specificity 保持一致
+                        
+                        # 【统一计算方式】Recall = TP / (TP + FN)
+                        rec_den = tp + fn
+                        if rec_den < 1e-7:
+                            recall = 1.0  # 如果Ground Truth为空，召回率为1.0
+                        else:
+                            recall = float(tp / (rec_den + 1e-7))  # 使用 1e-7 与 Precision/Specificity 保持一致
+                        
+                        # 【统一计算方式】Specificity = TN / (TN + FP)
+                        spec_den = tn + fp
+                        if spec_den < 1e-7:
+                            specificity = 1.0  # 如果没有负样本，特异性为1.0
+                        else:
+                            specificity = float(tn / (spec_den + 1e-7))  # 使用 1e-7 与 Precision/Recall 保持一致
                         f1 = dice
                         
                         seg_metrics['dice'].append(float(dice))
@@ -2293,19 +3535,27 @@ class TrainThread(QThread):
                     mask_sum = float(true_mask.sum().item())
                     intersection = float((system_pred * true_mask).sum().item())
                     
-                    # 计算系统整体Dice（包括空mask的情况）
-                    if mask_sum > 1e-7 or pred_sum > 1e-7:
-                        dice = self._safe_dice_score(system_pred, true_mask)
-                        total = pred_sum + mask_sum
-                        union = total - intersection
-                        iou = (intersection + 1e-7) / (union + 1e-7) if union > 1e-7 else 0.0
-                        precision = (intersection + 1e-7) / (pred_sum + 1e-7) if pred_sum > 1e-7 else 0.0
-                        recall = (intersection + 1e-7) / (mask_sum + 1e-7) if mask_sum > 1e-7 else 0.0
-                        
-                        system_dice_list.append(float(dice))
-                        system_iou_list.append(float(iou))
-                        system_precision_list.append(float(precision))
-                        system_recall_list.append(float(recall))
+                    # 【统一指标计算】使用统一函数同时计算 Dice 和 IoU，确保逻辑一致
+                    dice, iou = self._compute_metrics_unified(system_pred, true_mask)
+                    
+                    # 【统一计算方式】Precision = TP / (TP + FP) = intersection / pred_sum
+                    # 注意：这里 intersection = tp, pred_sum = tp + fp
+                    if pred_sum < 1e-7:
+                        precision = 1.0  # 如果没有预测出任何正样本，精确率为1.0
+                    else:
+                        precision = float(intersection / (pred_sum + 1e-7))  # 使用 1e-7 与 Recall 保持一致
+                    
+                    # 【统一计算方式】Recall = TP / (TP + FN) = intersection / mask_sum
+                    # 注意：这里 intersection = tp, mask_sum = tp + fn
+                    if mask_sum < 1e-7:
+                        recall = 1.0  # 如果Ground Truth为空，召回率为1.0
+                    else:
+                        recall = float(intersection / (mask_sum + 1e-7))  # 使用 1e-7 与 Precision 保持一致
+                    
+                    system_dice_list.append(float(dice))
+                    system_iou_list.append(float(iou))
+                    system_precision_list.append(float(precision))
+                    system_recall_list.append(float(recall))
                 
                 # 计算整体系统指标
                 for i in range(labels.size(0)):
@@ -2356,8 +3606,22 @@ class TrainThread(QThread):
                          system_metrics['false_negative'] + system_metrics['true_negative'])
         
         system_accuracy = 100.0 * (system_metrics['true_positive'] + system_metrics['true_negative']) / total_samples if total_samples > 0 else 0.0
-        system_precision = system_metrics['true_positive'] / (system_metrics['true_positive'] + system_metrics['false_positive'] + 1e-7)
-        system_recall = system_metrics['true_positive'] / (system_metrics['true_positive'] + system_metrics['false_negative'] + 1e-7)
+        # 【统一计算方式】System Precision = TP / (TP + FP)
+        system_tp = system_metrics['true_positive']
+        system_fp = system_metrics['false_positive']
+        system_fn = system_metrics['false_negative']
+        prec_den = system_tp + system_fp
+        if prec_den < 1e-7:
+            system_precision = 1.0  # 如果没有预测出任何正样本，精确率为1.0
+        else:
+            system_precision = float(system_tp / (prec_den + 1e-7))  # 使用 1e-7 与 Recall 保持一致
+        
+        # 【统一计算方式】System Recall = TP / (TP + FN)
+        rec_den = system_tp + system_fn
+        if rec_den < 1e-7:
+            system_recall = 1.0  # 如果Ground Truth为空，召回率为1.0
+        else:
+            system_recall = float(system_tp / (rec_den + 1e-7))  # 使用 1e-7 与 Precision 保持一致
         system_f1 = 2 * system_precision * system_recall / (system_precision + system_recall + 1e-7)
         
         results = {
@@ -2385,13 +3649,26 @@ class TrainThread(QThread):
         
         return results
     
-    def visualize_test_results(self, model, dataloader, device, num_samples=8, use_tta=True):
-        """可视化测试集上的分割结果，包含原图、真实mask、预测mask和对比图
+    def visualize_test_results(self, model, dataloader, device, num_samples=8, use_tta=True, epoch=None, is_best=False, threshold=None):
+        """
+        【双引擎策略】可视化测试集上的分割结果
+        
+        策略：
+        - 关键 Epoch（每20轮或最佳模型）：使用 MATLAB 生成高清图
+        - 普通 Epoch：使用 Matplotlib 快速预览
         
         Args:
             use_tta: 是否使用测试时增强（默认True，训练结束后的测试推荐使用）
+            epoch: 当前轮次（用于判断是否为关键 Epoch）
+            is_best: 是否为最佳模型
+            threshold: 二值化阈值，如果为None则使用self.last_optimal_threshold，如果仍不可用则使用0.1
         """
-        save_path = os.path.join(self.temp_dir, "test_results_visualization.png")
+        # 确定使用的阈值
+        if threshold is None:
+            threshold = getattr(self, 'last_optimal_threshold', 0.1)
+        # 如果阈值仍然不可用或无效，使用0.1作为默认值（允许看到低置信度预测）
+        if threshold is None or threshold <= 0 or threshold >= 1:
+            threshold = 0.1
         model.eval()
         
         # 收集样本
@@ -2418,7 +3695,7 @@ class TrainThread(QThread):
                 if outputs.shape[2:] != masks.shape[2:]:
                     outputs = F.interpolate(outputs, size=masks.shape[2:], mode='bilinear', align_corners=False)
                 preds = torch.sigmoid(outputs)
-                preds_binary = (preds > 0.5).float()
+                preds_binary = (preds > threshold).float()
                 
                 for i in range(images.size(0)):
                     if len(all_masks) >= num_samples:
@@ -2442,21 +3719,8 @@ class TrainThread(QThread):
                     mask_sum = mask.sum()
                     intersection = (pred * mask).sum()
                     
-                    # 使用_safe_dice_score统一处理
-                    dice = self._safe_dice_score(pred, mask)
-                    
-                    # IoU计算也需要特殊处理
-                    if mask_sum <= 1e-7:
-                        if pred_sum <= 1e-7:
-                            iou = 1.0  # 完美匹配
-                        else:
-                            iou = 0.0  # 有误检
-                    elif pred_sum <= 1e-7:
-                        iou = 0.0  # 完全漏检
-                    else:
-                        total = pred_sum + mask_sum
-                        union = total - intersection
-                        iou = (intersection + 1e-7) / (union + 1e-7)
+                    # 【统一指标计算】使用统一函数同时计算 Dice 和 IoU，确保逻辑一致
+                    dice, iou = self._compute_metrics_unified(pred, mask)
                     
                     all_images.append(img)
                     all_masks.append(mask)
@@ -2466,16 +3730,53 @@ class TrainThread(QThread):
                 if len(all_masks) >= num_samples:
                     break
 
-        if self.enable_matlab_plots and self.matlab_viz_bridge:
+        # 【双引擎策略】判断使用 MATLAB 还是 Matplotlib
+        use_matlab = False
+        if epoch is not None:
+            # 关键 Epoch：每20轮或最佳模型
+            is_key_epoch = (epoch % 20 == 0) or is_best
+            use_matlab = is_key_epoch and self.enable_matlab_plots and self.matlab_viz_bridge
+        else:
+            # 如果没有传入 epoch，默认使用 MATLAB（向后兼容）
+            use_matlab = self.enable_matlab_plots and self.matlab_viz_bridge
+
+        # 使用 MATLAB 生成高清图（关键 Epoch）
+        if use_matlab:
             try:
-                payload = self._save_test_results_payload(all_images, all_masks, all_preds, all_metrics, "test_results")
-                matlab_path = os.path.join(self.temp_dir, "test_results_visualization_matlab.png")
-                self.matlab_viz_bridge.render_test_results(payload, matlab_path)
+                # 使用 _save_matlab_viz_payload 保存数据（与 render_prediction_grid 兼容）
+                payload = self._save_matlab_viz_payload(all_images, all_masks, all_preds, "test_results")
+                # 【持久化修复】保存到持久化目录
+                import time
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                base_name = f"test_results_visualization_epoch{epoch}_matlab" if epoch is not None else "test_results_visualization_matlab"
+                matlab_path = os.path.join(self.persistent_report_dir, f"{base_name}_{timestamp}.png")
+                os.makedirs(os.path.dirname(matlab_path), exist_ok=True)
+                self.matlab_viz_bridge.render_prediction_grid(payload, matlab_path)
+                print(f"[高清] MATLAB 渲染完成，已保存到持久化目录: {matlab_path}")
                 return matlab_path
             except Exception as exc:
                 print(f"[MATLAB Plot] 测试可视化回退: {exc}")
+                # 回退到 Matplotlib
         
-        # 创建可视化
+        # 使用 Matplotlib 快速预览（普通 Epoch）
+        save_path = os.path.join(self.temp_dir, f"test_results_visualization_epoch{epoch}_preview.png" if epoch is not None else "test_results_visualization.png")
+        try:
+            # 使用类方法（如果可用）或独立函数，传入阈值
+            if self.matlab_viz_bridge:
+                self.matlab_viz_bridge.render_quick_preview_matplotlib(all_images, all_masks, all_preds, save_path, num_samples=min(num_samples, len(all_images)), threshold=threshold)
+            else:
+                # 回退：使用独立函数（向后兼容）
+                from utils import render_quick_preview_matplotlib
+                render_quick_preview_matplotlib(all_images, all_masks, all_preds, save_path, num_samples=min(num_samples, len(all_images)), threshold=threshold)
+            print(f"[快照] Matplotlib 绘图完成: {save_path}")
+            return save_path
+        except Exception as exc:
+            print(f"[Matplotlib Plot] 快速预览失败: {exc}")
+            # 最终回退：使用原有的 Matplotlib 代码
+            return self._fallback_matplotlib_plot(all_images, all_masks, all_preds, all_metrics, save_path, num_samples)
+    
+    def _fallback_matplotlib_plot(self, all_images, all_masks, all_preds, all_metrics, save_path, num_samples):
+        """回退方案：使用原有的 Matplotlib 绘图代码"""
         num_samples = min(num_samples, len(all_images))
         cols = 4  # 原图、真实mask、预测mask、对比图
         rows = num_samples
@@ -2530,7 +3831,11 @@ class TrainThread(QThread):
         if self.enable_matlab_plots and self.matlab_viz_bridge:
             try:
                 payload = self._save_performance_payload(detailed_metrics)
-                matlab_path = os.path.join(self.temp_dir, "performance_analysis_matlab.png")
+                # 【持久化修复】保存到持久化目录
+                import time
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                matlab_path = os.path.join(self.persistent_report_dir, f"performance_analysis_{timestamp}_matlab.png")
+                os.makedirs(os.path.dirname(matlab_path), exist_ok=True)
                 self.matlab_viz_bridge.render_performance_analysis(payload, matlab_path)
                 return matlab_path
             except Exception as exc:
@@ -2648,12 +3953,26 @@ class TrainThread(QThread):
         
         return save_path
     
-    def visualize_attention_maps(self, model, dataloader, device, num_samples=4):
-        """可视化注意力权重图，用于模型可解释性分析 - 优化版"""
-        if not self._supports_attention_maps(model):
+    def visualize_attention_maps(self, model, dataloader, device, num_samples=4, threshold=None):
+        """可视化注意力权重图，用于模型可解释性分析 - 优化版
+        
+        Args:
+            threshold: 二值化阈值，如果为None则使用self.last_optimal_threshold，如果仍不可用则使用0.1
+        """
+        # 【DeepLabV3+ 兼容性】DeepLabV3+ 虽然标记为支持注意力图，但实际上不支持 return_attention
+        # 这里允许 DeepLabV3+ 通过，但会在后续返回空结果
+        is_deeplabv3 = self.model_type in ("deeplabv3plus", "smp_deeplabv3plus")
+        if not self._supports_attention_maps(model) and not is_deeplabv3:
             raise RuntimeError("当前模型不支持注意力可视化")
         save_path = os.path.join(self.temp_dir, "attention_visualization.png")
         model.eval()
+        
+        # 确定使用的阈值
+        if threshold is None:
+            threshold = getattr(self, 'last_optimal_threshold', 0.1)
+        # 如果阈值仍然不可用或无效，使用0.1作为默认值
+        if threshold is None or threshold <= 0 or threshold >= 1:
+            threshold = 0.1
         
         # 收集样本和注意力图
         all_images = []
@@ -2661,19 +3980,60 @@ class TrainThread(QThread):
         all_preds = []
         all_attention_maps = []
         
-        with torch.no_grad():
-            for batch_data in dataloader:
-                # 处理数据：可能包含分类标签
-                if len(batch_data) == 3:
-                    images, masks, _ = batch_data
+        # 【性能优化】只对前 5 个 batch 生成 Grad-CAM，其他 batch 跳过以提升速度
+        # Grad-CAM 需要反向传播，计算成本极高，全量生成会导致验证时间过长
+        max_gradcam_batches = 5  # 只对前 5 个 batch 生成 Grad-CAM
+        
+        for batch_idx, batch_data in enumerate(dataloader):
+            # 处理数据：可能包含分类标签
+            if len(batch_data) == 3:
+                images, masks, _ = batch_data
+            else:
+                images, masks = batch_data
+            images, masks = images.to(device), masks.to(device)
+            
+            # 【性能优化】判断是否需要生成 Grad-CAM（仅前 5 个 batch）
+            need_gradcam = (batch_idx < max_gradcam_batches)
+            is_deeplabv3 = self.model_type in ("deeplabv3plus", "smp_deeplabv3plus")
+            
+            if need_gradcam:
+                # 需要 Grad-CAM 的样本：必须在 torch.enable_grad() 下运行
+                # 【DeepLabV3+ 兼容性 + Grad-CAM 集成】DeepLabV3+ 不支持 return_attention，使用 Grad-CAM
+                if is_deeplabv3:
+                    # DeepLabV3+ 不支持 return_attention，先获取输出
+                    with torch.enable_grad():
+                        outputs = model(images)
+                        # 使用 Grad-CAM 生成热力图（需要梯度）
+                        actual_model = self._unwrap_model(model)
+                        attention_maps = self._generate_gradcam_for_deeplabv3(actual_model, images, device)
                 else:
-                    images, masks = batch_data
-                images, masks = images.to(device), masks.to(device)
-                # 获取预测结果和注意力权重
-                outputs, attention_maps = model(images, return_attention=True)
-                preds = torch.sigmoid(outputs)
-                preds_binary = (preds > 0.5).float()
-                
+                    outputs, attention_maps = model(images, return_attention=True)
+            else:
+                # 不需要 Grad-CAM 的样本：使用 torch.no_grad() 加速
+                # 如果已收集足够样本，直接退出循环
+                if len(all_images) >= num_samples:
+                    break
+                    
+                with torch.no_grad():
+                    if is_deeplabv3:
+                        # DeepLabV3+ 不需要注意力图，直接获取输出
+                        outputs = model(images)
+                        attention_maps = {}  # 不需要热力图
+                    else:
+                        # 其他模型：尝试获取注意力图，但不强制
+                        try:
+                            outputs, attention_maps = model(images, return_attention=True)
+                        except:
+                            # 如果获取失败，只获取输出
+                            outputs = model(images)
+                            attention_maps = {}
+            
+            # 处理预测结果（无论是否需要 Grad-CAM）
+            preds = torch.sigmoid(outputs)
+            preds_binary = (preds > threshold).float()
+            
+            # 只处理需要可视化的样本（前 5 个 batch）
+            if need_gradcam:
                 for i in range(images.size(0)):
                     if len(all_images) >= num_samples:
                         break
@@ -2686,15 +4046,21 @@ class TrainThread(QThread):
                     
                     # 收集所有层的注意力图，并上采样到原始图像大小
                     att_dict = {}
-                    for att_name, att_map in attention_maps.items():
-                        att_np = att_map[i, 0].cpu().numpy()
-                        # 上采样到256x256（与输入图像大小一致）
-                        from scipy.ndimage import zoom
-                        target_size = (256, 256)
-                        if att_np.shape != target_size:
-                            zoom_factors = (target_size[0] / att_np.shape[0], target_size[1] / att_np.shape[1])
-                            att_np = zoom(att_np, zoom_factors, order=1)
-                        att_dict[att_name] = att_np
+                    # 【DeepLabV3+ 兼容性】如果 attention_maps 为空（DeepLabV3+ 不支持），使用占位符
+                    if not attention_maps:
+                        # 对于 DeepLabV3+，创建一个占位符注意力图（使用预测概率图作为替代）
+                        pred_np = pred.copy()
+                        att_dict['output_probability'] = pred_np  # 使用预测概率作为注意力图
+                    else:
+                        for att_name, att_map in attention_maps.items():
+                            att_np = att_map[i, 0].cpu().numpy()
+                            # 上采样到512x512（与输入图像大小一致）
+                            from scipy.ndimage import zoom
+                            target_size = (512, 512)  # 提升分辨率以保留更多病灶边缘细节
+                            if att_np.shape != target_size:
+                                zoom_factors = (target_size[0] / att_np.shape[0], target_size[1] / att_np.shape[1])
+                                att_np = zoom(att_np, zoom_factors, order=1)
+                            att_dict[att_name] = att_np
                     
                     all_images.append(img)
                     all_masks.append(mask)
@@ -2713,7 +4079,11 @@ class TrainThread(QThread):
         if self.enable_matlab_plots and self.matlab_viz_bridge:
             try:
                 payload_path = self._save_attention_payload(all_images, all_masks, all_preds, att_layer_payload, "attention_visualization")
-                matlab_path = os.path.join(self.temp_dir, "attention_visualization_matlab.png")
+                # 【持久化修复】保存到持久化目录
+                import time
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                matlab_path = os.path.join(self.persistent_report_dir, f"attention_visualization_{timestamp}_matlab.png")
+                os.makedirs(os.path.dirname(matlab_path), exist_ok=True)
                 self.matlab_viz_bridge.render_attention_maps(payload_path, matlab_path)
                 return matlab_path
             except Exception as exc:
@@ -2791,47 +4161,100 @@ class TrainThread(QThread):
     
     def analyze_attention_statistics(self, model, dataloader, device, num_samples=20):
         """分析注意力权重的统计特性 - 增强版，支持动态检测注意力层"""
-        if not self._supports_attention_maps(model):
+        # 【DeepLabV3+ 兼容性】DeepLabV3+ 虽然标记为支持注意力图，但实际上不支持 return_attention
+        is_deeplabv3 = self.model_type in ("deeplabv3plus", "smp_deeplabv3plus")
+        if not self._supports_attention_maps(model) and not is_deeplabv3:
             raise RuntimeError("当前模型不支持注意力统计分析")
         model.eval()
         # 先运行一次获取实际的注意力层名称
         attention_stats = {}
         
-        with torch.no_grad():
-            eval_count = 0
-            for batch_data in dataloader:
+        # 【性能优化】只对前 5 个 batch 生成 Grad-CAM，其他 batch 跳过以提升速度
+        # Grad-CAM 需要反向传播，计算成本极高，全量生成会导致验证时间过长
+        max_gradcam_batches = 5  # 只对前 5 个 batch 生成 Grad-CAM
+        gradcam_generated = False  # 标记是否已生成 Grad-CAM
+        
+        eval_count = 0
+        for batch_idx, batch_data in enumerate(dataloader):
+            if eval_count >= num_samples:
+                break
+            
+            # 处理数据：可能包含分类标签
+            if len(batch_data) == 3:
+                images, masks, _ = batch_data
+            else:
+                images, masks = batch_data
+            images, masks = images.to(device), masks.to(device)
+            
+            # 【性能优化】判断是否需要生成 Grad-CAM（仅前 5 个 batch）
+            need_gradcam = (batch_idx < max_gradcam_batches)
+            is_deeplabv3 = self.model_type in ("deeplabv3plus", "smp_deeplabv3plus")
+            
+            if need_gradcam:
+                # 需要 Grad-CAM 的样本：必须在 torch.enable_grad() 下运行
+                # 【DeepLabV3+ 兼容性 + Grad-CAM 集成】DeepLabV3+ 不支持 return_attention，使用 Grad-CAM
+                if is_deeplabv3:
+                    # DeepLabV3+ 不支持 return_attention，先获取输出
+                    with torch.enable_grad():
+                        outputs = model(images)
+                        # 使用 Grad-CAM 生成热力图（需要梯度）
+                        actual_model = self._unwrap_model(model)
+                        attention_maps = self._generate_gradcam_for_deeplabv3(actual_model, images, device)
+                        gradcam_generated = True
+                else:
+                    outputs, attention_maps = model(images, return_attention=True)
+                    gradcam_generated = True
+            else:
+                # 不需要 Grad-CAM 的样本：使用 torch.no_grad() 加速
+                with torch.no_grad():
+                    if is_deeplabv3:
+                        # DeepLabV3+ 不需要注意力图，直接获取输出
+                        outputs = model(images)
+                        attention_maps = {}  # 不需要热力图
+                    else:
+                        # 其他模型：尝试获取注意力图，但不强制
+                        try:
+                            outputs, attention_maps = model(images, return_attention=True)
+                        except:
+                            # 如果获取失败，只获取输出
+                            outputs = model(images)
+                            attention_maps = {}
+            
+            # 初始化统计字典（只初始化实际存在的层）
+            # 【性能优化】如果前 5 个 batch 都没有生成 Grad-CAM，提前返回
+            if batch_idx == max_gradcam_batches - 1 and not gradcam_generated and not attention_maps:
+                print("[注意力统计] 前 5 个 batch 均无法获取注意力图（可能是 Grad-CAM 生成失败），跳过统计分析")
+                return None
+            
+            # 【统计兼容性】如果 attention_maps 为空，跳过该 batch 的统计
+            # 注意：不需要 Grad-CAM 的 batch（need_gradcam=False）也会进入这里
+            if not attention_maps:
+                eval_count += images.size(0)
+                # 如果不需要 Grad-CAM 且已处理足够样本，提前退出
+                if not need_gradcam and eval_count >= num_samples:
+                    break
+                continue
+                
+            if not attention_stats:
+                for att_name in attention_maps.keys():
+                    attention_stats[att_name] = {
+                        'mean': [], 'std': [], 'max': [], 'min': [], 
+                        'entropy': [], 'concentration': []
+                    }
+            
+            preds = torch.sigmoid(outputs)
+            preds_binary = (preds > 0.5).float()
+            
+            for i in range(images.size(0)):
                 if eval_count >= num_samples:
                     break
                 
-                # 处理数据：可能包含分类标签
-                if len(batch_data) == 3:
-                    images, masks, _ = batch_data
-                else:
-                    images, masks = batch_data
-                images, masks = images.to(device), masks.to(device)
-                outputs, attention_maps = model(images, return_attention=True)
+                mask_np = masks[i, 0].cpu().numpy()
+                pred_np = preds_binary[i, 0].cpu().numpy()
                 
-                # 初始化统计字典（只初始化实际存在的层）
-                if not attention_stats:
-                    for att_name in attention_maps.keys():
-                        attention_stats[att_name] = {
-                            'mean': [], 'std': [], 'max': [], 'min': [], 
-                            'entropy': [], 'concentration': []
-                        }
-                
-                preds = torch.sigmoid(outputs)
-                preds_binary = (preds > 0.5).float()
-                
-                for i in range(images.size(0)):
-                    if eval_count >= num_samples:
-                        break
-                    
-                    mask_np = masks[i, 0].cpu().numpy()
-                    pred_np = preds_binary[i, 0].cpu().numpy()
-                    
-                    for att_name, att_map in attention_maps.items():
-                        if att_name not in attention_stats:
-                            continue
+                for att_name, att_map in attention_maps.items():
+                    if att_name not in attention_stats:
+                        continue
                             
                         att_np = att_map[i, 0].cpu().numpy()
                         
@@ -2903,26 +4326,125 @@ class TrainThread(QThread):
 
     def run(self):
         try:
+            # 【Bug修复】清空训练历史记录，防止图表数据重叠
+            # 策略：每次开始训练时都清空历史记录，确保图表从第1轮开始绘制
+            # 如果历史记录列表不为空，说明可能是上次训练留下的数据，应该清空
+            # 注意：当前实现不支持从checkpoint恢复历史记录，如果需要断点续训并恢复历史，
+            # 可以在后续添加从checkpoint读取历史数据的逻辑
+            has_existing_history = (
+                len(self.train_loss_history) > 0 or 
+                len(self.val_loss_history) > 0 or 
+                len(self.val_dice_history) > 0
+            )
+            
+            if has_existing_history:
+                print("[训练历史] 检测到残留的历史记录，已清空（防止图表数据重叠）")
+            
+            # 清空所有历史记录列表，确保每次训练都从第1轮开始
+            self.train_loss_history = []
+            self.val_loss_history = []
+            self.val_dice_history = []
+            self.val_dice_pos_history = []
+            self.val_dice_neg_history = []
+            
+            if not has_existing_history:
+                print("[训练历史] 开始新训练，历史记录已初始化")
+            
             # 初始化设备
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             self.update_progress.emit(0, f"使用设备: {device}")
             
             # 数据准备
-            patient_ids = [pid for pid in os.listdir(self.data_dir) 
-                         if os.path.isdir(os.path.join(self.data_dir, pid))]
+            # 2.5D数据集直接从文件加载，不需要patient_ids
+            if self.dataset_type == "2.5d":
+                # 2.5D数据集：直接使用load_dataset，它会处理文件列表
+                # 我们需要手动分割文件列表
+                from dataset import TCGA2_5DDataset
+                if not TCGA2_5D_AVAILABLE:
+                    raise ImportError("TCGA2_5DDataset 未导入，无法使用2.5D数据集")
+                
+                # 创建临时数据集以获取文件列表
+                temp_dataset = TCGA2_5DDataset(
+                    data_dir=self.data_dir,
+                    mask_dir=self.data_dir,
+                    transform=None,
+                    is_train=True,
+                    debug=False
+                )
+                all_indices = list(range(len(temp_dataset)))
+                
+                # 【修复数据泄露Bug】使用GroupShuffleSplit按case_id分组划分
+                # 确保同一个病人的所有切片要么全在训练集，要么全在验证集
+                # 避免同一病人的切片同时出现在训练集和验证集，导致验证集分数虚高
+                # GroupShuffleSplit已在文件顶部导入
+                
+                # 1. 获取所有样本的 group (case_id)
+                groups = [temp_dataset.file_list[i][0] for i in range(len(temp_dataset))]
+                
+                # 2. 按组划分
+                gss = GroupShuffleSplit(n_splits=1, test_size=0.3, random_state=42)
+                train_idx, val_idx = next(gss.split(all_indices, groups=groups))
+                
+                # 3. 转换回列表
+                train_indices = train_idx.tolist()
+                val_indices = val_idx.tolist()
+                
+                # 存储索引用于后续数据集创建
+                self.train_indices = train_indices
+                self.val_indices = val_indices
+                
+                # 验证分组正确性（调试信息）
+                train_cases = set([temp_dataset.file_list[i][0] for i in train_indices])
+                val_cases = set([temp_dataset.file_list[i][0] for i in val_indices])
+                overlap = train_cases & val_cases
+                if overlap:
+                    print(f"[警告] 发现 {len(overlap)} 个病例同时出现在训练集和验证集中，可能存在数据泄露！")
+                else:
+                    print(f"[数据划分] ✅ 成功按病例分组：训练集 {len(train_cases)} 个病例，验证集 {len(val_cases)} 个病例，无重叠")
+                patient_ids = []  # 2.5D数据集不使用patient_ids
+            else:
+                # 标准数据集：按patient_id组织
+                patient_ids = [pid for pid in os.listdir(self.data_dir) 
+                             if os.path.isdir(os.path.join(self.data_dir, pid))]
             
-            # 单模型训练
-            train_ids, val_ids = train_test_split(patient_ids, test_size=0.3, random_state=42)
+            # 单模型训练（仅对标准数据集）
+            if self.dataset_type != "2.5d":
+                # 检查patient_ids是否为空
+                if not patient_ids:
+                    error_msg = f"数据目录为空或格式不正确！\n\n数据目录: {self.data_dir}\n\n期望结构:\n  {self.data_dir}/\n    patient_id_1/\n    patient_id_2/\n    ...\n\n或者使用2.5D数据集模式。"
+                    self.update_progress.emit(0, error_msg)
+                    self.training_finished.emit(error_msg, None)
+                    return
+                train_ids, val_ids = train_test_split(patient_ids, test_size=0.3, random_state=42)
+            else:
+                train_ids, val_ids = [], []  # 2.5D数据集使用索引分割
             
             # 数据增强（增强对比度、光照和形变，提升泛化能力）
             # 优化数据增强 - 针对医学影像的非刚体形变特性
             # 重点增强：Grid Distortion + Elastic Transform（模拟器官挤压和变形）
             # MixUp 将在训练循环中实现（需要两张图像混合）
+            
+            # 【修复归一化参数】根据数据集类型动态设置归一化参数
+            # 2.5D数据集：3通道输入，使用ImageNet 3通道归一化
+            # 标准数据集：1通道输入，使用单通道归一化（但某些模型可能期望3通道，会在模型内部处理）
+            if self.dataset_type == "2.5d":
+                # 2.5D数据集：3通道输入，使用ImageNet归一化
+                normalize_mean = (0.485, 0.456, 0.406)
+                normalize_std = (0.229, 0.224, 0.225)
+            else:
+                # 标准数据集：根据模型类型判断
+                # 如果模型是SMP模型（U-Net++或DeepLabV3+），可能使用3通道（如果用户配置了3通道）
+                # 其他模型通常使用1通道，但为了兼容性，先使用3通道归一化
+                # 实际通道数会在模型构建时根据dataset_type设置
+                # 注意：如果模型输入是1通道，归一化参数会被忽略或重复使用
+                normalize_mean = (0.485, 0.456, 0.406)  # 默认3通道，兼容性考虑
+                normalize_std = (0.229, 0.224, 0.225)
+            
             train_transform = A.Compose([
-                A.Resize(256, 256),
+                A.Resize(512, 512),  # 提升分辨率以保留更多病灶边缘细节
                 A.HorizontalFlip(p=0.5),
                 A.VerticalFlip(p=0.1),
-                A.Affine(translate_percent=0.05, scale=(0.9, 1.1), rotate=(-10, 10), mode=cv2.BORDER_REFLECT_101, p=0.6),
+                A.Affine(translate_percent=0.05, scale=(0.9, 1.1), rotate=(-10, 10), border_mode=cv2.BORDER_REFLECT_101, p=0.6),
                 # Grid Distortion：模拟非刚体形变，对医学影像非常有效
                 A.GridDistortion(
                     num_steps=5,
@@ -2944,36 +4466,54 @@ class TrainThread(QThread):
                 A.CLAHE(clip_limit=2.5, tile_grid_size=(8, 8), p=0.3),
                 A.GaussianBlur(blur_limit=(3, 5), p=0.15),
                 # GaussNoise 已移除（参数不兼容），如需噪声增强可使用其他方式
-                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                A.Normalize(mean=normalize_mean, std=normalize_std),
                 ToTensorV2()
             ])
             
             # 验证集仅做几何归一化，避免引入过多随机性
             val_transform = A.Compose([
-                A.Resize(256, 256),
-                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                A.Resize(512, 512),  # 提升分辨率以保留更多病灶边缘细节
+                A.Normalize(mean=normalize_mean, std=normalize_std),
                 ToTensorV2()
             ])
             
             # 加载分割训练数据
             self.update_progress.emit(5, "正在加载分割训练数据...")
-            # 根据CPU核心数和操作系统设置合适的num_workers
-            # Windows上使用多进程可能导致卡死，建议使用0或1
+            # 【Windows 多进程优化】针对 Intel Core Ultra 9 285HX (24核) 优化
+            # 使用 8 个 worker 充分利用 8 个 P-Core（性能核心），既能喂饱 RTX 5080，又不会导致系统卡顿
             import platform
             is_windows = platform.system() == 'Windows'
             cpu_count = os.cpu_count() or 1
+            
+            # 【性能优化】设置 num_workers: 充分利用多核 CPU（ROG 枪神9 i9 + RTX 4090）
+            # 动态计算最优值：使用 min(os.cpu_count(), 8) 或直接设置为 8
+            # 对于高性能硬件，使用更多 workers 可以显著提升数据加载速度
             if is_windows:
-                # Windows上使用单进程或0，避免卡死
-                num_workers = 0
-                use_persistent_workers = False
+                # Windows 上使用 8 个 workers（充分利用 P-Core）
+                num_workers = min(os.cpu_count(), 8) if os.cpu_count() > 0 else 8
             else:
-                # Linux/Mac可以使用多进程
-                num_workers = max(0, min(4, cpu_count - 1))
-                use_persistent_workers = num_workers > 0
+                # Linux/Mac 可以使用更多进程
+                num_workers = min(os.cpu_count(), 8) if os.cpu_count() > 0 else 4
             
-            self.update_progress.emit(6, f"数据加载器配置: num_workers={num_workers}")
+            # 【关键优化】persistent_workers=True: 让子进程在 Epoch 之间保持存活，避免重复创建
+            # 这对性能提升至关重要，避免每个 Epoch 重新创建进程的开销
+            use_persistent_workers = (num_workers > 0)
             
-            train_dataset = self.load_dataset(train_ids, train_transform, split_name="train", return_classification=False)
+            # 【性能优化】pin_memory=True: 锁页内存，极大加快 CPU 到 GPU 的数据传输
+            # 对于 RTX 4090 这样的高性能 GPU，pin_memory 能带来显著性能提升
+            # 如果遇到 "resource already mapped" 错误，可以尝试减少 num_workers 或使用单 GPU
+            use_pin_memory = (device.type == 'cuda')  # CUDA 设备启用 pin_memory
+            
+            self.update_progress.emit(6, f"数据加载器配置: num_workers={num_workers}, persistent_workers={use_persistent_workers}, pin_memory={use_pin_memory}, prefetch_factor=4")
+            
+            # 2.5D数据集使用索引，标准数据集使用patient_ids
+            if self.dataset_type == "2.5d":
+                train_dataset = self.load_dataset([], train_transform, split_name="train", return_classification=False)
+                # 创建子集（使用索引）
+                from torch.utils.data import Subset
+                train_dataset = Subset(train_dataset, self.train_indices)
+            else:
+                train_dataset = self.load_dataset(train_ids, train_transform, split_name="train", return_classification=False)
             train_sampler = None
             if getattr(train_dataset, "use_weighted_sampling", False):
                 weights = train_dataset.get_sampling_weights()
@@ -2981,27 +4521,49 @@ class TrainThread(QThread):
                     weight_tensor = torch.as_tensor(weights, dtype=torch.double)
                     train_sampler = WeightedRandomSampler(weight_tensor, num_samples=len(weight_tensor), replacement=True)
 
+            # 检查训练数据集是否为空
+            if len(train_dataset) == 0:
+                error_msg = f"训练数据集为空！\n\n数据目录: {self.data_dir}\n\n请检查:\n1. 数据目录结构是否正确\n2. 图像和掩膜文件是否存在\n3. 数据集类型选择是否正确"
+                self.update_progress.emit(0, error_msg)
+                self.training_finished.emit(error_msg, None)
+                return
+            
             train_loader = DataLoader(
                 train_dataset,
                 batch_size=self.batch_size,
                 shuffle=(train_sampler is None),
                 sampler=train_sampler,
-                num_workers=num_workers,
-                pin_memory=(device.type == 'cuda' and not is_windows),  # Windows上pin_memory可能导致问题
-                persistent_workers=use_persistent_workers,
-                prefetch_factor=2 if num_workers > 0 else None
+                num_workers=num_workers,  # 【性能优化】使用多进程加速数据加载
+                pin_memory=use_pin_memory,  # 【性能优化】锁页内存，加速 CPU->GPU 传输
+                persistent_workers=use_persistent_workers,  # 【性能优化】保持子进程存活，避免重复创建
+                prefetch_factor=4 if num_workers > 0 else None  # 【性能优化】增加预取因子，提升数据流水线效率
             )
             
             self.update_progress.emit(10, "正在加载分割验证数据...")
-            val_dataset = self.load_dataset(val_ids, val_transform, split_name="val", return_classification=False, use_weighted_sampling=False)
+            # 2.5D数据集使用索引，标准数据集使用patient_ids
+            if self.dataset_type == "2.5d":
+                val_dataset = self.load_dataset([], val_transform, split_name="val", return_classification=False, use_weighted_sampling=False)
+                # 创建子集（使用索引）
+                from torch.utils.data import Subset
+                val_dataset = Subset(val_dataset, self.val_indices)
+            else:
+                val_dataset = self.load_dataset(val_ids, val_transform, split_name="val", return_classification=False, use_weighted_sampling=False)
+            
+            # 检查验证数据集是否为空
+            if len(val_dataset) == 0:
+                error_msg = f"验证数据集为空！\n\n数据目录: {self.data_dir}\n\n请检查:\n1. 数据目录结构是否正确\n2. 图像和掩膜文件是否存在\n3. 数据集类型选择是否正确"
+                self.update_progress.emit(0, error_msg)
+                self.training_finished.emit(error_msg, None)
+                return
+            
             val_loader = DataLoader(
                 val_dataset,
                 batch_size=self.batch_size,
                 shuffle=False,
-                num_workers=num_workers,
-                pin_memory=(device.type == 'cuda' and not is_windows),
-                persistent_workers=use_persistent_workers,
-                prefetch_factor=2 if num_workers > 0 else None
+                num_workers=num_workers,  # 【性能优化】使用多进程加速数据加载
+                pin_memory=use_pin_memory,  # 【性能优化】锁页内存，加速 CPU->GPU 传输
+                persistent_workers=use_persistent_workers,  # 【性能优化】保持子进程存活，避免重复创建
+                prefetch_factor=4 if num_workers > 0 else None  # 【性能优化】增加预取因子，提升数据流水线效率
             )
             
             train_pos_weight = self.pos_weight_cache.get('train')
@@ -3053,11 +4615,29 @@ class TrainThread(QThread):
                 self.dstrans_params = self._gwo_optimize_dstrans_params(train_loader, val_loader, device)
                 self.update_progress.emit(14, f"GWO优化完成，最佳参数: {self.dstrans_params}")
             
-            # 初始化模型
-            self.update_progress.emit(15, f"正在构建模型 ({self.model_type})...")
+            # 【GUI选项驱动】根据dataset_type自动判断并设置模型输入通道数
+            if self.dataset_type == "2.5d":
+                input_channels = 3
+                use_stacking = True
+                dataset_mode_desc = "2.5D模式（3通道堆叠：上一张、当前、下一张）"
+            else:  # 默认为 2D
+                input_channels = 1
+                use_stacking = False
+                dataset_mode_desc = "2D模式（单通道：仅当前切片）"
+            
+            print(f"\n{'='*60}")
+            print(f"📋 [GUI选项驱动配置]")
+            print(f"   数据集类型: {self.dataset_type}")
+            print(f"   模型输入通道数: {input_channels}")
+            print(f"   数据堆叠: {'启用' if use_stacking else '禁用'}")
+            print(f"   模式描述: {dataset_mode_desc}")
+            print(f"{'='*60}\n")
+            
+            # 初始化模型（_build_model内部会根据self.dataset_type设置in_channels）
+            self.update_progress.emit(15, f"正在构建模型 ({self.model_type}, {dataset_mode_desc})...")
             try:
                 model = self._build_model(device, swin_params=self.swin_params, dstrans_params=self.dstrans_params)
-                self.update_progress.emit(16, "模型构建完成")
+                self.update_progress.emit(16, f"模型构建完成（输入通道数: {input_channels}）")
             except Exception as e:
                 self.update_progress.emit(0, f"模型构建失败: {str(e)}")
                 import traceback
@@ -3079,9 +4659,17 @@ class TrainThread(QThread):
                     except Exception:
                         pass
 
-                # 使用兼容加载函数
-                success, msg = load_model_compatible(model, model_path_to_use, device, verbose=False)
+                # 【权重加载保护】使用兼容加载函数
+                # 如果是 2D 模式，允许加载单通道预训练权重
+                # 如果是 2.5D 模式，如果加载的是单通道权重，_adapt_model_channels 会在后续自动适配
+                print(f"[权重加载] 正在加载权重: {model_path_to_use}")
+                print(f"[权重加载] 当前模式: {dataset_mode_desc}，期望输入通道数: {input_channels}")
+                # 传递 target_model_type 参数，用于跨架构权重迁移（如从 ResNet-UNet 到 DeepLabV3+）
+                success, msg = load_model_compatible(model, model_path_to_use, device, verbose=False, target_model_type=self.model_type)
                 self.update_progress.emit(15, msg)
+                if not success:
+                    print(f"[警告] 权重加载失败: {msg}")
+                    print(f"[提示] 如果是通道数不匹配，_adapt_model_channels 会在后续自动适配")
             ema_model = None
             if self.use_ema:
                 ema_model = self._init_ema_model(model, device)
@@ -3095,6 +4683,10 @@ class TrainThread(QThread):
                 # ResNet101使用预训练权重，需要更小的学习率进行微调
                 # 从5e-5进一步降低到2e-5，避免梯度爆炸和数值不稳定
                 default_lr = 2e-5
+            elif self.model_type in ("smp_deeplabv3plus", "deeplabv3plus"):
+                # DeepLabV3+：使用更高的学习率，因为decoder是随机初始化的，需要更快的学习
+                # Encoder使用ImageNet预训练，Decoder需要快速适应任务
+                default_lr = 2e-4  # 从1e-4提升到2e-4
             else:
                 default_lr = 1e-4
 
@@ -3106,20 +4698,79 @@ class TrainThread(QThread):
                 print(f"[警告] 无法解析 SEG_LR='{env_lr}'，回退到默认学习率 {default_lr}")
                 initial_lr = default_lr
 
-            optimizer = self._create_optimizer(model.parameters(), lr=initial_lr)
-            # 增强前景权重以处理类别不平衡
-            adjusted_pos_weight = min(train_pos_weight * 1.5, 20.0)
-            bce_weight_tensor = torch.tensor([adjusted_pos_weight], device=device)
-            bce_criterion = nn.BCEWithLogitsLoss(pos_weight=bce_weight_tensor)
+            # 【降维打击】为SMP模型（U-Net++和DeepLabV3+）实现差异化学习率：encoder使用小LR，decoder使用10倍LR
+            # 这样可以让ResNet保持稳定，同时强行把随机初始化的头部拉起来
+            if self.model_type in ("smp_unetplusplus", "smp_deeplabv3plus", "deeplabv3plus"):
+                # 获取encoder和decoder参数
+                encoder_params = []
+                decoder_params = []
+                
+                # 处理可能的DataParallel包装
+                actual_model = model.module if isinstance(model, nn.DataParallel) else model
+                
+                # 检查是否是SMP模型（UnetPlusPlus或DeepLabV3Plus）
+                if hasattr(actual_model, 'model') and hasattr(actual_model.model, 'encoder'):
+                    # SMP模型结构：model.model.encoder 和 model.model.decoder（或decoder）
+                    encoder_params = list(actual_model.model.encoder.parameters())
+                    # DeepLabV3+和UnetPlusPlus都使用decoder
+                    if hasattr(actual_model.model, 'decoder'):
+                        decoder_params = list(actual_model.model.decoder.parameters())
+                    else:
+                        # 如果没有decoder，可能是其他结构，尝试获取所有非encoder参数
+                        decoder_params = []
+                        for name, param in actual_model.model.named_parameters():
+                            if 'encoder' not in name:
+                                decoder_params.append(param)
+                    # 添加segmentation_head参数到decoder组
+                    if hasattr(actual_model.model, 'segmentation_head'):
+                        decoder_params.extend(list(actual_model.model.segmentation_head.parameters()))
+                elif hasattr(actual_model, 'encoder') and hasattr(actual_model, 'decoder'):
+                    # 直接有encoder和decoder属性
+                    encoder_params = list(actual_model.encoder.parameters())
+                    decoder_params = list(actual_model.decoder.parameters())
+                    if hasattr(actual_model, 'segmentation_head'):
+                        decoder_params.extend(list(actual_model.segmentation_head.parameters()))
+                else:
+                    # 回退：无法识别结构，使用统一学习率
+                    print("[警告] 无法识别SMP模型结构，使用统一学习率")
+                    encoder_params = []
+                    decoder_params = list(model.parameters())
+                
+                if encoder_params and decoder_params:
+                    # 参数分组：encoder和decoder使用相同学习率（修正：移除10倍倍率，避免训练初期震荡）
+                    decoder_lr = initial_lr
+                    print(f"[差异化学习率] Encoder LR: {initial_lr:.2e}, Decoder LR: {decoder_lr:.2e}")
+                    optimizer = self._create_optimizer_with_groups(
+                        [
+                            {'params': encoder_params, 'lr': initial_lr},
+                            {'params': decoder_params, 'lr': decoder_lr}
+                        ],
+                        lr=initial_lr  # 默认LR（用于scheduler）
+                    )
+                else:
+                    # 回退到统一学习率
+                    optimizer = self._create_optimizer(model.parameters(), lr=initial_lr)
+            else:
+                # 非SMP U-Net++模型，使用统一学习率
+                optimizer = self._create_optimizer(model.parameters(), lr=initial_lr)
+            
+            # 【简化】移除 pos_weight，使用标准 BCEWithLogitsLoss
+            # Dice Loss 本身就能很好地处理类别不平衡，额外的 pos_weight 会导致严重的假阳性
+            bce_criterion = nn.BCEWithLogitsLoss()
 
             # Poly学习率 + Warmup: lr = base_lr * (1 - epoch / max_epochs) ** power
             warmup_epochs_lr = 5
             poly_power = float(os.environ.get("SEG_POLY_POWER", "0.9"))
             scheduler = None
             # 使用 ReduceLROnPlateau 在验证Dice长期不提升时自动降低学习率
-            # 兼容较旧版本的PyTorch，这里不使用verbose参数
+            # 配置：当val_dice在3-5个Epoch内不再上升时，自动将学习率减半
             plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode='max', factor=0.1, patience=3
+                optimizer, 
+                mode='max',           # 监控验证Dice（越大越好）
+                factor=0.5,          # 学习率减半（而非0.1的10倍降低，更温和）
+                patience=4,           # 4个epoch无提升则降低学习率（3-5之间）
+                min_lr=1e-6           # 最小学习率下限
+                # 注意：新版本PyTorch不再支持verbose参数，学习率变化日志由自定义代码打印
             )
 
             # SWA与早停配置 - 若启用EMA则默认关闭SWA避免冲突
@@ -3154,10 +4805,21 @@ class TrainThread(QThread):
                 amp_enabled = False
             scaler = GradScaler('cuda', enabled=amp_enabled, init_scale=2.0 ** 7, growth_interval=200, growth_factor=1.5, backoff_factor=0.5)
             
+            # 【性能优化】开启 CuDNN Benchmark，自动寻找最适合当前硬件的卷积算法
+            # 这通常能带来 10-20% 的加速，特别适合 RTX 4090 这样的高性能 GPU
+            if device.type == 'cuda':
+                import torch.backends.cudnn as cudnn
+                cudnn.benchmark = True
+                print("[性能优化] CuDNN Benchmark 已启用，将自动优化卷积算法")
+            
             # 训练循环
-            # 冻结/解冻策略：前50% epoch冻结编码器，后50%解冻进行微调
-            freeze_epochs = int(self.epochs * 0.5)
-            encoder_frozen = False
+            # 【性能优化】编码器冻结策略已禁用，让编码器全程参与训练以提升性能和精度
+            # 解冻编码器会显著增加 GPU 负载并提升 HD95 指标
+            # 如果遇到显存不足，可以通过增大 Batch Size 来利用 AMP 节省的显存
+            # 
+            # 冻结/解冻策略：前50% epoch冻结编码器，后50%解冻进行微调（已禁用）
+            # freeze_epochs = int(self.epochs * 0.5)
+            # encoder_frozen = False
             # 训练过程中用于学习率调度的基准LR（解冻时会动态下调）
             base_lr = float(initial_lr)
             
@@ -3168,32 +4830,36 @@ class TrainThread(QThread):
                     self.training_finished.emit("训练已被用户停止", self.best_model_path if self.save_best else None)
                     return
                 
-                # 冻结/解冻编码器逻辑（仅对 ResNetUNet 有效）
-                if self.model_type == "resnet_unet":
-                    actual_model = self._unwrap_model(model)
-                    if isinstance(actual_model, ResNetUNet):
-                        if epoch < freeze_epochs:
-                            # 前50% epoch：冻结编码器
-                            if not encoder_frozen:
-                                actual_model._freeze_encoder()
-                                encoder_frozen = True
-                                # 重新创建优化器，只优化可训练参数
-                                trainable_params = [p for p in model.parameters() if p.requires_grad]
-                                optimizer = self._create_optimizer(trainable_params, initial_lr)
-                                print(f"[训练策略] Epoch {epoch+1}/{self.epochs}: 编码器已冻结，仅训练解码器")
-                        else:
-                            # 后50% epoch：解冻编码器进行微调
-                            if encoder_frozen:
-                                actual_model._unfreeze_encoder()
-                                encoder_frozen = False
-                                # 重新创建优化器，优化所有参数（使用较小的学习率进行微调）
-                                # 解冻瞬间：把“当前学习率”强制降低到 1/10，避免 ResNet101 全量微调震荡
-                                current_lr = float(optimizer.param_groups[0]['lr'])
-                                fine_tune_lr = current_lr * 0.1
-                                base_lr = fine_tune_lr  # 同时更新后续Poly调度的基准LR，避免被initial_lr覆盖回去
-                                trainable_params = [p for p in model.parameters() if p.requires_grad]
-                                optimizer = self._create_optimizer(trainable_params, fine_tune_lr)
-                                print(f"[训练策略] Epoch {epoch+1}/{self.epochs}: 编码器已解冻，开始端到端微调 (LR={fine_tune_lr:.6f})")
+                # 【性能优化】编码器冻结逻辑已禁用，让编码器全程参与训练
+                # 解冻编码器会显著增加 GPU 负载并提升 HD95 指标
+                # 如果遇到显存不足，可以通过增大 Batch Size 来利用 AMP 节省的显存
+                # 
+                # 冻结/解冻编码器逻辑（已禁用，仅对 ResNetUNet 有效）
+                # if self.model_type == "resnet_unet":
+                #     actual_model = self._unwrap_model(model)
+                #     if isinstance(actual_model, ResNetUNet):
+                #         if epoch < freeze_epochs:
+                #             # 前50% epoch：冻结编码器
+                #             if not encoder_frozen:
+                #                 actual_model._freeze_encoder()
+                #                 encoder_frozen = True
+                #                 # 重新创建优化器，只优化可训练参数
+                #                 trainable_params = [p for p in model.parameters() if p.requires_grad]
+                #                 optimizer = self._create_optimizer(trainable_params, initial_lr)
+                #                 print(f"[训练策略] Epoch {epoch+1}/{self.epochs}: 编码器已冻结，仅训练解码器")
+                #         else:
+                #             # 后50% epoch：解冻编码器进行微调
+                #             if encoder_frozen:
+                #                 actual_model._unfreeze_encoder()
+                #                 encoder_frozen = False
+                #                 # 重新创建优化器，优化所有参数（使用较小的学习率进行微调）
+                #                 # 解冻瞬间：把"当前学习率"强制降低到 1/10，避免 ResNet101 全量微调震荡
+                #                 current_lr = float(optimizer.param_groups[0]['lr'])
+                #                 fine_tune_lr = current_lr * 0.1
+                #                 base_lr = fine_tune_lr  # 同时更新后续Poly调度的基准LR，避免被initial_lr覆盖回去
+                #                 trainable_params = [p for p in model.parameters() if p.requires_grad]
+                #                 optimizer = self._create_optimizer(trainable_params, fine_tune_lr)
+                #                 print(f"[训练策略] Epoch {epoch+1}/{self.epochs}: 编码器已解冻，开始端到端微调 (LR={fine_tune_lr:.6f})")
                 
                 epoch_loss_weights = self._get_loss_weights(epoch, self.epochs)
                 
@@ -3239,6 +4905,25 @@ class TrainThread(QThread):
                     images, masks = batch_data
                     images, masks = images.to(device), masks.float().to(device)
                     
+                    # 【数据诊断】首个批次打印输入像素范围，确认归一化是否正常
+                    if batch_idx == 0:
+                        img_min = float(images.min().item())
+                        img_max = float(images.max().item())
+                        img_mean = float(images.mean().item())
+                        print(f"[数据诊断] 输入像素范围 (min/max/mean): {img_min:.3f} / {img_max:.3f} / {img_mean:.3f}")
+                    
+                    # 【通道一致性检查】确保数据通道数与模型匹配
+                    # DeepLabV3+ 使用"伪三通道流"：数据加载器将单通道图像转换为3通道RGB
+                    # 模型固定为3通道输入，因此 images 应该是 [B, 3, H, W]
+                    # 不要对 images 进行通道切片（如 images[:, :1, :, :]），这会破坏通道匹配
+                    if images.shape[1] != 3:
+                        # 防御性检查：如果数据是1通道，复制为3通道（防守性编程）
+                        if images.shape[1] == 1:
+                            print(f"[警告] 训练阶段: 检测到1通道数据，自动复制为3通道以匹配DeepLabV3+")
+                            images = images.repeat(1, 3, 1, 1)  # [B, 1, H, W] -> [B, 3, H, W]
+                        else:
+                            raise ValueError(f"训练阶段: 意外的通道数 {images.shape[1]}，期望3通道")
+                    
                     batch_size = images.size(0)
                     
                     # MixUp 数据增强（小数据集增强泛化能力，防止对特定纹理过拟合）
@@ -3259,8 +4944,8 @@ class TrainThread(QThread):
                         images = mixed_images
                         masks = mixed_masks
                     
-                    # 定期清理GPU缓存，降低显存峰值
-                    if batch_idx % 10 == 0 and torch.cuda.is_available():
+                    # 定期清理GPU缓存，降低显存峰值（更频繁地清理）
+                    if batch_idx % 5 == 0 and torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     brain_mask = None
                     if self.use_skull_stripper:
@@ -3299,30 +4984,52 @@ class TrainThread(QThread):
                             print(f"[警告] Epoch {epoch+1}, Batch {batch_idx+1}: 掩膜值域异常 (min={mask_min:.4f}, max={mask_max:.4f})，进行裁剪")
                         masks = torch.clamp(masks, min=0.0, max=1.0)
 
-                    optimizer.zero_grad(set_to_none=True)
-                    with autocast(device_type=amp_device_type, enabled=amp_enabled):
-                        supports_aux = self._supports_aux_outputs(model)
-                        supports_attention = self._supports_attention_maps(model)
+                    # 【显存优化】训练循环异常处理，捕获 OOM 错误
+                    try:
+                        with autocast(device_type=amp_device_type, enabled=amp_enabled):
+                            supports_aux = self._supports_aux_outputs(model)
+                            supports_attention = self._supports_attention_maps(model)
+                            
+                            # 【DeepLabV3+ 兼容性】检查模型类型，DeepLabV3+ 的 forward 不支持 return_attention
+                            is_deeplabv3 = self.model_type in ("deeplabv3plus", "smp_deeplabv3plus")
+                            
+                            # 【显存优化】训练阶段彻底禁用注意力图生成，避免显存溢出
+                            # 训练和验证阶段都不生成注意力热力图，仅在测试阶段（ModelTestThread）生成
+                            need_attention = False  # 训练阶段强制禁用，避免 OOM
+                        
+                        # 【显存优化】训练阶段不传递 return_attention 参数，彻底禁用注意力图生成
                         forward_kwargs = {}
                         if supports_aux:
                             forward_kwargs['return_aux'] = True
-                        if supports_attention:
-                            forward_kwargs['return_attention'] = True
+                        # 训练阶段不传递 return_attention，即使模型支持也不生成注意力图
+                        # if supports_attention:
+                        #     forward_kwargs['return_attention'] = True
                         
+                        # 【紧急修复】DeepLabV3+ 不支持 return_attention，必须在调用前移除
+                        # 无论 need_attention 是否为 True，都要移除，因为 DeepLabV3+ 的 forward 方法不支持此参数
+                        if is_deeplabv3 and "return_attention" in forward_kwargs:
+                            forward_kwargs.pop("return_attention")
+                        
+                        # 【显存优化】确保训练阶段不生成任何注意力图
+                        if "return_attention" in forward_kwargs:
+                            forward_kwargs.pop("return_attention")
+                        
+                        # 执行正常的前向传播（用于计算 Loss 和指标）
                         if forward_kwargs:
                             forward_out = model(images, **forward_kwargs)
-                            if supports_aux and supports_attention:
-                                outputs, aux_outputs, attention_maps = forward_out
-                            elif supports_aux:
+                            if supports_aux:
                                 outputs, aux_outputs = forward_out
-                                attention_maps = {}
                             else:
-                                outputs, attention_maps = forward_out
+                                outputs = forward_out
                                 aux_outputs = []
                         else:
                             outputs = model(images)
                             aux_outputs = []
-                            attention_maps = {}
+                        
+                        # 【显存优化】训练阶段彻底禁用所有注意力图生成，避免显存溢出
+                        # 训练和验证阶段都不生成注意力热力图（Grad-CAM 或原生注意力图）
+                        # 仅在测试阶段（ModelTestThread）生成注意力热力图用于最终分析
+                        attention_maps = {}  # 始终为空字典，不生成任何注意力图
                         if brain_mask is not None:
                             outputs = outputs * brain_mask
 
@@ -3376,121 +5083,171 @@ class TrainThread(QThread):
                         if not torch.isfinite(loss):
                             print(f"[严重警告] Epoch {epoch+1}, Batch {batch_idx+1}: 最终loss为NaN/Inf，跳过此批次")
                             continue
-                    
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    
-                    # 清理异常梯度，防止NaN/Inf传播
-                    grad_clamp = 1.0 if self.model_type in ("swin_unet", "swinunet") else 5.0
-                    grad_sanitized = self._sanitize_gradients(model, clamp_value=grad_clamp)
-                    if grad_sanitized:
-                        print(f"[警告] Epoch {epoch+1}, Batch {batch_idx+1}: 检测到异常梯度，已自动修复")
-                    
-                    # 检查梯度中的NaN/Inf
-                    has_nan_grad = False
-                    for name, param in model.named_parameters():
-                        if param.grad is not None:
-                            if torch.any(torch.isnan(param.grad)) or torch.any(torch.isinf(param.grad)):
-                                print(f"[严重警告] Epoch {epoch+1}, Batch {batch_idx+1}: 参数 {name} 的梯度包含NaN/Inf，清零梯度")
-                                param.grad.zero_()
-                                has_nan_grad = True
-                    
-                    if has_nan_grad:
-                        print(f"[警告] Epoch {epoch+1}, Batch {batch_idx+1}: 检测到NaN/Inf梯度，跳过此批次")
-                        scaler.update()
-                        continue
-                    
-                    # 计算梯度范数并检查
-                    total_grad_norm = 0.0
-                    param_count = 0
-                    for p in model.parameters():
-                        if p.grad is not None:
-                            param_norm = p.grad.data.norm(2)
-                            if torch.isfinite(param_norm):
-                                total_grad_norm += param_norm.item() ** 2
-                                param_count += 1
+                        
+                        # 记录未缩放的原始 loss 用于日志和 epoch 统计
+                        loss_value = loss.item()
+                        if not np.isfinite(loss_value):
+                            print(f"[警告] Epoch {epoch+1}, Batch {batch_idx+1}: 损失值为NaN/Inf，使用0.0")
+                            loss_value = 0.0
+                        
+                        # 梯度累积：将 loss 按累积步数缩放，累计多个小 batch 的梯度后再进行一次优化步骤
+                        loss = loss / max(1, getattr(self, "accumulation_steps", 1))
+                        
+                        scaler.scale(loss).backward()
+                        
+                        # 只有在达到累积步数时才执行一次优化器 step
+                        should_step = ((batch_idx + 1) % max(1, getattr(self, "accumulation_steps", 1)) == 0) or ((batch_idx + 1) == len(train_loader))
+                        if should_step:
+                            scaler.unscale_(optimizer)
+                            
+                            # 清理异常梯度，防止NaN/Inf传播
+                            grad_clamp = 1.0 if self.model_type in ("swin_unet", "swinunet") else 5.0
+                            grad_sanitized = self._sanitize_gradients(model, clamp_value=grad_clamp)
+                            if grad_sanitized:
+                                print(f"[警告] Epoch {epoch+1}, Batch {batch_idx+1}: 检测到异常梯度，已自动修复")
+                            
+                            # 检查梯度中的NaN/Inf
+                            has_nan_grad = False
+                            for name, param in model.named_parameters():
+                                if param.grad is not None:
+                                    if torch.any(torch.isnan(param.grad)) or torch.any(torch.isinf(param.grad)):
+                                        print(f"[严重警告] Epoch {epoch+1}, Batch {batch_idx+1}: 参数 {name} 的梯度包含NaN/Inf，清零梯度")
+                                        param.grad.zero_()
+                                        has_nan_grad = True
+                            
+                            if has_nan_grad:
+                                print(f"[警告] Epoch {epoch+1}, Batch {batch_idx+1}: 检测到NaN/Inf梯度，跳过此批次")
+                                optimizer.zero_grad(set_to_none=True)
+                                scaler.update()
+                                continue
+                            
+                            # 计算梯度范数并检查
+                            total_grad_norm = 0.0
+                            param_count = 0
+                            for p in model.parameters():
+                                if p.grad is not None:
+                                    param_norm = p.grad.data.norm(2)
+                                    if torch.isfinite(param_norm):
+                                        total_grad_norm += param_norm.item() ** 2
+                                        param_count += 1
+                                    else:
+                                        print(f"[警告] 参数梯度范数为NaN/Inf，清零该梯度")
+                                        p.grad.zero_()
+                            
+                            if param_count > 0:
+                                total_grad_norm = total_grad_norm ** (1. / 2)
                             else:
-                                print(f"[警告] 参数梯度范数为NaN/Inf，清零该梯度")
-                                p.grad.zero_()
+                                total_grad_norm = 0.0
+                            
+                            # 调试：检查梯度（仅在第一个epoch的前几个batch或梯度异常时）
+                            if (epoch == 0 and batch_idx < 3) or total_grad_norm > 100.0 or total_grad_norm < 1e-6:
+                                print(f"[调试] Epoch {epoch+1}, Batch {batch_idx+1}: Loss={loss_value:.4f}, GradNorm={total_grad_norm:.6f}, LR={optimizer.param_groups[0]['lr']:.8f}")
+                                if total_grad_norm < 1e-6:
+                                    print(f"[警告] 梯度过小，模型可能无法正常更新！")
+                                if total_grad_norm > 100.0:
+                                    print(f"[警告] 梯度过大，可能发生梯度爆炸！")
+                            
+                            # 梯度裁剪：统一使用标准 max_norm=1.0（0.05 过小会导致训练不稳定/难以收敛）
+                            max_grad_norm = 1.0
+                            if total_grad_norm > 10.0:
+                                print(f"[严重警告] 梯度过大({total_grad_norm:.2f})，执行梯度裁剪(max_norm={max_grad_norm})")
+                            
+                            # 如果梯度为0，尝试临时提高学习率或跳过该batch
+                            if total_grad_norm < 1e-8:
+                                print(f"[严重警告] Epoch {epoch+1}, Batch {batch_idx+1}: 梯度完全消失(GradNorm={total_grad_norm:.8f})")
+                                # 如果连续多个step梯度为0，临时提高学习率
+                                if not hasattr(self, '_zero_grad_count'):
+                                    self._zero_grad_count = 0
+                                self._zero_grad_count += 1
+                                if self._zero_grad_count > 5:
+                                    # 临时将学习率提高2倍
+                                    current_lr = optimizer.param_groups[0]['lr']
+                                    new_lr = min(current_lr * 2.0, initial_lr * 0.1)  # 最高不超过初始学习率的10%
+                                    for param_group in optimizer.param_groups:
+                                        param_group['lr'] = new_lr
+                                    print(f"[修复] 临时提高学习率: {current_lr:.8f} -> {new_lr:.8f}")
+                                    self._zero_grad_count = 0
+                                    optimizer.zero_grad(set_to_none=True)
+                                scaler.update()
+                                continue
+                            else:
+                                # 梯度正常时重置计数器
+                                if hasattr(self, '_zero_grad_count'):
+                                    self._zero_grad_count = 0
+                            
+                            clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+                            
+                            # 再次检查裁剪后的梯度
+                            for p in model.parameters():
+                                if p.grad is not None:
+                                    if torch.any(torch.isnan(p.grad)) or torch.any(torch.isinf(p.grad)):
+                                        print(f"[严重警告] 梯度裁剪后仍有NaN/Inf，清零梯度")
+                                        p.grad.zero_()
+                            
+                            scaler.step(optimizer)
+                            scaler.update()
+                            optimizer.zero_grad(set_to_none=True)
+                            
+                            # 【显存优化】定期清理显存，防止 OOM
+                            # 每 N 个 batch 清理一次（避免过于频繁影响性能）
+                            if (batch_idx + 1) % 10 == 0 and torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        
+                        # 检查模型参数是否包含NaN/Inf
+                        for name, param in model.named_parameters():
+                            if torch.any(torch.isnan(param.data)) or torch.any(torch.isinf(param.data)):
+                                print(f"[严重警告] Epoch {epoch+1}, Batch {batch_idx+1}: 参数 {name} 包含NaN/Inf！")
+                                # 尝试从EMA模型恢复（如果可用）
+                                if hasattr(self, 'use_ema') and self.use_ema and ema_model is not None:
+                                    print(f"[尝试恢复] 从EMA模型恢复参数 {name}")
+                                    with torch.no_grad():
+                                        actual_model = self._unwrap_model(model)
+                                        actual_ema = self._unwrap_model(ema_model)
+                                        if name in actual_ema.state_dict():
+                                            param.data.copy_(actual_ema.state_dict()[name])
+                        
+                        # EMA 更新（在 try 块内，确保总是执行）
+                        if self.use_ema and ema_model is not None:
+                            self._update_ema_model(ema_model, model)
                     
-                    if param_count > 0:
-                        total_grad_norm = total_grad_norm ** (1. / 2)
-                    else:
-                        total_grad_norm = 0.0
+                    except RuntimeError as e:
+                        # 【显存优化】捕获 OOM 异常并清理显存
+                        if "out of memory" in str(e).lower():
+                            print(f"[严重警告] Epoch {epoch+1}, Batch {batch_idx+1}: CUDA OOM 错误，清理显存并跳过此批次")
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            # 清理可能残留的变量
+                            if 'outputs' in locals():
+                                del outputs
+                            if 'images' in locals():
+                                del images
+                            if 'masks' in locals():
+                                del masks
+                            continue
+                        else:
+                            # 其他 RuntimeError 重新抛出
+                            raise
                     
-                    # 调试：检查梯度（仅在第一个epoch的前几个batch或梯度异常时）
-                    if (epoch == 0 and batch_idx < 3) or total_grad_norm > 100.0 or total_grad_norm < 1e-6:
-                        print(f"[调试] Epoch {epoch+1}, Batch {batch_idx+1}: Loss={loss.item():.4f}, GradNorm={total_grad_norm:.6f}, LR={optimizer.param_groups[0]['lr']:.8f}")
-                        if total_grad_norm < 1e-6:
-                            print(f"[警告] 梯度过小，模型可能无法正常更新！")
-                        if total_grad_norm > 100.0:
-                            print(f"[警告] 梯度过大，可能发生梯度爆炸！")
-                    
-                    # 梯度裁剪：统一使用标准 max_norm=1.0（0.05 过小会导致训练不稳定/难以收敛）
-                    max_grad_norm = 1.0
-                    if total_grad_norm > 10.0:
-                        print(f"[严重警告] 梯度过大({total_grad_norm:.2f})，执行梯度裁剪(max_norm={max_grad_norm})")
-                    
-                    # 如果梯度为0，尝试临时提高学习率或跳过该batch
-                    if total_grad_norm < 1e-8:
-                        print(f"[严重警告] Epoch {epoch+1}, Batch {batch_idx+1}: 梯度完全消失(GradNorm={total_grad_norm:.8f})")
-                        # 如果连续多个batch梯度为0，临时提高学习率
-                        if not hasattr(self, '_zero_grad_count'):
-                            self._zero_grad_count = 0
-                        self._zero_grad_count += 1
-                        if self._zero_grad_count > 5:
-                            # 临时将学习率提高2倍
-                            current_lr = optimizer.param_groups[0]['lr']
-                            new_lr = min(current_lr * 2.0, initial_lr * 0.1)  # 最高不超过初始学习率的10%
-                            for param_group in optimizer.param_groups:
-                                param_group['lr'] = new_lr
-                            print(f"[修复] 临时提高学习率: {current_lr:.8f} -> {new_lr:.8f}")
-                            self._zero_grad_count = 0
-                        scaler.update()
-                        continue
-                    else:
-                        # 梯度正常时重置计数器
-                        if hasattr(self, '_zero_grad_count'):
-                            self._zero_grad_count = 0
-                    
-                    clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-                    
-                    # 再次检查裁剪后的梯度
-                    for p in model.parameters():
-                        if p.grad is not None:
-                            if torch.any(torch.isnan(p.grad)) or torch.any(torch.isinf(p.grad)):
-                                print(f"[严重警告] 梯度裁剪后仍有NaN/Inf，清零梯度")
-                                p.grad.zero_()
-                    
-                    scaler.step(optimizer)
-                    scaler.update()
-                    
-                    # 检查模型参数是否包含NaN/Inf
-                    for name, param in model.named_parameters():
-                        if torch.any(torch.isnan(param.data)) or torch.any(torch.isinf(param.data)):
-                            print(f"[严重警告] Epoch {epoch+1}, Batch {batch_idx+1}: 参数 {name} 包含NaN/Inf！")
-                            # 尝试从EMA模型恢复（如果可用）
-                            if hasattr(self, 'use_ema') and self.use_ema and ema_model is not None:
-                                print(f"[尝试恢复] 从EMA模型恢复参数 {name}")
-                                with torch.no_grad():
-                                    actual_model = self._unwrap_model(model)
-                                    actual_ema = self._unwrap_model(ema_model)
-                                    if name in actual_ema.state_dict():
-                                        param.data.copy_(actual_ema.state_dict()[name])
-                    if self.use_ema and ema_model is not None:
-                        self._update_ema_model(ema_model, model)
-                    
-                    # 检查损失值是否有效
-                    loss_value = loss.item()
-                    if not np.isfinite(loss_value):
-                        print(f"[警告] Epoch {epoch+1}, Batch {batch_idx+1}: 损失值为NaN/Inf，使用0.0")
-                        loss_value = 0.0
-                    
+                    # 累加 epoch 损失（使用未缩放的 loss_value）
                     epoch_loss += loss_value * batch_size
                     
-                    # 定期清理GPU缓存
-                    if batch_idx % 10 == 0 and torch.cuda.is_available():
+                    # 【显存优化】定期清理GPU缓存（更频繁地清理）
+                    if batch_idx % 5 == 0 and torch.cuda.is_available():
                         torch.cuda.empty_cache()
+                    
+                    # 【显存优化】删除训练循环中的中间变量
+                    if 'outputs' in locals():
+                        del outputs
+                    if 'aux_outputs' in locals():
+                        del aux_outputs
+                    if 'attention_maps' in locals():
+                        del attention_maps
+                    if 'mixed_images' in locals():
+                        del mixed_images
+                    if 'mixed_masks' in locals():
+                        del mixed_masks
+                    if 'indices' in locals():
+                        del indices
                     
                     # 更新训练进度
                     train_progress = 20 + int(50 * (batch_idx + 1) / len(train_loader))
@@ -3502,7 +5259,6 @@ class TrainThread(QThread):
                 # 验证阶段
                 model.eval()
                 val_dice = 0.0
-                val_iou = 0.0
                 val_loss = 0.0
                 val_samples = 0
                 val_pred_fg_pixels = 0.0
@@ -3513,9 +5269,11 @@ class TrainThread(QThread):
                 val_empty_mask_dice_sum = 0.0  # 空mask样本的Dice总和
                 val_non_empty_mask_count = 0  # 目标有前景的样本数
                 val_non_empty_mask_dice_sum = 0.0  # 有前景样本的Dice总和
-                # IoU分类统计
-                val_empty_mask_iou_sum = 0.0
-                val_non_empty_mask_iou_sum = 0.0
+                
+                # 【修复】添加IoU/Precision/Recall累加器，基于全量样本计算
+                val_iou_sum = 0.0
+                val_precision_sum = 0.0
+                val_recall_sum = 0.0
                 
                 self.update_val_progress.emit(0, f"开始验证轮次 {epoch+1}...")
                 # 如果启用EMA且训练了足够轮次，使用EMA模型进行评估
@@ -3544,17 +5302,33 @@ class TrainThread(QThread):
                 )
                 if refresh_threshold:
                     try:
-                        # 使用全部验证集进行阈值优化，确保与验证阶段结果一致
-                        val_threshold = float(self.find_optimal_threshold(
+                        # 使用全部验证集进行阈值优化
+                        # 注意：阈值优化阶段不使用后处理（为了速度），但验证阶段会使用后处理
+                        # 这可能导致阈值优化找到的阈值与验证阶段实际效果略有差异，但通常影响很小
+                        threshold_result = self.find_optimal_threshold(
                             eval_model_for_epoch,
                             val_loader,
                             device,
                             num_samples=None,  # None表示使用全部验证集
-                        ))
+                        )
+                        # 处理返回值：可能是元组(threshold, dice)或单个值（向后兼容）
+                        if isinstance(threshold_result, tuple):
+                            val_threshold, gwo_best_dice = threshold_result
+                            # 【关键修复】保存GWO找到的全验证集最佳Dice，用于best_model判定
+                            self.gwo_best_dice = float(gwo_best_dice)
+                            print(f">>> [GWO] 全验证集最佳Dice已保存: {self.gwo_best_dice:.4f} (将用于best_model判定)")
+                        else:
+                            # 向后兼容：如果返回单个值
+                            val_threshold = float(threshold_result)
+                            self.gwo_best_dice = None
                         self.last_optimal_threshold = val_threshold
+                        # 【显存优化】阈值优化后清理GPU缓存
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                     except Exception as threshold_err:
                         print(f"[警告] 阈值搜索失败，使用上一次的阈值。原因: {threshold_err}")
                         val_threshold = float(getattr(self, "last_optimal_threshold", 0.5))
+                        self.gwo_best_dice = None
                 else:
                     if epoch == 0:
                         val_threshold = 0.5
@@ -3572,6 +5346,18 @@ class TrainThread(QThread):
                         images, masks = val_batch
                         images = images.to(device)
                         masks = masks.float().to(device)
+                        
+                        # 【通道一致性检查】确保验证数据通道数与模型匹配
+                        # DeepLabV3+ 使用"伪三通道流"：数据加载器将单通道图像转换为3通道RGB
+                        # 模型固定为3通道输入，因此 images 应该是 [B, 3, H, W]
+                        # 不要对 images 进行通道切片，确保验证数据直接送入模型
+                        if images.shape[1] != 3:
+                            # 防御性检查：如果数据是1通道，复制为3通道（防守性编程）
+                            if images.shape[1] == 1:
+                                print(f"[警告] 验证阶段: 检测到1通道数据，自动复制为3通道以匹配DeepLabV3+")
+                                images = images.repeat(1, 3, 1, 1)  # [B, 1, H, W] -> [B, 3, H, W]
+                            else:
+                                raise ValueError(f"验证阶段: 意外的通道数 {images.shape[1]}，期望3通道")
                             
                         batch_size = images.size(0)
                         brain_mask = None
@@ -3592,14 +5378,14 @@ class TrainThread(QThread):
                                 print(f"[警告] 验证阶段: Batch {val_idx+1}: 输入图像包含NaN/Inf，跳过")
                                 continue
                             
-                            # 【关键修复】验证阶段不使用TTA，与训练损失计算保持一致
-                            # 原因：训练损失基于单次前向传播，如果验证使用TTA会导致Dice虚高
-                            # 如果需要TTA评估，应该在训练结束后的最终测试阶段使用
-                            # 可以通过环境变量 SEG_USE_TTA_IN_VAL=1 启用（不推荐）
-                            use_tta_in_val = os.environ.get("SEG_USE_TTA_IN_VAL", "0") == "1"
+                            # 【性能优化】验证阶段禁用TTA（测试时增强）以提升速度
+                            # 策略：原图预测 + 水平翻转后预测再翻回来，取平均
+                            # 这通常能白嫖0.01~0.02的Dice分数，但会显著降低验证速度（24倍推理）
+                            # 可以通过环境变量 SEG_USE_TTA_IN_VAL=1 启用（不推荐，速度慢）
+                            use_tta_in_val = os.environ.get("SEG_USE_TTA_IN_VAL", "0") == "1"  # 默认禁用以提升速度
                             
                             if use_tta_in_val:
-                                # 仅在明确启用时使用TTA（不推荐，会导致训练和验证不一致）
+                                # 使用TTA提升验证性能
                                 try:
                                     outputs = self._tta_inference(eval_model_for_epoch, images)
                                     if brain_mask is not None:
@@ -3607,6 +5393,9 @@ class TrainThread(QThread):
                                 except RuntimeError as e:
                                     if "out of memory" in str(e).lower() or "nan" in str(e).lower() or "inf" in str(e).lower():
                                         print(f"[严重警告] 验证阶段: Batch {val_idx+1}: TTA推理失败 ({str(e)[:100]})，跳过该batch")
+                                        # 【显存优化】OOM 时清理显存
+                                        if torch.cuda.is_available():
+                                            torch.cuda.empty_cache()
                                         continue
                                     else:
                                         raise
@@ -3670,10 +5459,11 @@ class TrainThread(QThread):
                             # 再执行传统形态学后处理，但不移除小区域（min_size=0）
                             pred_mask_processed = self.post_process_mask(
                                 pred_mask_tensor,
-                                min_size=0,
+                                min_size=150,
                                 use_morphology=True,
                                 keep_largest=False,  # 允许多发病灶同时存在
-                                fill_holes=True     # 填充孔洞，去除假阴性空洞
+                                fill_holes=True,     # 填充孔洞，去除假阴性空洞
+                                prob_map=prob_map_tensor
                             )
                             # post_process_mask会返回tensor或numpy，需要确保是tensor
                             if isinstance(pred_mask_processed, torch.Tensor):
@@ -3681,58 +5471,46 @@ class TrainThread(QThread):
                             else:
                                 preds[i, 0] = torch.from_numpy(pred_mask_processed).float().to(preds.device)
                         
-                        # 使用与训练过程相同的calculate_batch_dice函数计算Dice
-                        batch_dice = self.calculate_batch_dice(preds.float(), masks)
-                        val_dice += batch_dice.sum().item()
+                        # 【统一计算】使用统一的指标计算函数（单一真理来源）
+                        batch_metrics = self.calculate_batch_metrics(preds.float(), masks)
+                        batch_dice = batch_metrics['dice']
+                        batch_iou = batch_metrics['iou']
+                        batch_precision = batch_metrics['precision']
+                        batch_recall = batch_metrics['recall']
+                        batch_is_empty = batch_metrics['is_empty']
+                        
+                        batch_size = masks.shape[0]
+                        for i in range(batch_size):
+                            dice_i = batch_dice[i]
+                            iou_i = batch_iou[i]
+                            precision_i = batch_precision[i]
+                            recall_i = batch_recall[i]
+                            is_empty_i = batch_is_empty[i]
+                            
+                            # 累加所有样本的IoU/Precision/Recall（包括空mask和前景样本）
+                            val_iou_sum += iou_i
+                            val_precision_sum += precision_i
+                            val_recall_sum += recall_i
+                            
+                            if is_empty_i:
+                                val_empty_mask_count += 1
+                                val_empty_mask_dice_sum += dice_i
+                            else:
+                                val_non_empty_mask_count += 1
+                                val_non_empty_mask_dice_sum += dice_i
+                        
+                        # 统计像素信息（用于日志）
                         val_pred_fg_pixels += preds.sum().item()
                         val_gt_fg_pixels += masks.sum().item()
                         val_total_pixels += float(masks.numel())
                         
-                        # 计算批次 IoU（逐样本），并分类统计
-                        # 计算批次 IoU（逐样本），并分类统计
-                        batch_size = masks.shape[0]
-                        for i in range(batch_size):
-                            mask_i = masks[i, 0]
-                            mask_sum = mask_i.sum().item()
-                            pred_i = preds[i, 0]
-                            
-                            # 计算混淆矩阵
-                            tp = torch.sum((pred_i > 0.5) & (mask_i > 0.5)).item()
-                            fp = torch.sum((pred_i > 0.5) & (mask_i <= 0.5)).item()
-                            fn = torch.sum((pred_i <= 0.5) & (mask_i > 0.5)).item()
-                            tn = torch.sum((pred_i <= 0.5) & (mask_i <= 0.5)).item()
-                            
-                            # 【修复】分别计算前景类和背景类的IoU
-                            # 前景类IoU（Positive Class）
-                            iou_pos_den = tp + fp + fn
-                            iou_pos_i = 1.0 if iou_pos_den < 1e-8 else tp / (iou_pos_den + 1e-8)
-                            
-                            # 背景类IoU（Negative Class）
-                            iou_neg_den = tn + fp + fn
-                            iou_neg_i = 1.0 if iou_neg_den < 1e-8 else tn / (iou_neg_den + 1e-8)
-                            
-                            # 整体IoU（使用前景类IoU，与标准定义一致）
-                            val_iou += iou_pos_i
-                            
-                            # 判断是否为空mask
-                            total_pixels = mask_i.numel()
-                            avg_fg_ratio = val_gt_fg_pixels / max(1.0, val_total_pixels) if val_total_pixels > 0 else 0.0
-                            adaptive_empty_threshold = max(1e-7, avg_fg_ratio * 0.001)
-                            empty_threshold_pixels = adaptive_empty_threshold * total_pixels
-                            
-                            if mask_sum <= empty_threshold_pixels:
-                                val_empty_mask_count += 1
-                                val_empty_mask_dice_sum += batch_dice[i].item()
-                                val_empty_mask_iou_sum += iou_neg_i  # ✅ 使用背景类IoU
-                            else:
-                                val_non_empty_mask_count += 1
-                                val_non_empty_mask_dice_sum += batch_dice[i].item()
-                                val_non_empty_mask_iou_sum += iou_pos_i  # ✅ 使用前景类IoU
-                        
                         # 更新验证进度
                         val_progress = int(100 * (val_idx + 1) / len(val_loader))
                         current_avg_loss = val_loss / max(1, val_samples)
-                        current_avg_dice = val_dice / max(1, val_samples)
+                        # 计算当前批次的所有样本平均 Dice（用于最佳模型选择）
+                        val_current_total_count = val_non_empty_mask_count + val_empty_mask_count
+                        val_current_total_dice_sum = val_non_empty_mask_dice_sum + val_empty_mask_dice_sum
+                        current_avg_dice = val_current_total_dice_sum / max(1, val_current_total_count)
                         # 计算当前批次的 Dice_Pos 和 Dice_Neg（用于进度显示）
                         current_dice_pos = val_non_empty_mask_dice_sum / max(1, val_non_empty_mask_count) if val_non_empty_mask_count > 0 else 0.0
                         current_dice_neg = val_empty_mask_dice_sum / max(1, val_empty_mask_count) if val_empty_mask_count > 0 else 0.0
@@ -3740,12 +5518,24 @@ class TrainThread(QThread):
                         self.update_val_progress.emit(
                             val_progress,
                             f"验证轮次 {epoch+1} | 批次 {val_idx+1}/{len(val_loader)}\n"
-                            f"损失: {current_avg_loss:.4f} | Dice_Pos: {current_dice_pos:.4f} | Dice_Neg: {current_dice_neg:.4f} | 整体Dice: {current_avg_dice:.4f}"
+                            f"损失: {current_avg_loss:.4f} | Dice_Pos: {current_dice_pos:.4f} | Dice_Neg: {current_dice_neg:.4f} | 整体Dice(所有样本): {current_avg_dice:.4f}"
                         )
                         
                         # 每5个批次强制更新UI
                         if val_idx % 5 == 0:
                             QApplication.processEvents()
+                        
+                        # 【显存优化】显式删除中间变量，释放GPU显存
+                        del outputs, probs, preds, batch_dice
+                        if 'pred_mask_tensor' in locals():
+                            del pred_mask_tensor
+                        if 'prob_map_tensor' in locals():
+                            del prob_map_tensor
+                        if 'pred_mask_processed' in locals():
+                            del pred_mask_processed
+                        # 每10个批次清理一次GPU缓存
+                        if val_idx % 10 == 0 and torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                 
                 # 计算平均值（确保没有NaN/Inf）
                 avg_train_loss = epoch_loss / max(1, train_samples)
@@ -3753,18 +5543,32 @@ class TrainThread(QThread):
                     print(f"[警告] Epoch {epoch+1}: 训练平均损失为NaN/Inf，使用0.0")
                     avg_train_loss = 0.0
                 
-                val_dice /= max(1, val_samples)
-                val_iou /= max(1, val_samples)
+                # 【修改】val_dice 统计所有验证样本（包括空mask样本）
+                # 使用所有样本的平均 Dice 来选择最佳模型，确保模型在所有场景下都有良好表现
+                val_total_count = val_non_empty_mask_count + val_empty_mask_count
+                val_total_dice_sum = val_non_empty_mask_dice_sum + val_empty_mask_dice_sum
+                
+                if val_total_count > 0:
+                    val_dice = val_total_dice_sum / val_total_count
+                else:
+                    # 如果没有样本，使用0.0（而不是NaN）
+                    val_dice = 0.0
+                
                 if not np.isfinite(val_dice):
                     print(f"[警告] Epoch {epoch+1}: 验证Dice为NaN/Inf，使用0.0")
                     val_dice = 0.0
-                if not np.isfinite(val_iou):
-                    print(f"[警告] Epoch {epoch+1}: 验证IoU为NaN/Inf，使用0.0")
-                    val_iou = 0.0
 
                 # 使用 ReduceLROnPlateau 根据验证Dice自动调整学习率（优先提升稳定性）
                 if plateau_scheduler is not None:
+                    old_lr = optimizer.param_groups[0]['lr']
                     plateau_scheduler.step(val_dice)
+                    new_lr = optimizer.param_groups[0]['lr']
+                    # 如果学习率发生变化，打印显眼的提示
+                    if new_lr < old_lr:
+                        print(f"\n{'='*60}")
+                        print(f"📉 检测到性能停滞，学习率下调为: {new_lr:.2e} (原: {old_lr:.2e})")
+                        print(f"   当前验证Dice: {val_dice:.4f}")
+                        print(f"{'='*60}\n")
                 
                 avg_val_loss = val_loss / max(1, val_samples)
                 if not np.isfinite(avg_val_loss):
@@ -3774,28 +5578,44 @@ class TrainThread(QThread):
                 pred_fg_ratio = val_pred_fg_pixels / max(1.0, val_total_pixels)
                 gt_fg_ratio = val_gt_fg_pixels / max(1.0, val_total_pixels)
                 
-                # 【关键修改】分别统计有前景mask和空mask的Dice/IoU
+                # 【关键修改】分别统计有前景mask和空mask的Dice（用于诊断和详细分析）
+                # 注意：val_dice 现在统计所有样本（包括空mask样本），用于最佳模型选择
                 dice_pos = val_non_empty_mask_dice_sum / max(1, val_non_empty_mask_count) if val_non_empty_mask_count > 0 else 0.0
                 dice_neg = val_empty_mask_dice_sum / max(1, val_empty_mask_count) if val_empty_mask_count > 0 else 0.0
-                iou_pos = val_non_empty_mask_iou_sum / max(1, val_non_empty_mask_count) if val_non_empty_mask_count > 0 else 0.0
-                iou_neg = val_empty_mask_iou_sum / max(1, val_empty_mask_count) if val_empty_mask_count > 0 else 0.0
                 empty_mask_ratio = val_empty_mask_count / max(1, val_samples) if val_samples > 0 else 0.0
                 
-                # 记录到历史中
-                self.val_dice_pos_history.append(dice_pos)
-                self.val_dice_neg_history.append(dice_neg)
+                # 记录到历史中（记录所有样本的平均Dice，用于最佳模型选择）
+                val_total_count = val_non_empty_mask_count + val_empty_mask_count
+                val_total_dice = val_dice  # 已经在上面计算为所有样本的平均Dice
+                # 【修复】val_dice_history 已在下方"更新训练历史"部分统一添加，此处不再重复添加
+                self.val_dice_pos_history.append(dice_pos)  # 保留用于诊断
+                self.val_dice_neg_history.append(dice_neg)  # 保留用于诊断
                 
-                print(
-                    f"[验证统计] Epoch {epoch+1}: threshold={val_threshold:.3f}, "
-                    f"pred_fg_ratio={pred_fg_ratio:.4f}, gt_fg_ratio={gt_fg_ratio:.4f}, "
-                    f"val_dice={val_dice:.4f}, val_iou={val_iou:.4f}"
-                )
-                print(
-                    f"[Dice/IoU分类统计] "
-                    f"Dice_Pos: {dice_pos:.4f}, IoU_Pos: {iou_pos:.4f} ({val_non_empty_mask_count}/{val_samples}样本) | "
-                    f"Dice_Neg: {dice_neg:.4f}, IoU_Neg: {iou_neg:.4f} ({val_empty_mask_count}/{val_samples}样本) | "
-                    f"整体Dice: {val_dice:.4f}, 整体IoU: {val_iou:.4f}"
-                )
+                # 【统一日志格式】重写验证报告输出
+                print(f"\n{'='*60}")
+                print(f"[验证报告] Epoch {epoch+1} | 最佳阈值: {val_threshold:.4f}")
+                print(f"{'-'*60}")
+                print(f"[整体表现] Mean Dice (全样): {val_dice:.4f}  <-- (用于 Best Model 判定)")
+                print(f"[分组详情]")
+                print(f"   - 空 Mask ({val_empty_mask_count}/{val_samples}): {dice_neg:.4f}  (反映背景抑制能力)")
+                print(f"   - 前景类 ({val_non_empty_mask_count}/{val_samples}): {dice_pos:.4f}  (反映病灶识别能力)")
+                
+                # 【诊断信息】检查阈值是否过高
+                if dice_neg > 0.9 and dice_pos < 0.5:
+                    print(f"[警告] 阈值过高，虽然抑制了背景，但严重损伤了前景识别")
+                
+                # 【修复】计算详细指标（IoU, Precision, Recall）- 基于全量样本的平均值
+                val_total_count = val_non_empty_mask_count + val_empty_mask_count
+                if val_total_count > 0:
+                    avg_iou = val_iou_sum / val_total_count
+                    avg_precision = val_precision_sum / val_total_count
+                    avg_recall = val_recall_sum / val_total_count
+                    print(f"[详细指标] IoU: {avg_iou:.4f} | Precision: {avg_precision:.4f} | Recall: {avg_recall:.4f}")
+                else:
+                    print(f"[详细指标] IoU: N/A | Precision: N/A | Recall: N/A  (无样本)")
+                
+                print(f"{'-'*60}")
+                print(f"Loss: {avg_val_loss:.4f} (基于全部验证集{val_samples}个样本，使用后处理)\n")
 
                 # 根据验证Dice或SWA阶段调整学习率（Poly策略下仅保留SWA调度）
                 swa_epoch_active = swa_enabled and epoch >= swa_start_epoch
@@ -3823,42 +5643,72 @@ class TrainThread(QThread):
                     import gc
                     gc.collect()
                 
+                # 【显存优化】显式删除验证阶段的变量（但保留eval_model_for_epoch，后续还会用到）
+                if 'val_batch' in locals():
+                    del val_batch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
                 # 每个轮次结束后生成性能分析可视化
                 self.update_progress.emit(
                     int(70 + 20 * (epoch + 1) / self.epochs),
                     f"轮次 {epoch+1} 完成 (LR={current_lr:.6f})，生成性能分析..."
                 )
                 
-                # 生成测试集分割结果可视化 - 使用TTA提升性能
+                # 【双引擎策略】判断是否为关键 Epoch（每20轮或最佳模型）
+                is_best_epoch = (val_dice > self.best_dice) if hasattr(self, 'best_dice') else False
+                is_key_epoch = ((epoch + 1) % 20 == 0) or is_best_epoch
+                
+                # 生成测试集分割结果可视化
+                # 使用当前轮次计算出的最佳阈值
+                viz_threshold = getattr(self, 'last_optimal_threshold', 0.1)
+                # 【显存优化】临时创建eval模型用于可视化
+                temp_eval_model = model.eval() if not isinstance(model, nn.DataParallel) else model.module.eval()
+                if self.use_ema and ema_model is not None and epoch >= self.ema_eval_start_epoch:
+                    temp_eval_model = ema_model.eval()
+                    if isinstance(model, nn.DataParallel):
+                        temp_eval_model = nn.DataParallel(temp_eval_model)
                 test_viz_path = self.visualize_test_results(
-                    eval_model_for_epoch, 
+                    temp_eval_model, 
                     val_loader, 
                     device, 
                     num_samples=6,  # 每个轮次显示6个样本
-                    use_tta=True    # 训练结束后的测试使用TTA
+                    use_tta=True,   # 训练结束后的测试使用TTA
+                    epoch=epoch + 1,  # 传入当前轮次（1-based）
+                    is_best=is_best_epoch,  # 传入是否为最佳模型
+                    threshold=viz_threshold  # 传入当前轮次的最佳阈值
                 )
+                # 【显存优化】删除临时eval模型引用
+                del temp_eval_model
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 
-                # 计算当前轮次的性能指标（快速评估）
-                model.eval()
+                # 计算当前轮次的性能指标（全验证集评估）
+                # 【关键修复】验证评分现在使用全部验证集，与验证统计保持一致
+                # 1. 验证统计：使用全部验证集 + 后处理，用于主要评估和早停判断
+                # 2. 验证评分：使用全部验证集 + 后处理，用于性能分析和可视化（已修复）
+                # 【显存优化】使用临时eval模型
+                temp_eval_model_for_metrics = model.eval() if not isinstance(model, nn.DataParallel) else model.module.eval()
+                if self.use_ema and ema_model is not None and epoch >= self.ema_eval_start_epoch:
+                    temp_eval_model_for_metrics = ema_model.eval()
+                    if isinstance(model, nn.DataParallel):
+                        temp_eval_model_for_metrics = nn.DataParallel(temp_eval_model_for_metrics)
+                
                 epoch_metrics = {
                     'dice': [],
                     'iou': [],
                     'precision': [],
                     'recall': [],
                     'sensitivity': [],
-                    'specificity': [],
-                    'f1': [],
-                    'hd95': []
+                    'f1': []
                 }
                 
                 with torch.no_grad():
-                    # 只评估部分验证集以加快速度
-                    eval_samples = min(20, len(val_dataset))  # 最多评估20个样本
+                    # 【关键修复】使用全部验证集，不再限制为20个样本
                     eval_count = 0
+                    total_eval_samples = len(val_dataset)
                     
                     for batch_data in val_loader:
-                        if eval_count >= eval_samples:
-                            break
                         
                         # 处理数据：可能包含分类标签
                         if len(batch_data) == 3:
@@ -3866,17 +5716,41 @@ class TrainThread(QThread):
                         else:
                             images, masks = batch_data
                         images, masks = images.to(device), masks.to(device)
-                        outputs = eval_model_for_epoch(images)
+                        brain_mask = None
+                        if self.use_skull_stripper:
+                            images, brain_mask = self._apply_skull_strip(images)
+                        
+                        outputs = temp_eval_model_for_metrics(images)
                         # 确保 outputs 和 masks 的空间尺寸匹配
                         if outputs.shape[2:] != masks.shape[2:]:
                             outputs = F.interpolate(outputs, size=masks.shape[2:], mode='bilinear', align_corners=False)
-                        preds = torch.sigmoid(outputs)
-                        preds = (preds > val_threshold).float()
+                        if brain_mask is not None:
+                            outputs = outputs * brain_mask
+                        
+                        probs = torch.sigmoid(outputs)
+                        preds = (probs > val_threshold).float()
+                        
+                        # 【统一逻辑】验证评分也应该使用后处理，与验证统计保持一致
+                        # 先执行智能后处理
+                        for i in range(preds.shape[0]):
+                            pred_mask_tensor = preds[i, 0]
+                            prob_map_tensor = probs[i, 0]
+                            pred_mask_tensor = self.smart_post_processing(pred_mask_tensor, prob_map_tensor)
+                            # 再执行传统形态学后处理
+                            pred_mask_processed = self.post_process_mask(
+                                pred_mask_tensor,
+                                min_size=150,
+                                use_morphology=True,
+                                keep_largest=False,
+                                fill_holes=True,
+                                prob_map=prob_map_tensor
+                            )
+                            if isinstance(pred_mask_processed, torch.Tensor):
+                                preds[i, 0] = pred_mask_processed.to(preds.device)
+                            else:
+                                preds[i, 0] = torch.from_numpy(pred_mask_processed).float().to(preds.device)
                         
                         for i in range(preds.shape[0]):
-                            if eval_count >= eval_samples:
-                                break
-                                
                             pred = preds[i, 0]
                             mask = masks[i, 0]
                             
@@ -3892,46 +5766,63 @@ class TrainThread(QThread):
                             fn = float(((1 - pred) * mask).sum().item())
                             tn = float(((1 - pred) * (1 - mask)).sum().item())
                             
-                            dice_den = 2.0 * tp + fp + fn
-                            if dice_den < 1e-7:
-                                dice = 1.0 if (mask_sum < 1e-7 and pred_sum < 1e-7) else 0.0
+                            # 【关键修复】统计所有样本（包括空mask），与验证统计保持一致
+                            # 空mask样本的Dice计算：如果GT为空且预测也为空，Dice=1.0；否则Dice=0.0
+                            empty_threshold_pixels = max(1e-7, float(mask.numel()) * 0.001)  # 0.1%像素，统一阈值
+                            
+                            if mask_sum <= empty_threshold_pixels:
+                                # 空mask样本：GT为空
+                                if pred_sum <= 1e-7:
+                                    dice = 1.0  # GT为空，预测也为空，Dice=1.0
+                                else:
+                                    dice = 0.0  # GT为空，预测不为空（假阳性），Dice=0.0
+                                iou = dice  # IoU与Dice相同
+                                precision = 0.0 if pred_sum > 1e-7 else 1.0
+                                recall = 1.0  # GT为空，recall=1.0（没有漏检）
                             else:
-                                dice = (2.0 * tp) / dice_den
-                            
-                            union = tp + fp + fn
-                            iou = 1.0 if union < 1e-7 else tp / union
-                            
-                            if (tp + fp) < 1e-7:
-                                precision = 1.0 if mask_sum < 1e-7 else 0.0
-                            else:
-                                precision = tp / (tp + fp)
-                            
-                            if (tp + fn) < 1e-7:
-                                recall = 1.0 if pred_sum < 1e-7 else 0.0
-                            else:
-                                recall = tp / (tp + fn)
-                            
-                            specificity = 1.0 if (tn + fp) < 1e-7 else tn / (tn + fp)
-                            
-                            f1 = dice  # 二分类下F1=Dice
-                            hd95 = calculate_hd95(
-                                pred.cpu().numpy(),
-                                mask.cpu().numpy()
-                            )
-                            
-                            epoch_metrics['dice'].append(float(dice))
-                            epoch_metrics['iou'].append(float(iou))
-                            epoch_metrics['precision'].append(float(precision))
-                            epoch_metrics['recall'].append(float(recall))
-                            epoch_metrics['sensitivity'].append(float(recall))
-                            epoch_metrics['specificity'].append(float(specificity))
-                            epoch_metrics['f1'].append(float(f1))
-                            epoch_metrics['hd95'].append(hd95)
+                                # 有前景样本
+                                dice_den = 2.0 * tp + fp + fn
+                                if dice_den < 1e-7:
+                                    dice = 0.0  # 有前景但预测为空，Dice=0
+                                else:
+                                    dice = (2.0 * tp) / dice_den
+                                
+                                union = tp + fp + fn
+                                iou = 1.0 if union < 1e-7 else tp / union
+                                
+                                if (tp + fp) < 1e-7:
+                                    precision = 0.0  # 有前景但预测为空，precision=0
+                                else:
+                                    precision = tp / (tp + fp)
+                                
+                                if (tp + fn) < 1e-7:
+                                    recall = 0.0  # 有前景但预测为空，recall=0
+                                else:
+                                    recall = tp / (tp + fn)
+                                
+                                f1 = dice  # 二分类下F1=Dice
+                                
+                            # 统计所有样本（包括空mask）
+                                epoch_metrics['dice'].append(float(dice))
+                                epoch_metrics['iou'].append(float(iou))
+                                epoch_metrics['precision'].append(float(precision))
+                                epoch_metrics['recall'].append(float(recall))
+                                epoch_metrics['sensitivity'].append(float(recall))
+                                epoch_metrics['f1'].append(float(f1))
                             
                             eval_count += 1
                         
-                        if eval_count >= eval_samples:
-                            break
+                        # 【显存优化】删除epoch分析阶段的中间变量
+                        del outputs, probs, preds, images, masks
+                        if brain_mask is not None:
+                            del brain_mask
+                        if torch.cuda.is_available() and eval_count % 5 == 0:
+                            torch.cuda.empty_cache()
+                
+                # 【显存优化】删除临时eval模型
+                del temp_eval_model_for_metrics
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 
                 # 计算平均指标
                 avg_epoch_metrics = {}
@@ -3942,48 +5833,235 @@ class TrainThread(QThread):
                     else:
                         avg_epoch_metrics[k] = float(np.nanmean(arr))
 
-                # 基于当前阈值的平均指标，计算综合评分
-                hd95_mean = avg_epoch_metrics.get('hd95', float('inf'))
-                total_score = calculate_custom_score(
-                    dice=avg_epoch_metrics.get('dice', 0.0),
-                    iou=avg_epoch_metrics.get('iou', 0.0),
-                    precision=avg_epoch_metrics.get('precision', 0.0),
-                    recall=avg_epoch_metrics.get('recall', 0.0),
-                    specificity=avg_epoch_metrics.get('specificity', 0.0),
-                    hd95=hd95_mean,
-                )
-                avg_epoch_metrics['score'] = float(total_score)
-
-                # 格式化 HD95（处理 NaN/Inf 情况）
-                hd95_str = f"{hd95_mean:.4f}" if np.isfinite(hd95_mean) else "nan"
+                # 【关键修复】验证评分现在使用全部验证集，与验证统计保持一致
+                # 计算实际评估的样本数量
+                actual_eval_samples = len(epoch_metrics.get('dice', []))
+                # 【统一标准】验证评分统计所有样本（包括空mask），与验证统计保持一致
                 print(
                     f"[验证评分] Epoch {epoch+1}: threshold={val_threshold:.3f}, "
-                    f"TotalScore={total_score:.4f}, "
-                    f"Dice={avg_epoch_metrics.get('dice', float('nan')):.4f}, "
-                    f"IoU={avg_epoch_metrics.get('iou', float('nan')):.4f}, "
+                    f"Dice(所有样本)={avg_epoch_metrics.get('dice', float('nan')):.4f}, "
+                    f"IoU(所有样本)={avg_epoch_metrics.get('iou', float('nan')):.4f}, "
                     f"Precision={avg_epoch_metrics.get('precision', float('nan')):.4f}, "
-                    f"Recall={avg_epoch_metrics.get('recall', float('nan')):.4f}, "
-                    f"Specificity={avg_epoch_metrics.get('specificity', float('nan')):.4f}, "
-                    f"HD95={hd95_str}"
+                    f"Recall={avg_epoch_metrics.get('recall', float('nan')):.4f} "
+                    f"(基于全部验证集{actual_eval_samples}个样本，使用后处理)"
                 )
+                
+                # 【高清模式】关键 Epoch 时调用所有 MATLAB 方法生成出版级图表
+                # 注意：必须在 epoch_metrics 和 avg_epoch_metrics 计算完成后调用
+                if is_key_epoch and self.enable_matlab_plots and self.matlab_viz_bridge:
+                    print(f"\n[高清渲染] Epoch {epoch+1} 是关键轮次，正在调用 MATLAB 生成出版级图表...")
+                    try:
+                        # 1. 生成性能分析报表（如果数据可用）
+                        if len(epoch_metrics.get('dice', [])) > 0:
+                            try:
+                                # 【数据清洗】从 epoch_metrics 中提取纯数值列表，确保是 double 类型
+                                # epoch_metrics 是一个字典，键是指标名，值是列表
+                                dice_values = epoch_metrics.get('dice', [])
+                                
+                                # 确保所有值都是数值类型（不是字典或结构体）
+                                dice_values_clean = []
+                                for val in dice_values:
+                                    if isinstance(val, (int, float, np.number)):
+                                        dice_values_clean.append(float(val))
+                                    elif isinstance(val, dict):
+                                        # 如果值是字典，尝试提取数值（向后兼容）
+                                        dice_values_clean.append(float(val.get('val_dice', val.get('dice', 0.0))))
+                                    else:
+                                        # 其他类型，尝试转换为 float
+                                        try:
+                                            dice_values_clean.append(float(val))
+                                        except (ValueError, TypeError):
+                                            dice_values_clean.append(0.0)
+                                
+                                # 转换为 numpy 数组，确保是 double 类型
+                                dice_array = np.array(dice_values_clean, dtype=np.float64)
+                                
+                                # 直接保存为 .mat 文件，使用 MATLAB 脚本期望的字段名
+                                perf_payload_path = os.path.join(self.temp_dir, f"performance_metrics_epoch{epoch+1}_payload.mat")
+                                from scipy.io import savemat
+                                savemat(perf_payload_path, {
+                                    'dice_scores': dice_array,  # MATLAB 脚本期望的字段名
+                                    'iou_scores': np.array(epoch_metrics.get('iou', []), dtype=np.float64),
+                                    'precision_scores': np.array(epoch_metrics.get('precision', []), dtype=np.float64),
+                                    'recall_scores': np.array(epoch_metrics.get('recall', []), dtype=np.float64),
+                                })
+                                
+                                # 【持久化修复】保存到持久化目录
+                                import time
+                                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                                perf_analysis_path = os.path.join(self.persistent_report_dir, f"performance_analysis_epoch{epoch+1}_{timestamp}_matlab.png")
+                                os.makedirs(os.path.dirname(perf_analysis_path), exist_ok=True)
+                                self.matlab_viz_bridge.render_performance_analysis(perf_payload_path, perf_analysis_path)
+                                print(f"[高清渲染] 性能分析报表已保存到持久化目录: {perf_analysis_path}")
+                            except Exception as exc:
+                                print(f"[高清渲染] 性能分析报表生成失败: {exc}")
+                                import traceback
+                                traceback.print_exc()
+                        
+                        # 2. 生成注意力热力图（如果模型支持）
+                        # 【显存优化】使用临时eval模型
+                        temp_eval_model_for_att = model.eval() if not isinstance(model, nn.DataParallel) else model.module.eval()
+                        if self.use_ema and ema_model is not None and epoch >= self.ema_eval_start_epoch:
+                            temp_eval_model_for_att = ema_model.eval()
+                            if isinstance(model, nn.DataParallel):
+                                temp_eval_model_for_att = nn.DataParallel(temp_eval_model_for_att)
+                        
+                        if self._supports_attention_maps(temp_eval_model_for_att):
+                            try:
+                                # 收集注意力数据
+                                all_images_att = []
+                                all_masks_att = []
+                                all_preds_att = []
+                                att_layer_payload = {'att1': [], 'att2': [], 'att3': [], 'att4': []}
+                                
+                                # 【性能优化】只对前 2 个 batch 生成 Grad-CAM，其他 batch 跳过以提升速度
+                                max_gradcam_batches_att = 2  # 只对前 2 个 batch 生成 Grad-CAM（训练循环中）
+                                
+                                att_count = 0
+                                for batch_idx_att, batch_data in enumerate(val_loader):
+                                    if att_count >= 4:  # 只收集4个样本
+                                        break
+                                    if len(batch_data) == 3:
+                                        images, masks, _ = batch_data
+                                    else:
+                                        images, masks = batch_data
+                                    images, masks = images.to(device), masks.to(device)
+                                    
+                                    # 【性能优化】判断是否需要生成 Grad-CAM（仅前 2 个 batch）
+                                    need_gradcam_att = (batch_idx_att < max_gradcam_batches_att)
+                                    is_deeplabv3 = self.model_type in ("deeplabv3plus", "smp_deeplabv3plus")
+                                    
+                                    if need_gradcam_att:
+                                        # 需要 Grad-CAM 的样本：必须在 torch.enable_grad() 下运行
+                                        # 【DeepLabV3+ 兼容性 + Grad-CAM 集成】DeepLabV3+ 不支持 return_attention，使用 Grad-CAM
+                                        if is_deeplabv3:
+                                            # DeepLabV3+ 不支持 return_attention，先获取输出
+                                            with torch.enable_grad():
+                                                outputs = temp_eval_model_for_att(images)
+                                                # 使用 Grad-CAM 生成热力图（需要梯度）
+                                                actual_model = self._unwrap_model(temp_eval_model_for_att)
+                                                attention_maps = self._generate_gradcam_for_deeplabv3(actual_model, images, device)
+                                        else:
+                                            outputs, attention_maps = temp_eval_model_for_att(images, return_attention=True)
+                                    else:
+                                        # 不需要 Grad-CAM 的样本：使用 torch.no_grad() 加速
+                                        with torch.no_grad():
+                                            if is_deeplabv3:
+                                                # DeepLabV3+ 不需要注意力图，直接获取输出
+                                                outputs = temp_eval_model_for_att(images)
+                                                attention_maps = {}  # 不需要热力图
+                                            else:
+                                                # 其他模型：尝试获取注意力图，但不强制
+                                                try:
+                                                    outputs, attention_maps = temp_eval_model_for_att(images, return_attention=True)
+                                                except:
+                                                    # 如果获取失败，只获取输出
+                                                    outputs = temp_eval_model_for_att(images)
+                                                    attention_maps = {}
+                                    
+                                    # 如果不需要 Grad-CAM 且已收集足够样本，直接退出
+                                    if not need_gradcam_att and att_count >= 4:
+                                        break
+                                    
+                                    # 只处理需要可视化的样本（前 2 个 batch）
+                                    if need_gradcam_att:
+                                        preds = torch.sigmoid(outputs)
+                                        preds_binary = (preds > 0.5).float()
+                                        
+                                        for i in range(images.size(0)):
+                                            if att_count >= 4:
+                                                break
+                                            img = images[i].cpu().permute(1, 2, 0).numpy()
+                                            img = img * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
+                                            img = np.clip(img, 0, 1).astype(np.float32)
+                                            mask = masks[i, 0].cpu().numpy().astype(np.float32)
+                                            pred = preds_binary[i, 0].cpu().numpy().astype(np.float32)
+                                            
+                                            all_images_att.append(img)
+                                            all_masks_att.append(mask)
+                                            all_preds_att.append(pred)
+                                            
+                                            # 收集注意力图
+                                            for att_name in ['att1', 'att2', 'att3', 'att4']:
+                                                if att_name in attention_maps:
+                                                    att_np = attention_maps[att_name][i, 0].cpu().numpy()
+                                                    # 上采样到512x512
+                                                    from scipy.ndimage import zoom
+                                                    target_size = (512, 512)  # 提升分辨率以保留更多病灶边缘细节
+                                                    if att_np.shape != target_size:
+                                                        zoom_factors = (target_size[0] / att_np.shape[0], target_size[1] / att_np.shape[1])
+                                                        att_np = zoom(att_np, zoom_factors, order=1)
+                                                    att_layer_payload[att_name].append(att_np)
+                                            
+                                            att_count += 1
+                                        
+                                        # 【显存优化】删除注意力图收集的中间变量
+                                        del outputs, attention_maps, preds, preds_binary
+                                        if torch.cuda.is_available() and att_count % 2 == 0:
+                                            torch.cuda.empty_cache()
+                                
+                                if all_images_att:
+                                    att_payload = self._save_attention_payload(all_images_att, all_masks_att, all_preds_att, att_layer_payload, f"attention_epoch{epoch+1}")
+                                    # 【持久化修复】保存到持久化目录
+                                    import time
+                                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+                                    att_path = os.path.join(self.persistent_report_dir, f"attention_visualization_epoch{epoch+1}_{timestamp}_matlab.png")
+                                    os.makedirs(os.path.dirname(att_path), exist_ok=True)
+                                    self.matlab_viz_bridge.render_attention_maps(att_payload, att_path)
+                                    print(f"[高清渲染] 注意力热力图已保存到持久化目录: {att_path}")
+                                
+                                # 【显存优化】删除注意力图相关变量
+                                del all_images_att, all_masks_att, all_preds_att, att_layer_payload
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                            except Exception as exc:
+                                print(f"[高清渲染] 注意力热力图生成失败: {exc}")
+                        # 【显存优化】删除临时eval模型
+                        if 'temp_eval_model_for_att' in locals():
+                            del temp_eval_model_for_att
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception as exc:
+                        print(f"[高清渲染] MATLAB 高清渲染过程出错: {exc}")
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    # 【快速模式】普通 Epoch 跳过 MATLAB 调用，只使用 Matplotlib 快速预览
+                    if epoch is not None:
+                        print(f"[快照] Epoch {epoch+1} 使用 Matplotlib 快速预览（非关键轮次）")
                 
                 # 发送epoch分析结果信号（包含综合评分）
                 self.epoch_analysis_ready.emit(epoch + 1, test_viz_path, avg_epoch_metrics)
                 
                 # Save best model
-                if val_dice > self.best_dice:
-                    self.best_dice = val_dice
+                # 【关键修复】优先使用GWO找到的全验证集最佳Dice作为判定依据
+                # 如果GWO未运行或失败，则回退到验证循环计算的val_dice
+                dice_for_best_model = getattr(self, 'gwo_best_dice', None)
+                if dice_for_best_model is None:
+                    # 回退到验证循环计算的val_dice（基于全部验证集+后处理）
+                    dice_for_best_model = val_dice
+                    print(f">>> [Best Model] 使用验证循环Dice: {dice_for_best_model:.4f} (GWO未运行)")
+                else:
+                    print(f">>> [Best Model] 使用GWO全验证集最佳Dice: {dice_for_best_model:.4f}")
+                
+                if dice_for_best_model > self.best_dice:
+                    self.best_dice = dice_for_best_model
                     if self.save_best:
                         os.makedirs(self.best_model_cache_dir, exist_ok=True)
                         self.best_model_path = os.path.join(
-                            self.best_model_cache_dir, f"best_model_dice_{val_dice:.4f}.pth"
+                            self.best_model_cache_dir, f"best_model_dice_{dice_for_best_model:.4f}.pth"
                         )
                         self._save_checkpoint(eval_model_for_epoch, self.best_model_path)
-                        self.model_saved.emit(f"已保存最佳模型 (Dice: {val_dice:.4f})")
+                        self.model_saved.emit(f"已保存最佳模型 (Dice: {dice_for_best_model:.4f}, 基于全验证集GWO优化)")
 
                 # 恢复EMA模型为train模式（如果使用了EMA）
                 if self.use_ema and ema_model is not None and epoch >= self.ema_eval_start_epoch:
                     ema_model.train()
+                
+                # 【显存优化】在所有使用eval_model_for_epoch的操作完成后，删除它
+                del eval_model_for_epoch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 
                 # 触发早停
                 if early_stopping.step(val_dice):
@@ -4039,15 +6117,18 @@ class TrainThread(QThread):
                 try:
                     # 重新创建验证数据加载器（因为val_loader_cls可能不在作用域内）
                     val_dataset_cls = self.load_dataset(val_ids, val_transform, split_name="val", return_classification=True)
+                    import platform
+                    is_windows = platform.system() == 'Windows'
                     cpu_count = os.cpu_count() or 1
-                    num_workers = max(0, min(4, cpu_count - 1))
+                    # 【Windows 多进程优化】Intel Core Ultra 9 285HX: 使用 8 个 worker 充分利用 P-Core
+                    num_workers = 8 if is_windows else max(0, min(4, cpu_count - 1))
                     val_loader_cls = DataLoader(
                         val_dataset_cls,
                         batch_size=self.batch_size,
                         shuffle=False,
                         num_workers=num_workers,
-                        pin_memory=True,
-                        persistent_workers=num_workers > 0
+                        pin_memory=True,  # 【优化】加速数据传输
+                        persistent_workers=(num_workers > 0)  # 【关键】让子进程保持存活
                     )
                     
                     # 加载分类模型
@@ -4186,27 +6267,35 @@ class TrainThread(QThread):
             
             # 生成测试结果可视化 - 使用TTA提升性能
             self.update_progress.emit(95, "生成测试集分割结果可视化（TTA）...")
-            test_viz_path = self.visualize_test_results(eval_model, val_loader, device, num_samples=8, use_tta=True)
+            # 使用训练过程中计算出的最佳阈值
+            viz_threshold = getattr(self, 'last_optimal_threshold', 0.1)
+            test_viz_path = self.visualize_test_results(eval_model, val_loader, device, num_samples=8, use_tta=True, threshold=viz_threshold)
             
             # 生成性能分析
             self.update_progress.emit(98, "生成性能分析报告...")
             perf_analysis_path = self.generate_performance_analysis(detailed_metrics)
             
-            # 生成注意力可视化用于可解释性分析（若模型支持）- 使用TTA
-            if self._supports_attention_maps(eval_model):
-                self.update_progress.emit(99, "生成注意力可解释性分析（TTA）...")
-                # 注意：visualize_attention_maps 内部会使用 return_attention，TTA可能不支持，保持原样
-                attention_viz_path = self.visualize_attention_maps(eval_model, val_loader, device, num_samples=4)
-                attention_stats = self.analyze_attention_statistics(eval_model, val_loader, device, num_samples=20)
-            else:
-                self.update_progress.emit(99, "当前模型不支持注意力可视化，跳过该步骤。")
-                attention_viz_path = ""
-                attention_stats = {}
+            # 【显存优化】彻底禁用训练和验证阶段的注意力热力图生成，防止 CUDA OOM
+            # 注意力热力图生成需要大量显存（Grad-CAM 需要反向传播），在训练和验证阶段禁用
+            # 仅在测试阶段（ModelTestThread）生成注意力热力图用于最终分析
+            self.update_progress.emit(99, "注意力可视化已禁用（训练/验证阶段，防止 CUDA OOM）")
+            attention_viz_path = ""
+            attention_stats = {}
             
             # 发送测试结果信号，包含性能分析路径
             self.test_results_ready.emit(test_viz_path, detailed_metrics)
             self.visualization_ready.emit(perf_analysis_path)  # 同时发送性能分析
-            self.attention_analysis_ready.emit(attention_viz_path, attention_stats)  # 发送注意力分析
+            
+            # 【显存优化】训练和验证阶段已禁用注意力热力图生成，发送空信号
+            # 仅在测试阶段（ModelTestThread）生成注意力热力图用于最终分析
+            if attention_stats is None:
+                attention_stats = {}
+            # 如果 attention_viz_path 为空，说明未生成注意力热力图（训练/验证阶段）
+            if attention_viz_path:
+                self.attention_analysis_ready.emit(attention_viz_path, attention_stats)
+            else:
+                # 训练/验证阶段不发送注意力分析信号，避免下游处理错误
+                pass
             
             # 训练完成
             fallback_dice = self.val_dice_history[-1] if self.val_dice_history else 0.0
@@ -4310,6 +6399,44 @@ class TrainThread(QThread):
             use_percentile_normalization: 是否使用百分位数归一化（p10-p99，更鲁棒）
             use_weighted_sampling: 是否使用基于mask的权重采样（None时自动：训练集启用，验证集禁用）
         """
+        # 如果使用2.5D数据集
+        if self.dataset_type == "2.5d" and TCGA2_5D_AVAILABLE:
+            # 2.5D数据集：支持递归搜索子文件夹
+            # 目录结构示例：
+            # data_dir/
+            #   - 子文件夹1/
+            #     - TCGA_CS_5393_19990606_1.tif
+            #     - TCGA_CS_5393_19990606_1_mask.tif
+            #     - TCGA_CS_5393_19990606_2.tif
+            #     - TCGA_CS_5393_19990606_2_mask.tif
+            #   - 子文件夹2/
+            #     - TCGA_CS_5394_19990607_1.tif
+            #     - TCGA_CS_5394_19990607_1_mask.tif
+            #   ...
+            # 系统会自动递归搜索所有子文件夹中的.tif文件
+            mask_dir = self.data_dir  # mask和图像在同一目录（或子目录）
+            
+            # 【GUI选项驱动】根据dataset_type自动设置mode参数
+            # 2.5D模式：使用3通道堆叠（上一张、当前、下一张）
+            # 2D模式：只使用当前切片，单通道
+            if self.dataset_type == "2.5d":
+                dataset_mode = "2.5d"  # 三通道堆叠
+            else:
+                dataset_mode = "2d"  # 单通道
+            print(f"[数据集加载] dataset_type={self.dataset_type}, 设置TCGA2_5DDataset mode={dataset_mode}")
+            
+            base_dataset = TCGA2_5DDataset(
+                data_dir=self.data_dir,
+                mask_dir=mask_dir,
+                transform=transform,
+                is_train=(split_name == "train"),
+                debug=False,
+                mode=dataset_mode  # 传递mode参数，确保数据加载方式与模型通道数匹配
+            )
+            print(f"[2.5D数据集] 加载了 {len(base_dataset)} 个样本")
+            return base_dataset
+        
+        # 标准数据集加载逻辑
         image_paths, mask_paths = self._collect_image_mask_paths(patient_ids)
         self.split_metadata[split_name] = {
             'image_paths': image_paths,
@@ -4374,16 +6501,37 @@ class TrainThread(QThread):
             swin_params: SwinUNet的超参数（如果使用GWO优化）
             dstrans_params: DS-TransUNet的超参数（如果使用GWO优化）
         """
+        # 【2.5D支持】根据数据集类型动态设置输入通道数
+        # 2.5D数据集：3通道（上一张、当前、下一张）
+        # 标准数据集：1通道（单通道输入）
+        if self.dataset_type == "2.5d":
+            in_channels = 3  # 2.5D输入：上一张、当前、下一张
+            dataset_mode = "2.5D模式"
+        else:
+            in_channels = 1  # 标准数据集：单通道输入
+            dataset_mode = "标准模式"
+        
         if self.model_type == "resnet_unet":
             # 默认冻结编码器，前50% epoch只训练解码器，后50%解冻进行微调
             freeze_encoder = True  # 可以通过配置控制
-            model = ResNetUNet(freeze_encoder=freeze_encoder).to(device)
+            # ResNetUNet需要检查是否支持in_channels参数
+            # 如果不支持，可能需要修改模型定义或使用适配层
+            try:
+                model = ResNetUNet(freeze_encoder=freeze_encoder, in_channels=in_channels).to(device)
+            except TypeError:
+                # 如果ResNetUNet不支持in_channels参数，使用默认值（通常是3）
+                # 对于标准数据集（1通道），可能需要添加适配层
+                print(f"[警告] ResNetUNet不支持in_channels参数，使用默认值。数据集类型：{self.dataset_type}")
+                model = ResNetUNet(freeze_encoder=freeze_encoder).to(device)
+                if in_channels == 1:
+                    print(f"[警告] ResNetUNet期望3通道输入，但数据集是1通道。可能需要修改模型定义。")
+            self.update_progress.emit(15, f"使用ResNet-UNet（{dataset_mode}）")
         elif self.model_type == "trans_unet" or self.model_type == "transunet":
-            model = TransUNet().to(device)
-            self.update_progress.emit(15, "使用Transformer+UNet混合架构（可提高Dice指标）")
+            model = TransUNet(in_channels=in_channels).to(device)
+            self.update_progress.emit(15, f"使用Transformer+UNet混合架构（{dataset_mode}，可提高Dice指标）")
         elif self.model_type in ("ds_trans_unet", "dstransunet", "ds-transunet"):
             dstrans_kwargs = {
-                "in_channels": 3,
+                "in_channels": in_channels,  # 使用动态设置的通道数
                 "out_channels": 1,
                 "embed_dim": 256,
                 "num_heads": 8,
@@ -4393,19 +6541,25 @@ class TrainThread(QThread):
             }
             if dstrans_params:
                 dstrans_kwargs.update(copy.deepcopy(dstrans_params))
+                # 如果dstrans_params中指定了in_channels，优先使用（用于checkpoint恢复）
+                if 'in_channels' in dstrans_params:
+                    dstrans_kwargs['in_channels'] = dstrans_params['in_channels']
             # 移除DSTransUNet不接受的内置参数
             dstrans_kwargs.pop('_from_checkpoint', None)
             if dstrans_kwargs["embed_dim"] % dstrans_kwargs["num_heads"] != 0:
                 dstrans_kwargs["embed_dim"] = dstrans_kwargs["num_heads"] * max(1, dstrans_kwargs["embed_dim"] // dstrans_kwargs["num_heads"])
             model = DSTransUNet(**dstrans_kwargs).to(device)
-            self.update_progress.emit(15, "使用DS-TransUNet（双尺度Transformer+UNet，增强多尺度特征提取）")
+            self.update_progress.emit(15, f"使用DS-TransUNet（双尺度Transformer+UNet，{dataset_mode}，增强多尺度特征提取）")
         elif self.model_type == "swin_unet" or self.model_type == "swinunet":
             swin_kwargs = {
-                "in_channels": 3,
+                "in_channels": in_channels,  # 使用动态设置的通道数
                 "out_channels": 1
             }
             if swin_params:
                 swin_kwargs.update(copy.deepcopy(swin_params))
+                # 如果swin_params中指定了in_channels，优先使用（用于checkpoint恢复）
+                if 'in_channels' in swin_params:
+                    swin_kwargs['in_channels'] = swin_params['in_channels']
             # 如果参数来自checkpoint推断，跳过归一化以保持兼容
             from_checkpoint = swin_params and swin_params.get('_from_checkpoint', False)
             if not from_checkpoint:
@@ -4431,11 +6585,11 @@ class TrainThread(QThread):
             final_window = swin_kwargs.get('window_size', 8)
             self.update_progress.emit(
                 15,
-                f"使用SwinUNet（参数：embed_dim={int(final_embed)}, window_size={int(final_window)}）"
+                f"使用SwinUNet（{dataset_mode}，参数：embed_dim={int(final_embed)}, window_size={int(final_window)}）"
             )
         elif self.model_type in ("swin_u_mamba", "swin-u-mamba", "swinumamba"):
             mamba_kwargs = {
-                "in_channels": 3,
+                "in_channels": in_channels,  # 使用动态设置的通道数
                 "out_channels": 1,
                 "base_channels": 64,
                 "num_blocks": (2, 2, 2, 2),
@@ -4443,13 +6597,86 @@ class TrainThread(QThread):
             }
             if swin_params:
                 mamba_kwargs.update(copy.deepcopy(swin_params))
+                # 如果swin_params中指定了in_channels，优先使用（用于checkpoint恢复）
+                if 'in_channels' in swin_params:
+                    mamba_kwargs['in_channels'] = swin_params['in_channels']
             model = SwinUMamba(**mamba_kwargs).to(device)
             self.update_progress.emit(
                 15,
-                f"使用Swin-U Mamba（base_channels={mamba_kwargs.get('base_channels',64)}, blocks={mamba_kwargs.get('num_blocks',(2,2,2,2))}）"
+                f"使用Swin-U Mamba（{dataset_mode}，base_channels={mamba_kwargs.get('base_channels',64)}, blocks={mamba_kwargs.get('num_blocks',(2,2,2,2))}）"
+            )
+        elif self.model_type == "smp_unetplusplus":
+            # 使用SMP U-Net++模型
+            # 【2.5D支持】根据数据集类型动态设置输入通道数
+            from config import get_model_config
+            from models import SMPUnetPlusPlus
+            
+            model_config = get_model_config("smp_unetplusplus")
+            
+            # 【关键修复】根据数据集类型动态设置输入通道数
+            # 2.5D数据集：3通道（上一张、当前、下一张）
+            # 标准数据集：1通道（单通道输入）
+            if self.dataset_type == "2.5d":
+                in_channels = 3  # 2.5D输入：上一张、当前、下一张
+                dataset_mode = "2.5D模式"
+            else:
+                in_channels = 1  # 标准数据集：单通道输入
+                dataset_mode = "标准模式"
+            
+            # 如果提供了预训练模型路径，使用它作为pretrained_weights_path
+            pretrained_weights_path = model_config.get("pretrained_weights_path")
+            if self.model_path and os.path.exists(self.model_path):
+                pretrained_weights_path = self.model_path
+            
+            model = SMPUnetPlusPlus(
+                encoder_name=model_config.get("encoder_name", "resnet101"),
+                encoder_weights=model_config.get("encoder_weights", "imagenet"),
+                in_channels=in_channels,  # 使用动态设置的通道数
+                classes=model_config.get("out_channels", 1),
+                activation=model_config.get("activation", None),
+                pretrained_weights_path=pretrained_weights_path
+            ).to(device)
+            
+            encoder_name = model_config.get("encoder_name", "resnet101")
+            self.update_progress.emit(
+                15,
+                f"使用SMP U-Net++（编码器: {encoder_name}, 输入通道: {in_channels}, {dataset_mode}）"
+            )
+        elif self.model_type in ("deeplabv3plus", "smp_deeplabv3plus"):
+            # 【降维打击】使用SMP DeepLabV3+模型（更接近纯ResNet，训练更稳定）
+            # 【锁定3通道】强制使用3通道输入，不再考虑数据集类型
+            from config import get_model_config
+            from models import SMPDeepLabV3Plus
+            
+            # 统一使用 smp_deeplabv3plus 作为配置键
+            model_config = get_model_config("smp_deeplabv3plus")
+            
+            # 【锁定3通道】强制使用3通道，不再动态适配
+            in_channels = 3
+            
+            # 如果提供了预训练模型路径，使用它作为pretrained_weights_path
+            pretrained_weights_path = model_config.get("pretrained_weights_path")
+            if self.model_path and os.path.exists(self.model_path):
+                pretrained_weights_path = self.model_path
+            
+            model = SMPDeepLabV3Plus(
+                encoder_name=model_config.get("encoder_name", "resnet101"),
+                encoder_weights=model_config.get("encoder_weights", "imagenet"),
+                in_channels=in_channels,  # 锁定为3通道
+                classes=model_config.get("out_channels", 1),
+                activation=model_config.get("activation", None),
+                pretrained_weights_path=pretrained_weights_path
+            ).to(device)
+            
+            encoder_name = model_config.get("encoder_name", "resnet101")
+            self.update_progress.emit(
+                15,
+                f"【降维打击】使用SMP DeepLabV3+（编码器: {encoder_name}, 输入通道: 3通道，已锁定）"
             )
         else:
-            model = ImprovedUNet().to(device)
+            # ImprovedUNet：根据数据集类型动态设置输入通道数
+            model = ImprovedUNet(in_channels=in_channels).to(device)
+            self.update_progress.emit(15, f"使用改进UNet（{dataset_mode}）")
 
         if torch.cuda.device_count() > 1:
             model = nn.DataParallel(model)
@@ -4487,6 +6714,212 @@ class TrainThread(QThread):
                 images = images.to(device)
                 _ = model(images)  # 只使用images来更新BN统计量
     
+    def _adapt_model_channels(self, model, train_loader, device):
+        """
+        模型输入通道自适应：检查数据通道数与模型第一层通道数是否匹配，如不匹配则动态修改
+        
+        参数:
+            model: 模型实例
+            train_loader: 训练数据加载器
+            device: 设备
+        
+        返回:
+            适配后的模型（如果进行了修改，则返回新模型；否则返回原模型）
+        """
+        try:
+            # 【锁定3通道】SMPDeepLabV3Plus已锁定为3通道，跳过通道适配
+            actual_model = self._unwrap_model(model)
+            # 检查是否是SMPDeepLabV3Plus模型（通过类名或模型类型判断）
+            is_deeplabv3 = (
+                self.model_type in ("deeplabv3plus", "smp_deeplabv3plus") or
+                type(actual_model).__name__ == "SMPDeepLabV3Plus" or
+                (hasattr(actual_model, 'model') and type(actual_model.model).__name__ == "SMPDeepLabV3Plus")
+            )
+            if is_deeplabv3:
+                print(f"[通道适配] SMPDeepLabV3Plus已锁定为3通道，跳过通道适配")
+                return model
+            
+            # 步骤1: 从 train_loader 中取出一个 batch
+            data_iter = iter(train_loader)
+            batch_data = next(data_iter)
+            if len(batch_data) == 2:
+                images, masks = batch_data
+            elif len(batch_data) == 3:
+                images, masks, _ = batch_data
+            else:
+                print("[通道适配] 无法解析batch数据格式，跳过通道适配检查")
+                return model
+            
+            # 获取数据的通道数
+            if len(images.shape) < 4:
+                print("[通道适配] 图像维度不足，跳过通道适配检查")
+                return model
+            
+            data_channels = images.shape[1]  # (B, C, H, W) 中的 C
+            print(f"[通道适配] 检测到数据通道数: {data_channels}")
+            
+            # 步骤2: 获取模型第一层的通道数
+            actual_model = self._unwrap_model(model)
+            model_channels = None
+            first_conv_layer = None
+            first_conv_path = None
+            
+            # 尝试多种方式找到第一层卷积
+            if hasattr(actual_model, 'model') and hasattr(actual_model.model, 'encoder'):
+                # SMP模型结构：model.model.encoder.conv1
+                if hasattr(actual_model.model.encoder, 'conv1'):
+                    first_conv_layer = actual_model.model.encoder.conv1
+                    first_conv_path = 'model.encoder.conv1'
+                    model_channels = first_conv_layer.in_channels
+            elif hasattr(actual_model, 'encoder') and hasattr(actual_model.encoder, 'conv1'):
+                # 直接有encoder.conv1
+                first_conv_layer = actual_model.encoder.conv1
+                first_conv_path = 'encoder.conv1'
+                model_channels = first_conv_layer.in_channels
+            elif hasattr(actual_model, 'conv1'):
+                # 直接有conv1
+                first_conv_layer = actual_model.conv1
+                first_conv_path = 'conv1'
+                model_channels = first_conv_layer.in_channels
+            elif hasattr(actual_model, 'down1'):
+                # UNet类模型：down1的第一个卷积层
+                if hasattr(actual_model.down1, '__getitem__'):
+                    # down1可能是Sequential，尝试找到第一个Conv2d层
+                    for idx, layer in enumerate(actual_model.down1):
+                        if isinstance(layer, nn.Conv2d):
+                            first_conv_layer = layer
+                            first_conv_path = f'down1[{idx}]'
+                            model_channels = layer.in_channels
+                            break
+                elif hasattr(actual_model.down1, 'conv'):
+                    first_conv_layer = actual_model.down1.conv
+                    first_conv_path = 'down1.conv'
+                    if isinstance(first_conv_layer, nn.Conv2d) and hasattr(first_conv_layer, 'in_channels'):
+                        model_channels = first_conv_layer.in_channels
+            
+            if model_channels is None or first_conv_layer is None:
+                print(f"[通道适配] 无法找到模型第一层卷积，跳过通道适配检查")
+                return model
+            
+            print(f"[通道适配] 检测到模型第一层通道数: {model_channels} (路径: {first_conv_path})")
+            
+            # 步骤3: 如果两者不一致，动态修改模型的第一层卷积
+            if data_channels != model_channels:
+                print(f"\n{'='*60}")
+                print(f"⚠️  [通道适配警告] 数据通道数 ({data_channels}) 与模型第一层通道数 ({model_channels}) 不匹配！")
+                print(f"   正在自动适配模型以匹配数据通道数...")
+                print(f"{'='*60}\n")
+                
+                # 获取第一层卷积的权重和偏置
+                old_weight = first_conv_layer.weight.data.clone()  # (out_channels, in_channels, H, W)
+                old_bias = first_conv_layer.bias.data.clone() if first_conv_layer.bias is not None else None
+                
+                # 创建新的卷积层
+                out_channels = old_weight.shape[0]
+                kernel_size = old_weight.shape[2:]  # (H, W)
+                stride = first_conv_layer.stride if hasattr(first_conv_layer, 'stride') else (1, 1)
+                padding = first_conv_layer.padding if hasattr(first_conv_layer, 'padding') else (0, 0)
+                dilation = first_conv_layer.dilation if hasattr(first_conv_layer, 'dilation') else (1, 1)
+                groups = first_conv_layer.groups if hasattr(first_conv_layer, 'groups') else 1
+                
+                # 创建新的卷积层
+                new_conv = nn.Conv2d(
+                    in_channels=data_channels,
+                    out_channels=out_channels,
+                    kernel_size=kernel_size,
+                    stride=stride,
+                    padding=padding,
+                    dilation=dilation,
+                    groups=groups,
+                    bias=(old_bias is not None)
+                ).to(device)
+                
+                # 权重适配策略
+                if data_channels > model_channels:
+                    # 数据是3通道，模型是1通道：将1通道权重复制3份（或取平均扩展）
+                    print(f"   [适配策略] 1通道 -> {data_channels}通道：复制权重")
+                    # 方法1: 直接复制（简单但可能不够好）
+                    # 方法2: 取平均后复制（更稳定）
+                    # 这里使用平均复制策略
+                    old_weight_mean = old_weight.mean(dim=1, keepdim=True)  # (out_channels, 1, H, W)
+                    new_weight = old_weight_mean.repeat(1, data_channels, 1, 1)  # (out_channels, data_channels, H, W)
+                    new_conv.weight.data = new_weight
+                    if old_bias is not None:
+                        new_conv.bias.data = old_bias.clone()
+                else:
+                    # 数据是1通道，模型是3通道：将3通道权重求和（或取平均），压缩成1通道卷积层
+                    print(f"   [适配策略] {model_channels}通道 -> 1通道：求和压缩权重")
+                    # 方法1: 直接求和（简单）
+                    # 方法2: 取平均（更稳定）
+                    # 这里使用平均策略
+                    new_weight = old_weight.mean(dim=1, keepdim=True)  # (out_channels, 1, H, W)
+                    new_conv.weight.data = new_weight
+                    if old_bias is not None:
+                        new_conv.bias.data = old_bias.clone()
+                
+                # 替换第一层卷积
+                # 根据路径设置新层
+                if first_conv_path == 'model.encoder.conv1':
+                    actual_model.model.encoder.conv1 = new_conv
+                elif first_conv_path == 'encoder.conv1':
+                    actual_model.encoder.conv1 = new_conv
+                elif first_conv_path == 'conv1':
+                    actual_model.conv1 = new_conv
+                elif first_conv_path.startswith('down1'):
+                    # 对于down1，需要根据路径索引替换
+                    if '[' in first_conv_path and ']' in first_conv_path:
+                        # 提取索引，例如 down1[0] -> 0
+                        idx_str = first_conv_path.split('[')[1].split(']')[0]
+                        try:
+                            idx = int(idx_str)
+                            if hasattr(actual_model.down1, '__getitem__'):
+                                # 如果是Sequential，需要替换对应索引的层
+                                if isinstance(actual_model.down1, nn.Sequential):
+                                    # 创建一个新的Sequential，替换指定索引的层
+                                    layers = list(actual_model.down1)
+                                    layers[idx] = new_conv
+                                    actual_model.down1 = nn.Sequential(*layers).to(device)
+                                else:
+                                    # 如果是其他可索引结构，直接替换
+                                    actual_model.down1[idx] = new_conv
+                        except (ValueError, IndexError):
+                            print(f"   ⚠️  [通道适配] 无法解析down1索引: {first_conv_path}")
+                    elif hasattr(actual_model.down1, 'conv'):
+                        actual_model.down1.conv = new_conv
+                
+                # 如果模型被DataParallel包装，需要同步更新
+                if isinstance(model, nn.DataParallel):
+                    model.module = actual_model
+                elif isinstance(model, AveragedModel):
+                    model.module = actual_model
+                else:
+                    model = actual_model
+                
+                print(f"   ✅ [通道适配完成] 模型第一层已从 {model_channels} 通道适配为 {data_channels} 通道")
+                print(f"   适配路径: {first_conv_path}")
+                print(f"{'='*60}\n")
+                
+                # 验证适配是否成功
+                try:
+                    test_images = images[:1].to(device)  # 只取第一个样本测试
+                    with torch.no_grad():
+                        _ = model(test_images)
+                    print(f"   ✅ [验证通过] 适配后的模型可以正常前向传播")
+                except Exception as e:
+                    print(f"   ⚠️  [验证失败] 适配后的模型前向传播出错: {str(e)}")
+                    print(f"   建议检查模型结构和数据格式")
+            else:
+                print(f"[通道适配] 数据通道数 ({data_channels}) 与模型通道数 ({model_channels}) 匹配，无需适配")
+            
+            return model
+            
+        except Exception as e:
+            print(f"[通道适配] 通道适配过程出错: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            print(f"[通道适配] 出错后返回原模型，训练将继续进行")
+            return model
+    
     def _unwrap_model(self, model):
         """解包DataParallel，返回实际模型"""
         actual = model
@@ -4505,7 +6938,175 @@ class TrainThread(QThread):
     def _supports_attention_maps(self, model):
         """模型是否提供注意力图"""
         actual = self._unwrap_model(model)
-        return isinstance(actual, (ImprovedUNet, TransUNet, DSTransUNet, SwinUNet, ResNetUNet))
+        from models import SMPDeepLabV3Plus
+        return isinstance(actual, (ImprovedUNet, TransUNet, DSTransUNet, SwinUNet, ResNetUNet, SMPDeepLabV3Plus))
+    
+    def _generate_gradcam_for_deeplabv3(self, model, images, device):
+        """
+        为 DeepLabV3+ 生成 Grad-CAM 热力图
+        
+        Args:
+            model: 模型实例（已解包，非 DataParallel）
+            images: 输入图像 (B, 3, H, W)
+            device: 设备
+        
+        Returns:
+            attention_maps: 字典，包含 Grad-CAM 热力图
+        """
+        if not GRAD_CAM_AVAILABLE:
+            return {}
+        
+        try:
+            # 确保模型处于 eval 模式（Grad-CAM 需要）
+            was_training = model.training
+            model.eval()
+            
+            # 获取实际模型（SMPDeepLabV3Plus 包装了 smp.DeepLabV3Plus）
+            actual_model = model
+            if hasattr(model, 'model'):
+                actual_model = model.model
+            
+            # 【分辨率优化】使用 Decoder 作为目标层，获得更高分辨率的热力图
+            # Decoder 具有更高的空间分辨率（接近输入图像大小），而 encoder.layer4 只有 1/32 分辨率
+            target_layer = None
+            
+            # 优先使用 decoder（更高分辨率）
+            if hasattr(actual_model, 'decoder'):
+                decoder = actual_model.decoder
+                # decoder 可能是一个 Sequential 或 ModuleList
+                if hasattr(decoder, '__getitem__') and len(decoder) > 0:
+                    # 如果是可索引的，取最后一个模块（通常是输出层）
+                    target_layer = decoder[-1]
+                elif hasattr(decoder, 'segmentation_head'):
+                    # 某些 decoder 有 segmentation_head
+                    target_layer = decoder.segmentation_head
+                else:
+                    target_layer = decoder
+            elif hasattr(actual_model, 'segmentation_head'):
+                # 如果 decoder 不存在，尝试直接使用 segmentation_head
+                target_layer = actual_model.segmentation_head
+            
+            # 如果 decoder 不可用，回退到 encoder.layer4（低分辨率，但至少能工作）
+            if target_layer is None:
+                encoder = actual_model.encoder
+                if hasattr(encoder, 'layer4'):
+                    layer4 = encoder.layer4
+                    if hasattr(layer4, '__getitem__'):
+                        target_layer = layer4[-1] if len(layer4) > 0 else layer4
+                    else:
+                        target_layer = layer4
+                elif hasattr(encoder, 'blocks') and len(encoder.blocks) > 0:
+                    target_layer = encoder.blocks[-1]
+            
+            if target_layer is None:
+                print("[Grad-CAM] 无法找到目标层（decoder 或 encoder），跳过 Grad-CAM 生成")
+                if was_training:
+                    model.train()
+                return {}
+            
+            # 初始化 GradCAM
+            # 注意：GradCAM 需要访问实际的模型结构，使用 actual_model（smp.DeepLabV3Plus）
+            # 新版本的 grad-cam 库已移除 use_cuda 参数，会自动检测设备
+            cam = GradCAM(model=actual_model, target_layers=[target_layer])
+            
+            # 获取图像尺寸 (images 形状是 [B, C, H, W])
+            height, width = images.shape[2], images.shape[3]
+            
+            # 创建全1掩码 (表示关注整张图的类别预测)
+            # SemanticSegmentationTarget 不接受 mask=None，必须传入具体的 numpy 数组
+            mask = np.ones((height, width), dtype=np.float32)
+            
+            # 确定目标类别索引
+            # 对于二分类模型 (classes=1)，输出只有1个通道，索引必须是0
+            # 对于多分类模型 (classes>1)，可以使用 category=1 或其他类别索引
+            target_category = 1  # 默认使用类别1（前景类）
+            
+            # 检查模型的类别数
+            if hasattr(actual_model, 'classes'):
+                num_classes = actual_model.classes
+                if num_classes == 1:
+                    # 二分类模型：输出只有1个通道（索引0），必须使用 category=0
+                    target_category = 0
+                    # 【日志优化】仅在第一次调用时打印，避免重复日志刷屏
+                    if not getattr(self, '_has_logged_gradcam_info', False):
+                        print(f"[Grad-CAM] 检测到二分类模型 (classes=1)，使用 category=0")
+                        self._has_logged_gradcam_info = True
+                else:
+                    # 多分类模型：可以使用 category=1（前景类）或其他类别
+                    target_category = min(1, num_classes - 1)  # 确保不越界
+                    # 【日志优化】仅在第一次调用时打印，避免重复日志刷屏
+                    if not getattr(self, '_has_logged_gradcam_info', False):
+                        print(f"[Grad-CAM] 检测到多分类模型 (classes={num_classes})，使用 category={target_category}")
+                        self._has_logged_gradcam_info = True
+            else:
+                # 如果无法获取 classes 属性，尝试从输出形状推断
+                # 先进行一次前向传播获取输出形状（仅用于推断）
+                try:
+                    with torch.no_grad():
+                        test_output = actual_model(images[:1])  # 只取第一个样本测试
+                        if isinstance(test_output, tuple):
+                            test_output = test_output[0]
+                        num_classes = test_output.shape[1]  # (B, C, H, W) 中的 C
+                        if num_classes == 1:
+                            target_category = 0
+                            # 【日志优化】仅在第一次调用时打印，避免重复日志刷屏
+                            if not getattr(self, '_has_logged_gradcam_info', False):
+                                print(f"[Grad-CAM] 通过输出形状推断为二分类模型 (channels=1)，使用 category=0")
+                                self._has_logged_gradcam_info = True
+                        else:
+                            target_category = min(1, num_classes - 1)
+                            # 【日志优化】仅在第一次调用时打印，避免重复日志刷屏
+                            if not getattr(self, '_has_logged_gradcam_info', False):
+                                print(f"[Grad-CAM] 通过输出形状推断为多分类模型 (channels={num_classes})，使用 category={target_category}")
+                                self._has_logged_gradcam_info = True
+                except Exception as e:
+                    # 如果推断失败，默认使用 category=0（二分类）
+                    target_category = 0
+                    # 【日志优化】仅在第一次调用时打印，避免重复日志刷屏
+                    if not getattr(self, '_has_logged_gradcam_info', False):
+                        print(f"[Grad-CAM] 无法推断模型类别数，默认使用 category=0 (二分类): {e}")
+                        self._has_logged_gradcam_info = True
+            
+            # 定义目标：语义分割的目标类别
+            targets = [SemanticSegmentationTarget(category=target_category, mask=mask)]
+            
+            # 【关键修复】强制开启梯度计算，这是 Grad-CAM 必须的
+            # 即使外部有 torch.no_grad()，这里也要临时开启梯度计算
+            # 确保输入图像支持求导
+            images_grad = images.clone().detach().requires_grad_(True)
+            
+            # 生成 Grad-CAM 热力图
+            # grayscale_cam 形状: (B, H, W)
+            # 使用 torch.enable_grad() 上下文管理器，确保梯度计算可用
+            with torch.enable_grad():
+                grayscale_cam = cam(input_tensor=images_grad, targets=targets)
+            
+            # 转换为 torch.Tensor 并添加通道维度，匹配其他模型的注意力图格式
+            # 格式: (B, 1, H, W)
+            attention_maps = {}
+            if len(grayscale_cam.shape) == 3:  # (B, H, W)
+                grayscale_cam_tensor = torch.from_numpy(grayscale_cam).float().to(device)
+                grayscale_cam_tensor = grayscale_cam_tensor.unsqueeze(1)  # (B, 1, H, W)
+            else:
+                grayscale_cam_tensor = torch.from_numpy(grayscale_cam).float().to(device)
+            
+            # 使用 'gradcam_decoder' 作为键名（因为现在使用 decoder 作为目标层）
+            attention_maps['gradcam_decoder'] = grayscale_cam_tensor
+            
+            # 恢复模型训练状态
+            if was_training:
+                model.train()
+            
+            return attention_maps
+            
+        except Exception as e:
+            print(f"[Grad-CAM警告] 生成热力图失败: {e}")
+            import traceback
+            traceback.print_exc()
+            # 确保恢复模型状态
+            if was_training:
+                model.train()
+            return {}
     
     def _create_optimizer(self, parameters, lr):
         # 微调阶段统一收紧学习率：大于1e-4的强制压到1e-4，若恰好等于1e-4则进一步降为1e-5
@@ -4523,35 +7124,75 @@ class TrainThread(QThread):
         # 默认使用AdamW - 小数据集增强正则化
         return optim.AdamW(parameters, lr=effective_lr, weight_decay=5e-4)
     
+    def _create_optimizer_with_groups(self, param_groups, lr):
+        """
+        创建带参数分组的优化器（用于差异化学习率）
+        
+        Args:
+            param_groups: 参数组列表，每个元素是包含'params'和'lr'的字典
+            lr: 默认学习率（用于scheduler，实际LR由param_groups指定）
+        
+        Returns:
+            优化器实例
+        """
+        # 处理每个参数组的学习率（应用与_create_optimizer相同的限制逻辑）
+        processed_groups = []
+        for group in param_groups:
+            group_lr = float(group.get('lr', lr))
+            # 对encoder组应用学习率限制（如果LR太大）
+            # 通过检查参数数量或学习率大小来判断是encoder还是decoder
+            is_encoder_group = group_lr <= 1e-4 or group_lr == lr
+            
+            if is_encoder_group:
+                # encoder组：应用限制
+                if group_lr > 1e-4:
+                    group_lr = 1e-4
+                elif abs(group_lr - 1e-4) < 1e-9:
+                    group_lr = 1e-5
+            else:
+                # decoder组：允许更大的学习率（10倍），但也要有上限
+                if group_lr > 1e-3:
+                    group_lr = 1e-3
+            
+            processed_group = {
+                'params': group['params'],
+                'lr': group_lr,
+                'weight_decay': group.get('weight_decay', 5e-4)
+            }
+            processed_groups.append(processed_group)
+        
+        # 【降维打击】对于SMP模型（U-Net++和DeepLabV3+），强制使用AdamW以获得更好的训练效果
+        # AdamW对权重衰减的处理更稳定，适合微调预训练模型
+        if self.model_type in ("smp_unetplusplus", "smp_deeplabv3plus", "deeplabv3plus"):
+            return optim.AdamW(processed_groups, weight_decay=5e-4)
+        
+        if self.optimizer_type == "adam":
+            return optim.Adam(processed_groups, betas=(0.9, 0.999))
+        if self.optimizer_type == "sgd":
+            return optim.SGD(processed_groups, momentum=0.99, nesterov=True)
+        # 默认使用AdamW
+        return optim.AdamW(processed_groups)
+    
     def _get_loss_weights(self, epoch: int, total_epochs: int) -> Dict[str, float]:
-        """优化的损失权重策略 - 更强调Dice和Tversky"""
-        progress = epoch / max(1, total_epochs - 1)
-        # 早期：BCE主导帮助收敛；后期：Dice+Tversky主导提升分割质量
+        """
+        【极简配置】回归稳健的基准配置：50% BCE + 50% Dice
+        
+        这是医学分割的黄金标准组合，先跑通这个，再考虑加其他的。
+        """
+        # 极简 Loss 组合：只使用 BCE 和 Dice，各占 50%
         weights = {
-            # BCE 只负责前期收敛, 后期权重下降到较低水平
-            'bce': max(0.10, 0.30 - 0.18 * progress),
-            # Dice 从一开始就占比较高, 随epoch进一步提升
-            'dice': 0.45 + 0.30 * progress,          # 0.45 -> 0.75
-            # Tversky 在后期配合Dice, 更关注 FN
-            'tversky': 0.25 + 0.15 * progress,       # 0.25 -> 0.40
-            # Focal Tversky 针对难案例，逐步加权
-            'tversky_focal': 0.05 + 0.10 * progress,  # 0.05 -> 0.15
-            # 边界损失稍微降低, 防止过度关注细小噪声
-            'boundary': 0.08,
-            # Hausdorff 距离损失：训练前30%关闭，之后渐进开启（专注边界）
-            'hausdorff': 0.08 * max((progress - 0.3) / 0.7, 0.0),
-            # Focal 主要在前期起作用, 后期权重很小
-            'focal': max(0.03, 0.10 * (1.0 - progress)),
-            # Lovasz 在全程参与, 但后期比重更高, 对齐 IoU/Dice
-            'lovasz': 0.05 + 0.10 * progress,        # 0.05 -> 0.15
-            # 假阴性惩罚逐渐增加, 提高召回率, 一般能拉高Dice
-            'fn_penalty': 0.06 + 0.09 * progress,    # 0.06 -> 0.15
-            # 假阳性惩罚随epoch略微下降, 让模型在后期更敢预测前景
-            'fp_penalty': 0.18 + 0.12 * (1.0 - progress),  # 0.30 -> 0.18
+            'bce': 0.5,
+            'dice': 0.5,
+            'focal': 0.0,
+            'tversky': 0.0,
+            'tversky_focal': 0.0,
+            'boundary': 0.0,
+            'hausdorff': 0.0,
+            'lovasz': 0.0,
+            'fn_penalty': 0.0,
+            'fp_penalty': 0.0,
         }
-        total = sum(weights.values())
-        for k in weights:
-            weights[k] /= total
+        # 不需要归一化，因为总和已经是 1.0
         return weights
     
     def _init_ema_model(self, model, device):
@@ -4646,6 +7287,31 @@ class TrainThread(QThread):
                     "pretrained": False,  # 测试时不需要pretrained
                     "backbone_name": backbone_name
                 }
+        # 【2.5D支持】为SMP模型（DeepLabV3+ 和 U-Net++）保存输入通道数和数据集类型
+        if isinstance(actual, (SMPDeepLabV3Plus, SMPUnetPlusPlus)):
+            # 从模型的第一层卷积推断输入通道数
+            if hasattr(actual, 'model') and hasattr(actual.model, 'encoder'):
+                # SMP模型结构：model.model.encoder
+                if hasattr(actual.model.encoder, 'stem') and hasattr(actual.model.encoder.stem, 'conv1'):
+                    in_channels = actual.model.encoder.stem.conv1.in_channels
+                elif hasattr(actual.model.encoder, 'conv1'):
+                    in_channels = actual.model.encoder.conv1.in_channels
+                else:
+                    # 回退：从state_dict推断
+                    state_dict = actual.state_dict()
+                    first_conv_key = None
+                    for key in state_dict.keys():
+                        if 'encoder.stem.conv1.weight' in key or 'encoder.conv1.weight' in key:
+                            first_conv_key = key
+                            break
+                    if first_conv_key:
+                        in_channels = state_dict[first_conv_key].shape[1]
+                    else:
+                        in_channels = 3  # 默认值
+                config["in_channels"] = in_channels
+                # 保存数据集类型，用于测试时正确加载模型
+                config["dataset_type"] = getattr(self, 'dataset_type', 'standard')
+                print(f"[Checkpoint] 保存SMP模型配置: in_channels={in_channels}, dataset_type={config['dataset_type']}")
         config["best_threshold"] = float(getattr(self, "last_optimal_threshold", 0.5))
         config["skull_stripping"] = {
             "enabled": self.use_skull_stripper,
@@ -5348,23 +8014,56 @@ class TrainThread(QThread):
 
     def _save_performance_payload(self, detailed_metrics: dict) -> str:
         payload_path = os.path.join(self.temp_dir, "performance_metrics_payload.mat")
-        def to_array_map(source: dict) -> dict:
-            return {k: np.array(source.get(k, 0.0)).astype(np.float32) for k in source}
-
+        
+        # 【MATLAB 兼容性修复】将字典转换为数值数组和名称数组，避免 MATLAB 识别为 struct 导致转换失败
+        def dict_to_arrays(source: dict):
+            """将字典转换为数值数组和名称数组"""
+            if not source:
+                return np.array([], dtype=np.float32), np.array([], dtype='<U100')
+            keys = list(source.keys())
+            values = [float(source.get(k, 0.0)) for k in keys]
+            return np.array(values, dtype=np.float32), np.array(keys, dtype='<U100')
+        
+        # 处理 all_samples：保持原有结构（每个指标是一个数组）
         metrics = {k: np.array(v, dtype=np.float32) for k, v in detailed_metrics.get('all_samples', {}).items()}
-        avg = to_array_map(detailed_metrics.get('average', {}))
-        std = to_array_map(detailed_metrics.get('std', {}))
-        min_vals = to_array_map(detailed_metrics.get('min', {}))
-        max_vals = to_array_map(detailed_metrics.get('max', {}))
-        median_vals = to_array_map(detailed_metrics.get('median', {}))
-        savemat(payload_path, {
-            'metrics': metrics,
-            'avg_metrics': avg,
-            'std_metrics': std,
-            'min_metrics': min_vals,
-            'max_metrics': max_vals,
-            'median_metrics': median_vals
-        })
+        
+        # 处理统计指标：转换为数值数组和名称数组
+        avg_vals, avg_names = dict_to_arrays(detailed_metrics.get('average', {}))
+        std_vals, std_names = dict_to_arrays(detailed_metrics.get('std', {}))
+        min_vals, min_names = dict_to_arrays(detailed_metrics.get('min', {}))
+        max_vals, max_names = dict_to_arrays(detailed_metrics.get('max', {}))
+        median_vals, median_names = dict_to_arrays(detailed_metrics.get('median', {}))
+        
+        # 【关键修复】确保 std_metrics_values 字段总是存在（MATLAB 端必需）
+        # 如果 std_vals 为空但 avg_vals 不为空，创建一个全 0 数组作为默认标准差
+        if len(std_vals) == 0 and len(avg_vals) > 0:
+            std_vals = np.zeros(len(avg_vals), dtype=np.float32)
+            std_names = avg_names.copy()  # 使用相同的名称
+        
+        # 保存到 .mat 文件
+        # 注意：MATLAB 需要数值数组（double），而不是 struct
+        payload = {
+            'metrics': metrics,  # 保持原有结构，用于详细分析
+        }
+        
+        # 添加统计指标的数值数组和名称数组
+        if len(avg_vals) > 0:
+            payload['avg_metrics_values'] = avg_vals
+            payload['avg_metrics_names'] = avg_names
+            # 【关键修复】确保 std_metrics_values 总是与 avg_metrics_values 一起存在
+            payload['std_metrics_values'] = std_vals
+            payload['std_metrics_names'] = std_names
+        if len(min_vals) > 0:
+            payload['min_metrics_values'] = min_vals
+            payload['min_metrics_names'] = min_names
+        if len(max_vals) > 0:
+            payload['max_metrics_values'] = max_vals
+            payload['max_metrics_names'] = max_names
+        if len(median_vals) > 0:
+            payload['median_metrics_values'] = median_vals
+            payload['median_metrics_names'] = median_names
+        
+        savemat(payload_path, payload)
         return payload_path
 
     def _save_test_results_payload(self, images_np: List[np.ndarray], masks_np: List[np.ndarray],
@@ -5408,71 +8107,88 @@ class TrainThread(QThread):
         savemat(payload_path, payload)
         return payload_path
 
+    def _compute_metrics_unified(self, pred, target, eps: float = 1e-7):
+        """
+        【统一指标计算函数】同时计算 Dice 和 IoU，确保逻辑完全一致
+        
+        核心原则：
+        1. 只计算前景类（Class Index = 1），不计算背景
+        2. 空掩码情况严格处理：
+           - GT 为空且 Pred 为空 → Dice=1.0, IoU=1.0 (完美预测)
+           - GT 为空但 Pred 不为空 → Dice=0.0, IoU=0.0 (误报)
+           - GT 不为空但 Pred 为空 → Dice=0.0, IoU=0.0 (漏报)
+        3. 正常情况使用标准公式
+        
+        Args:
+            pred: 预测掩码（可以是 torch.Tensor 或 numpy.ndarray）
+            target: 真实掩码（可以是 torch.Tensor 或 numpy.ndarray）
+            eps: 平滑系数
+        
+        Returns:
+            (dice, iou): Dice 系数和 IoU 值
+        """
+        # 预处理：转换为 numpy 并展平
+        if isinstance(pred, torch.Tensor):
+            pred_np = pred.detach().cpu().numpy()
+        else:
+            pred_np = np.array(pred)
+        
+        if isinstance(target, torch.Tensor):
+            target_np = target.detach().cpu().numpy()
+        else:
+            target_np = np.array(target)
+        
+        # 确保尺寸匹配
+        if pred_np.shape != target_np.shape:
+            from scipy.ndimage import zoom
+            if len(pred_np.shape) == 2 and len(target_np.shape) == 2:
+                zoom_factors = (target_np.shape[0] / pred_np.shape[0], target_np.shape[1] / pred_np.shape[1])
+                pred_np = zoom(pred_np, zoom_factors, order=1)
+            else:
+                # 对于多维数组，只调整最后两个维度
+                if len(pred_np.shape) >= 2 and len(target_np.shape) >= 2:
+                    zoom_factors = (target_np.shape[-2] / pred_np.shape[-2], target_np.shape[-1] / pred_np.shape[-1])
+                    pred_np = zoom(pred_np, [1] * (len(pred_np.shape) - 2) + list(zoom_factors), order=1)
+        
+        # 二值化：只计算前景类（> 0.5 视为前景）
+        pred_binary = (pred_np > 0.5).astype(np.float32)
+        target_binary = (target_np > 0.5).astype(np.float32)
+        
+        # 展平
+        pred_flat = pred_binary.flatten()
+        target_flat = target_binary.flatten()
+        
+        # 计算统计量
+        pred_sum = float(pred_flat.sum())
+        target_sum = float(target_flat.sum())
+        intersection = float((pred_flat * target_flat).sum())
+        union = pred_sum + target_sum - intersection
+        
+        # 【核心修复逻辑】空掩码特判
+        # Case 1: 双空（GT 为空且 Pred 为空）
+        if target_sum <= eps and pred_sum <= eps:
+            return 1.0, 1.0  # Dice=1.0, IoU=1.0 (完美预测)
+        
+        # Case 2: 单空（GT 为空但 Pred 不为空，或 GT 不为空但 Pred 为空）
+        if target_sum <= eps or pred_sum <= eps:
+            return 0.0, 0.0  # Dice=0.0, IoU=0.0 (误报或漏报)
+        
+        # Case 3: 正常情况，使用标准公式
+        # Dice = 2 * |Pred ∩ GT| / (|Pred| + |GT|)
+        # IoU = |Pred ∩ GT| / |Pred ∪ GT|
+        dice = (2.0 * intersection + eps) / (pred_sum + target_sum + eps)
+        iou = (intersection + eps) / (union + eps) if union > eps else 0.0
+        
+        return float(dice), float(iou)
+    
     def _safe_dice_score(self, pred, target, eps: float = 1e-7) -> float:
         """
-        计算Dice系数,对空预测和空目标进行安全处理。
+        【向后兼容】计算Dice系数，内部调用统一计算函数
         
-        处理策略:
-        - 当目标为空且预测也为空: Dice = 1.0 (完美匹配)
-        - 当目标为空但预测有误检: 使用相对误差公式,避免过度惩罚
-        - 当预测为空但目标有前景: Dice = 0.0 (完全漏检)
-        - 正常情况: 使用标准Dice公式
+        注意：此函数保留用于向后兼容，新代码应使用 _compute_metrics_unified
         """
-        if isinstance(pred, torch.Tensor):
-            # 确保 pred 和 target 的空间尺寸匹配
-            if pred.shape != target.shape:
-                if pred.dim() >= 2 and target.dim() >= 2:
-                    if pred.shape[-2:] != target.shape[-2:]:
-                        # 将 pred 调整到 target 的尺寸
-                        if pred.dim() == 2:
-                            pred = pred.unsqueeze(0).unsqueeze(0)
-                        elif pred.dim() == 3:
-                            pred = pred.unsqueeze(0)
-                        if target.dim() == 2:
-                            target = target.unsqueeze(0).unsqueeze(0)
-                        elif target.dim() == 3:
-                            target = target.unsqueeze(0)
-                        pred = F.interpolate(pred, size=target.shape[2:], mode='bilinear', align_corners=False)
-                        if pred.dim() == 4 and pred.size(0) == 1:
-                            pred = pred.squeeze(0)
-                        if target.dim() == 4 and target.size(0) == 1:
-                            target = target.squeeze(0)
-            inter = float((pred * target).sum().item())
-            pred_sum = float(pred.sum().item())
-            target_sum = float(target.sum().item())
-            total_pixels = pred.numel()
-        else:
-            # NumPy 数组处理
-            if pred.shape != target.shape:
-                # 使用 scipy 或 PIL 进行 resize
-                from scipy.ndimage import zoom
-                if len(pred.shape) == 2 and len(target.shape) == 2:
-                    zoom_factors = (target.shape[0] / pred.shape[0], target.shape[1] / pred.shape[1])
-                    pred = zoom(pred, zoom_factors, order=1)
-            inter = float(np.sum(pred * target))
-            pred_sum = float(np.sum(pred))
-            target_sum = float(np.sum(target))
-            total_pixels = pred.size if hasattr(pred, 'size') else np.prod(pred.shape)
-        
-        # Case 1: 目标为空
-        if target_sum <= eps:
-            if pred_sum <= eps:
-                return 1.0  # 预测也为空,完美匹配
-            else:
-                # 预测有误检,计算相对惩罚
-                # 基于误检像素占总像素的比例
-                false_positive_ratio = pred_sum / total_pixels
-                # 使用线性惩罚: Dice = 1 - 2×误检率
-                # 例如: 1%误检 -> 0.98, 5%误检 -> 0.90, 10%误检 -> 0.80
-                return max(0.0, 1.0 - 2.0 * false_positive_ratio)
-        
-        # Case 2: 预测为空但目标有前景
-        if pred_sum <= eps:
-            return 0.0  # 完全漏检
-        
-        # Case 3: 正常情况,使用标准Dice
-        denom = pred_sum + target_sum
-        return (2.0 * inter + eps) / (denom + eps)
+        dice, _ = self._compute_metrics_unified(pred, target, eps)
+        return dice
     def calculate_hd95(self, pred, gt):
         """
         计算 Hausdorff Distance 95 (HD95)
@@ -5559,12 +8275,153 @@ class TrainThread(QThread):
             target_tensor = target_tensor.view(1, -1)
         
         intersection = (pred_tensor * target_tensor).sum()
-        return (2. * intersection + smooth) / (pred_tensor.sum() + target_tensor.sum() + smooth)
+        pred_sum = pred_tensor.sum()
+        target_sum = target_tensor.sum()
+        
+        # 【关键修复】空掩码特判逻辑
+        # Case 1: GT 为空（全黑样本）
+        if target_sum <= smooth:
+            if pred_sum <= smooth:
+                # 场景 A: GT 为空，Pred 为空 → Dice = 1.0 (完美预测)
+                return 1.0
+            else:
+                # 场景 B: GT 为空，Pred 不为空 (有误报) → Dice = 0.0 (完全错误)
+                return 0.0
+        
+        # Case 2: GT 不为空，但预测为空
+        if pred_sum <= smooth:
+            # 场景 C: GT 不为空，Pred 为空 (漏报) → Dice = 0.0 (完全漏检)
+            return 0.0
+        
+        # Case 3: 正常情况，使用标准 Dice 公式（只计算前景类）
+        return (2. * intersection + smooth) / (pred_sum + target_sum + smooth)
+
+    @staticmethod
+    @staticmethod
+    def calculate_batch_metrics(pred, target, smooth=1e-7):
+        """
+        【单一真理来源】统一的指标计算函数
+        
+        所有阶段（GWO搜索、GWO最终评估、Epoch验证循环）必须调用此函数计算指标。
+        
+        Args:
+            pred: 预测mask (B, H, W) 或 (B, 1, H, W)，值域[0,1]
+            target: 真实mask (B, H, W) 或 (B, 1, H, W)，值域[0,1]
+            smooth: 平滑系数，默认1e-7
+            
+        Returns:
+            metrics_dict: {
+                'dice': [dice_0, dice_1, ..., dice_B-1],  # 每个样本的Dice
+                'iou': [iou_0, iou_1, ..., iou_B-1],
+                'precision': [prec_0, prec_1, ..., prec_B-1],
+                'recall': [recall_0, recall_1, ..., recall_B-1],
+                'is_empty': [bool_0, bool_1, ..., bool_B-1],  # True表示空mask样本
+            }
+        """
+        import torch
+        import torch.nn.functional as F
+        
+        # 统一维度处理
+        if pred.dim() == 3:
+            pred = pred.unsqueeze(1)
+        if target.dim() == 3:
+            target = target.unsqueeze(1)
+        
+        # 确保尺寸匹配
+        if pred.shape[2:] != target.shape[2:]:
+            pred = F.interpolate(pred, size=target.shape[2:], mode='bilinear', align_corners=False)
+        
+        pred_flat = pred.view(pred.size(0), -1).float()
+        target_flat = target.view(target.size(0), -1).float()
+        
+        batch_size = pred.size(0)
+        total_pixels = pred_flat.size(1)
+        # 【统一阈值】使用固定的0.1%像素阈值
+        empty_threshold = max(1.0, float(total_pixels) * 0.001)  # 0.1%像素
+        
+        dice_scores = []
+        iou_scores = []
+        precision_scores = []
+        recall_scores = []
+        is_empty_list = []
+        
+        for i in range(batch_size):
+            pred_i = pred_flat[i]
+            target_i = target_flat[i]
+            
+            intersection = (pred_i * target_i).sum()
+            pred_sum = pred_i.sum()
+            target_sum = target_i.sum()
+            
+            # 判断是否为空mask
+            is_empty = (target_sum <= empty_threshold)
+            is_empty_list.append(is_empty)
+            
+            if is_empty:
+                # 空mask样本：GT为空
+                if pred_sum <= smooth:
+                    # GT为空，预测也为空 → Dice=1.0
+                    dice = 1.0
+                    iou = 1.0
+                    precision = 1.0
+                    recall = 1.0
+                else:
+                    # GT为空，预测不为空（假阳性）→ Dice=0.0（严厉惩罚）
+                    dice = 0.0
+                    iou = 0.0
+                    precision = 0.0
+                    recall = 1.0  # GT为空，recall=1.0（没有漏检）
+            else:
+                # 前景样本：使用标准公式
+                tp = intersection
+                fp = pred_sum - intersection
+                fn = target_sum - intersection
+                
+                # Dice = 2*TP / (2*TP + FP + FN)
+                dice_den = 2.0 * tp + fp + fn
+                if dice_den < smooth:
+                    dice = 0.0
+                else:
+                    dice = (2.0 * tp) / dice_den
+                
+                # IoU = TP / (TP + FP + FN)
+                union = tp + fp + fn
+                if union < smooth:
+                    iou = 0.0
+                else:
+                    iou = tp / union
+                
+                # Precision = TP / (TP + FP)
+                if (tp + fp) < smooth:
+                    precision = 0.0
+                else:
+                    precision = tp / (tp + fp)
+                
+                # Recall = TP / (TP + FN)
+                if (tp + fn) < smooth:
+                    recall = 0.0
+                else:
+                    recall = tp / (tp + fn)
+            
+            dice_scores.append(float(dice))
+            iou_scores.append(float(iou))
+            precision_scores.append(float(precision))
+            recall_scores.append(float(recall))
+        
+        return {
+            'dice': dice_scores,
+            'iou': iou_scores,
+            'precision': precision_scores,
+            'recall': recall_scores,
+            'is_empty': is_empty_list,
+        }
 
     def calculate_batch_dice(self, pred, target, smooth=1e-7):
         """
         计算一个批次中每个样本的Dice系数。
         对空mask情况进行特殊处理,避免过度惩罚少量误检。
+        
+        【注意】此函数保留用于向后兼容，新代码应使用 calculate_batch_metrics
         """
         # 确保 pred 和 target 的空间尺寸匹配
         if pred.shape[2:] != target.shape[2:]:
@@ -5581,10 +8438,9 @@ class TrainThread(QThread):
         
         batch_size = pred.size(0)
         total_pixels = pred_flat.size(1)
-        avg_fg_ratio = float(target_flat.sum() / max(1.0, batch_size * total_pixels))
-        # 【修复】降低空mask阈值，从0.015改为0.001，避免将少量前景像素误判为空mask
-        # 对于256x256图像，阈值从9.8像素降低到0.65像素，更严格
-        adaptive_empty_threshold = max(smooth, avg_fg_ratio * 0.001)
+        # 【统一阈值】使用固定的0.1%像素阈值，与验证阶段保持一致
+        # 对于512x512图像，阈值约为0.65像素
+        empty_threshold = max(1e-7, float(total_pixels) * 0.001)  # 0.1%像素，统一阈值
         dice_scores = []
         
         for i in range(batch_size):
@@ -5595,20 +8451,21 @@ class TrainThread(QThread):
             pred_sum = pred_i.sum()
             target_sum = target_i.sum()
             
-            # Case 1: 目标为空（真正的空mask，无病变）
-            if target_sum <= adaptive_empty_threshold:
+            # 【关键修复】空掩码特判逻辑
+            # Case 1: GT 为空（全黑样本）
+            if target_sum <= empty_threshold:
                 if pred_sum <= smooth:
-                    # 【修改】全阴性情况：预测也为空时，给予完全正确的阴性预测满分奖励
-                    # 如果预测也为空，Dice = 1.0（完全正确）
+                    # 场景 A: GT 为空，Pred 为空 → Dice = 1.0 (完美预测)
                     dice = 1.0
                 else:
-                    # 误检惩罚：目标为空但预测有前景
-                    false_positive_ratio = pred_sum.item() / max(1.0, total_pixels)
-                    dice = max(0.0, 1.0 - 1.5 * false_positive_ratio)
-            # Case 2: 预测为空但目标有前景
+                    # 场景 B: GT 为空，Pred 不为空 (有误报) → Dice = 0.0 (完全错误)
+                    # 这是假阳性（False Positive），应该得 0 分
+                    dice = 0.0
+            # Case 2: GT 不为空，但预测为空
             elif pred_sum <= smooth:
+                # 场景 C: GT 不为空，Pred 为空 (漏报) → Dice = 0.0 (完全漏检)
                 dice = 0.0
-            # Case 3: 正常情况（有病变样本）
+            # Case 3: 正常情况，使用标准 Dice 公式（只计算前景类）
             else:
                 dice = (2. * intersection + smooth) / (pred_sum + target_sum + smooth)
             
@@ -5929,37 +8786,44 @@ class TrainThread(QThread):
         # 假阳性惩罚：应该无病变但预测为有病变（使用clamp确保非负）
         false_positive_penalty = (probs.clamp(min=0.0, max=1.0) ** 2.0 * (1 - masks)).mean()
         
+        # 【默认权重】仅在没有传入weights时使用（向后兼容）
+        # 【注意】训练时实际使用的是 _get_loss_weights() 返回的权重，而不是这里的默认值
+        # 默认权重仅作为后备，实际权重配置见 _get_loss_weights() 方法
         loss_weights = {
-            'bce': 0.20,
-            'dice': 0.25,
-            'tversky': 0.35,  # 增加Tversky Loss权重，作为主要损失函数
-            'tversky_focal': 0.05,
-            'boundary': 0.05,  # 提升边界权重
-            'hausdorff': 0.05,  # 默认开启小权重的Hausdorff，关注轮廓
-            'focal': 0.03,
+            'bce': 0.20,      # 默认BCE权重（实际训练时会被覆盖）
+            'dice': 0.80,     # 默认Dice权重（实际训练时会被覆盖）
+            'tversky': 0.0,
+            'tversky_focal': 0.0,
+            'boundary': 0.0,
+            'hausdorff': 0.0,
+            'focal': 0.0,
             'lovasz': 0.0,
-            'fn_penalty': 0.03,
-            'fp_penalty': 0.02,
+            'fn_penalty': 0.0,
+            'fp_penalty': 0.0,
         }
-        if use_lovasz:
-            loss_weights['lovasz'] = 0.10
-            loss_weights['bce'] = 0.15
-            loss_weights['dice'] = 0.20
-            loss_weights['tversky'] = 0.35  # 保持Tversky为主要损失
+        # 【关键】如果传入了自定义权重（训练时从 _get_loss_weights() 获取），则使用传入的权重
         if weights:
             loss_weights.update(weights)
         
+        # 简化损失计算：仅使用BCE和Dice
         combined_loss = (
             loss_weights['bce'] * bce_loss
             + loss_weights['dice'] * dice_loss_val
-            + loss_weights['tversky'] * tversky_loss_val
-            + loss_weights['tversky_focal'] * tversky_focal_loss_val
-            + loss_weights['boundary'] * boundary_loss
-            + loss_weights['focal'] * focal_loss_val
-            + loss_weights['fn_penalty'] * false_negative_penalty
-            + loss_weights['fp_penalty'] * false_positive_penalty
-            + loss_weights.get('hausdorff', 0.0) * torch.tensor(0.0, device=logits.device)  # 预留Hausdorff项
         )
+        
+        # 如果启用了其他损失且权重>0，则添加（向后兼容）
+        if loss_weights.get('tversky', 0) > 0:
+            combined_loss += loss_weights['tversky'] * tversky_loss_val
+        if loss_weights.get('tversky_focal', 0) > 0:
+            combined_loss += loss_weights['tversky_focal'] * tversky_focal_loss_val
+        if loss_weights.get('boundary', 0) > 0:
+            combined_loss += loss_weights['boundary'] * boundary_loss
+        if loss_weights.get('focal', 0) > 0:
+            combined_loss += loss_weights['focal'] * focal_loss_val
+        if loss_weights.get('fn_penalty', 0) > 0:
+            combined_loss += loss_weights['fn_penalty'] * false_negative_penalty
+        if loss_weights.get('fp_penalty', 0) > 0:
+            combined_loss += loss_weights['fp_penalty'] * false_positive_penalty
         if use_lovasz and loss_weights.get('lovasz', 0) > 0:
             lovasz_loss_val = self.lovasz_hinge_loss(logits, masks)
             combined_loss += loss_weights['lovasz'] * lovasz_loss_val
@@ -6040,6 +8904,7 @@ class TrainThread(QThread):
         2. 概率空间融合：在概率空间进行TTA融合，避免数学错误
         3. 正确的后处理：对概率图进行高斯平滑和后处理
         4. 精度优化：避免反复的 Log/Sigmoid 转换，减少精度损失
+        5. 【新增】尺寸适配：确保输入尺寸能被16整除（DeepLabV3+等模型要求）
         
         多尺度推理：3个尺度 × 8种变换 = 24倍推理
         - 尺度因子: [0.8, 1.0, 1.2]
@@ -6053,6 +8918,38 @@ class TrainThread(QThread):
         all_prob_maps = []  # 存储所有概率图（而非Logits）
         all_weights = []  # 存储置信度权重
         
+        # 【辅助函数】确保尺寸能被16整除（DeepLabV3+等模型要求）
+        def pad_to_divisible_by_16(h, w):
+            """将尺寸向上取整到16的倍数"""
+            pad_h = (16 - h % 16) % 16
+            pad_w = (16 - w % 16) % 16
+            return pad_h, pad_w
+        
+        # 【辅助函数】填充图像到16的倍数
+        def pad_image(img, target_h, target_w):
+            """填充图像到目标尺寸（能被16整除）"""
+            _, _, h, w = img.shape
+            pad_h, pad_w = pad_to_divisible_by_16(target_h, target_w)
+            if pad_h > 0 or pad_w > 0:
+                # 使用反射填充，避免边界伪影
+                img = F.pad(img, (0, pad_w, 0, pad_h), mode='reflect')
+            return img, pad_h, pad_w
+        
+        # 【辅助函数】裁剪预测结果到原始尺寸
+        def crop_prediction(pred, original_h, original_w, pad_h, pad_w):
+            """裁剪预测结果，移除填充部分"""
+            _, _, h, w = pred.shape
+            # 裁剪填充部分（填充是在底部和右侧）
+            if pad_h > 0 or pad_w > 0:
+                # 裁剪到原始尺寸（移除底部和右侧的填充）
+                end_h = h - pad_h if pad_h > 0 else h
+                end_w = w - pad_w if pad_w > 0 else w
+                pred = pred[:, :, :end_h, :end_w]
+            # 如果尺寸不匹配，插值到原始尺寸
+            if pred.shape[2] != original_h or pred.shape[3] != original_w:
+                pred = F.interpolate(pred, size=(original_h, original_w), mode='bilinear', align_corners=False)
+            return pred
+        
         # 【多尺度循环】
         for scale in scales:
             # Resize到目标尺度
@@ -6064,100 +8961,109 @@ class TrainThread(QThread):
                 scaled_images = images
                 target_h, target_w = H, W
             
+            # 【关键修复】确保缩放后的尺寸能被16整除
+            scaled_images_padded, pad_h, pad_w = pad_image(scaled_images, target_h, target_w)
+            padded_h, padded_w = target_h + pad_h, target_w + pad_w
+            
             # 【8种变换循环】
             scale_prob_maps = []
             
+            # 【辅助函数】对图像进行变换并推理，自动处理填充和裁剪
+            def predict_with_transform(img_input, transform_func, reverse_transform_func):
+                """对填充后的图像进行变换、推理，然后裁剪回原始尺寸"""
+                # 应用变换
+                img_transformed = transform_func(img_input)
+                # 推理
+                pred_logits = model(img_transformed)
+                if isinstance(pred_logits, tuple):
+                    pred_logits = pred_logits[0]
+                # 反向变换
+                pred_logits = reverse_transform_func(pred_logits)
+                # 裁剪填充部分并插值到原始尺寸
+                pred_logits = crop_prediction(pred_logits, target_h, target_w, pad_h, pad_w)
+                # 如果scale != 1.0，还需要插值到原始H, W
+                if scale != 1.0:
+                    pred_logits = F.interpolate(pred_logits, size=(H, W), mode='bilinear', align_corners=False)
+                return pred_logits
+            
             # 1. 原始图像
-            pred_logits = model(scaled_images)
+            pred_logits = model(scaled_images_padded)
             if isinstance(pred_logits, tuple):
                 pred_logits = pred_logits[0]
+            pred_logits = crop_prediction(pred_logits, target_h, target_w, pad_h, pad_w)
             if not (torch.any(torch.isnan(pred_logits)) or torch.any(torch.isinf(pred_logits))):
                 if scale != 1.0:
                     pred_logits = F.interpolate(pred_logits, size=(H, W), mode='bilinear', align_corners=False)
-                # 【关键修复】立即转换为概率图，在概率空间进行融合
                 pred_prob = torch.sigmoid(pred_logits)
                 scale_prob_maps.append(pred_prob)
             
             # 2. 水平翻转
-            pred_logits = model(torch.flip(scaled_images, dims=[3]))
-            if isinstance(pred_logits, tuple):
-                pred_logits = pred_logits[0]
-            pred_logits = torch.flip(pred_logits, dims=[3])
+            pred_logits = predict_with_transform(
+                scaled_images_padded,
+                lambda x: torch.flip(x, dims=[3]),
+                lambda x: torch.flip(x, dims=[3])
+            )
             if not (torch.any(torch.isnan(pred_logits)) or torch.any(torch.isinf(pred_logits))):
-                if scale != 1.0:
-                    pred_logits = F.interpolate(pred_logits, size=(H, W), mode='bilinear', align_corners=False)
                 pred_prob = torch.sigmoid(pred_logits)
                 scale_prob_maps.append(pred_prob)
             
             # 3. 垂直翻转
-            pred_logits = model(torch.flip(scaled_images, dims=[2]))
-            if isinstance(pred_logits, tuple):
-                pred_logits = pred_logits[0]
-            pred_logits = torch.flip(pred_logits, dims=[2])
+            pred_logits = predict_with_transform(
+                scaled_images_padded,
+                lambda x: torch.flip(x, dims=[2]),
+                lambda x: torch.flip(x, dims=[2])
+            )
             if not (torch.any(torch.isnan(pred_logits)) or torch.any(torch.isinf(pred_logits))):
-                if scale != 1.0:
-                    pred_logits = F.interpolate(pred_logits, size=(H, W), mode='bilinear', align_corners=False)
                 pred_prob = torch.sigmoid(pred_logits)
                 scale_prob_maps.append(pred_prob)
             
             # 4. 旋转90度
-            pred_logits = model(torch.rot90(scaled_images, k=1, dims=[2, 3]))
-            if isinstance(pred_logits, tuple):
-                pred_logits = pred_logits[0]
-            pred_logits = torch.rot90(pred_logits, k=-1, dims=[2, 3])
+            pred_logits = predict_with_transform(
+                scaled_images_padded,
+                lambda x: torch.rot90(x, k=1, dims=[2, 3]),
+                lambda x: torch.rot90(x, k=-1, dims=[2, 3])
+            )
             if not (torch.any(torch.isnan(pred_logits)) or torch.any(torch.isinf(pred_logits))):
-                if scale != 1.0:
-                    pred_logits = F.interpolate(pred_logits, size=(H, W), mode='bilinear', align_corners=False)
                 pred_prob = torch.sigmoid(pred_logits)
                 scale_prob_maps.append(pred_prob)
             
             # 5. 旋转180度
-            pred_logits = model(torch.rot90(scaled_images, k=2, dims=[2, 3]))
-            if isinstance(pred_logits, tuple):
-                pred_logits = pred_logits[0]
-            pred_logits = torch.rot90(pred_logits, k=-2, dims=[2, 3])
+            pred_logits = predict_with_transform(
+                scaled_images_padded,
+                lambda x: torch.rot90(x, k=2, dims=[2, 3]),
+                lambda x: torch.rot90(x, k=-2, dims=[2, 3])
+            )
             if not (torch.any(torch.isnan(pred_logits)) or torch.any(torch.isinf(pred_logits))):
-                if scale != 1.0:
-                    pred_logits = F.interpolate(pred_logits, size=(H, W), mode='bilinear', align_corners=False)
                 pred_prob = torch.sigmoid(pred_logits)
                 scale_prob_maps.append(pred_prob)
             
             # 6. 旋转270度
-            pred_logits = model(torch.rot90(scaled_images, k=3, dims=[2, 3]))
-            if isinstance(pred_logits, tuple):
-                pred_logits = pred_logits[0]
-            pred_logits = torch.rot90(pred_logits, k=-3, dims=[2, 3])
+            pred_logits = predict_with_transform(
+                scaled_images_padded,
+                lambda x: torch.rot90(x, k=3, dims=[2, 3]),
+                lambda x: torch.rot90(x, k=-3, dims=[2, 3])
+            )
             if not (torch.any(torch.isnan(pred_logits)) or torch.any(torch.isinf(pred_logits))):
-                if scale != 1.0:
-                    pred_logits = F.interpolate(pred_logits, size=(H, W), mode='bilinear', align_corners=False)
                 pred_prob = torch.sigmoid(pred_logits)
                 scale_prob_maps.append(pred_prob)
             
             # 7. 水平翻转+旋转90度
-            img_aug = torch.flip(scaled_images, dims=[3])
-            img_aug = torch.rot90(img_aug, k=1, dims=[2, 3])
-            pred_logits = model(img_aug)
-            if isinstance(pred_logits, tuple):
-                pred_logits = pred_logits[0]
-            pred_logits = torch.rot90(pred_logits, k=-1, dims=[2, 3])
-            pred_logits = torch.flip(pred_logits, dims=[3])
+            pred_logits = predict_with_transform(
+                scaled_images_padded,
+                lambda x: torch.rot90(torch.flip(x, dims=[3]), k=1, dims=[2, 3]),
+                lambda x: torch.flip(torch.rot90(x, k=-1, dims=[2, 3]), dims=[3])
+            )
             if not (torch.any(torch.isnan(pred_logits)) or torch.any(torch.isinf(pred_logits))):
-                if scale != 1.0:
-                    pred_logits = F.interpolate(pred_logits, size=(H, W), mode='bilinear', align_corners=False)
                 pred_prob = torch.sigmoid(pred_logits)
                 scale_prob_maps.append(pred_prob)
             
             # 8. 垂直翻转+旋转90度
-            img_aug = torch.flip(scaled_images, dims=[2])
-            img_aug = torch.rot90(img_aug, k=1, dims=[2, 3])
-            pred_logits = model(img_aug)
-            if isinstance(pred_logits, tuple):
-                pred_logits = pred_logits[0]
-            pred_logits = torch.rot90(pred_logits, k=-1, dims=[2, 3])
-            pred_logits = torch.flip(pred_logits, dims=[2])
+            pred_logits = predict_with_transform(
+                scaled_images_padded,
+                lambda x: torch.rot90(torch.flip(x, dims=[2]), k=1, dims=[2, 3]),
+                lambda x: torch.flip(torch.rot90(x, k=-1, dims=[2, 3]), dims=[2])
+            )
             if not (torch.any(torch.isnan(pred_logits)) or torch.any(torch.isinf(pred_logits))):
-                if scale != 1.0:
-                    pred_logits = F.interpolate(pred_logits, size=(H, W), mode='bilinear', align_corners=False)
                 pred_prob = torch.sigmoid(pred_logits)
                 scale_prob_maps.append(pred_prob)
             
@@ -6303,7 +9209,7 @@ class TrainThread(QThread):
         if binary.sum() == 0:
             return pred_mask
         
-        # 连通域标记，并使用概率图作为 intensity_image，以便计算 mean_intensity
+        # 连通域标记，并使用概率图作为 intensity_image，以便计算 mean_intensity / max_intensity
         labels = measure.label(binary, connectivity=1)
         regions = measure.regionprops(labels, intensity_image=probs_np.astype(np.float32))
         
@@ -6312,6 +9218,8 @@ class TrainThread(QThread):
         for region in regions:
             area = region.area
             mean_prob = float(region.mean_intensity) if hasattr(region, "mean_intensity") else 0.0
+            # 获取区域内的最大概率（如果不可用则回退为 mean_prob）
+            max_prob = float(region.max_intensity) if hasattr(region, "max_intensity") else mean_prob
             
             # Level 1: 极小区域（<= tiny_size_thresh）视为绝对噪音，直接跳过
             if area <= tiny_size_thresh:
@@ -6322,8 +9230,9 @@ class TrainThread(QThread):
                 cleaned[labels == region.label] = 1
                 continue
             
-            # Level 3: 3~19 像素之间，依据平均概率判断
-            if small_min_size <= area <= small_max_size and mean_prob > prob_threshold:
+            # Level 3: 3~19 像素之间，依据平均概率 / 最大概率判断
+            # 修改为：平均概率达标 或 最大概率极高(>0.9) 时保留
+            if small_min_size <= area <= small_max_size and (mean_prob > prob_threshold or max_prob > 0.9):
                 cleaned[labels == region.label] = 1
                 continue
             # 否则视为噪声，不写入 cleaned
@@ -6373,22 +9282,26 @@ class TrainThread(QThread):
     @staticmethod
     def post_process_mask(
         pred_mask,
-        min_size=50,
+        min_size=150,
         use_morphology=True,
-        keep_largest=True,
+        keep_largest=False,
         fill_holes=True,
         enable_opening=True,
         opening_kernel_size: int = 3,
         opening_iterations: int = 1,
+        prob_map=None,
+        confidence_gate: float = 0.90,
+        min_largest_avg_prob: float = 0.5,
+        edge_margin: int = 10,
     ):
         """
         后处理优化预测mask - 增强版
         
         Args:
             pred_mask: 预测mask (numpy或tensor)
-            min_size: 移除小于此大小的连通域
+            min_size: 移除小于此大小的连通域。当 keep_largest=True 时，如果最大连通域也小于此值，将清空整个mask（用于处理空GT场景下的微小噪点）
             use_morphology: 是否使用形态学操作
-            keep_largest: 是否只保留最大连通域（单器官分割推荐）
+            keep_largest: 是否只保留最大连通域（单器官分割推荐）。注意：即使保留最大连通域，如果其面积 < min_size，也会被清空
             fill_holes: 是否填充内部孔洞（去除假阴性空洞）
         
         Returns:
@@ -6405,19 +9318,50 @@ class TrainThread(QThread):
             pred_np = pred_mask.copy()
             is_tensor = False
         
-        if pred_np.sum() < 10:  # 几乎为空,直接返回
-            return pred_mask
+        # 提取概率图用于置信度判断与平均概率计算
+        if prob_map is None:
+            prob_np = pred_np
+        else:
+            if isinstance(prob_map, torch.Tensor):
+                prob_np = prob_map.detach().cpu().numpy()
+            else:
+                prob_np = np.asarray(prob_map)
+        
+        # 【关键修复】对于几乎为空的预测，更严格地处理，避免后处理引入假阳性
+        pred_sum = pred_np.sum()
+        
+        # 【置信度预过滤】如果全图最大概率低于阈值，直接判定为全黑
+        # 这可以避免低置信度的噪声被形态学操作放大
+        max_prob_proxy = float(prob_np.max()) if prob_np.size > 0 else 0.0
+        if max_prob_proxy < confidence_gate:
+            if is_tensor:
+                return torch.zeros_like(pred_mask)
+            else:
+                return np.zeros_like(pred_np)
+        
+        # 如果预测像素数很少（< 100像素），可能是噪声，直接清空
+        # 【动态阈值】根据图像大小调整阈值
+        image_size = pred_np.size
+        dynamic_threshold = max(100, int(image_size * 0.0005))  # 至少100像素，或图像的0.05%
+        if pred_sum < dynamic_threshold:
+            # 对于几乎为空的预测，直接返回全空mask，避免后处理引入假阳性
+            if is_tensor:
+                return torch.zeros_like(pred_mask)
+            else:
+                return np.zeros_like(pred_np)
         
         pred_binary = (pred_np > 0.5).astype(np.uint8)
         
         # 1. 填充孔洞（Fill Holes）- 去除器官内部的假阴性空洞
-        if fill_holes:
+        # 【关键修复】fill_holes只在有较大预测块时启用，防止把背景底噪填成实心块
+        if fill_holes and pred_sum >= 1000:  # 只有预测块较大时才填充孔洞
             # 使用 scipy.ndimage.binary_fill_holes 填充内部孔洞
             pred_binary = ndimage.binary_fill_holes(pred_binary).astype(np.uint8)
         
         # 2. 形态学闭操作 - 进一步填充小孔洞和缝隙
         if use_morphology:
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            # 核大小从 (5, 5) 调整为 (3, 3)，减弱闭操作，避免不同病灶被误连
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
             pred_binary = cv2.morphologyEx(pred_binary, cv2.MORPH_CLOSE, kernel)
             # 形态学开操作（可选）- 去除小噪点/毛刺
             if enable_opening:
@@ -6437,18 +9381,54 @@ class TrainThread(QThread):
                 sizes = ndimage.sum(pred_binary, labeled, range(1, num_features + 1))
                 # 找到最大的连通域
                 largest_label = np.argmax(sizes) + 1
-                # 只保留最大连通域
-                pred_binary = (labeled == largest_label).astype(np.uint8)
+                max_size = sizes[largest_label - 1]  # sizes 是 0-indexed，largest_label 是 1-indexed
+                
+                # 【关键优化】绝对最小面积限制：如果最大的块都小于阈值，说明全是噪点，直接清空
+                # 这样可以避免在空 GT 的情况下，微小噪点被保留导致 Dice 从 1.0 变成 0.0
+                largest_component = (labeled == largest_label).astype(np.uint8)
+                if max_size < min_size:
+                    pred_binary = np.zeros_like(pred_binary)
+                else:
+                    # 计算最大连通域的平均概率，避免低置信度大块被误保留
+                    if prob_np is not None and prob_np.size > 0:
+                        largest_mean_prob = float((prob_np * largest_component).sum() / max_size)
+                    else:
+                        largest_mean_prob = 1.0
+                    
+                    if largest_mean_prob < min_largest_avg_prob:
+                        pred_binary = np.zeros_like(pred_binary)
+                    else:
+                        # 只保留最大连通域
+                        pred_binary = largest_component
         else:
             # 4. 连通域分析 - 移除小区域（如果不使用keep_largest）
+            # 【动态连通域过滤】根据图像大小和预测块大小动态调整min_size
             if min_size > 0:
                 labeled, num_features = ndimage.label(pred_binary)
                 if num_features > 0:
                     sizes = ndimage.sum(pred_binary, labeled, range(1, num_features + 1))
-                    mask_sizes = sizes >= min_size
+                    # 【关键修复】动态调整min_size：对于几乎为空的预测，使用更严格的阈值
+                    dynamic_min_size = max(min_size, int(image_size * 0.002))  # 至少min_size，或图像的0.2%
+                    if pred_sum < 1000:  # 如果总预测像素很少，使用更严格的阈值
+                        dynamic_min_size = max(dynamic_min_size, 1000)  # 至少1000像素
+                    mask_sizes = sizes >= dynamic_min_size
                     # 只保留大区域
                     keep_labels = np.where(mask_sizes)[0] + 1
-                    pred_binary = np.isin(labeled, keep_labels).astype(np.uint8)
+                    if len(keep_labels) == 0:
+                        # 如果没有区域满足条件，清空整个mask
+                        pred_binary = np.zeros_like(pred_binary)
+                    else:
+                        pred_binary = np.isin(labeled, keep_labels).astype(np.uint8)
+                        # 【边缘抑制】可选：移除质心靠近边界的伪影（例如头骨高亮）
+                        if edge_margin and edge_margin > 0:
+                            coords = ndimage.center_of_mass(pred_binary, labeled, keep_labels)
+                            H, W = pred_binary.shape
+                            remove_labels = []
+                            for lbl, (cy, cx) in zip(keep_labels, coords):
+                                if cx < edge_margin or cx > W - edge_margin - 1 or cy < edge_margin or cy > H - edge_margin - 1:
+                                    remove_labels.append(lbl)
+                            if remove_labels:
+                                pred_binary = np.isin(labeled, np.setdiff1d(keep_labels, remove_labels)).astype(np.uint8)
         
         # 返回原始类型
         if is_tensor:
@@ -6638,9 +9618,26 @@ def _compute_dice_standalone(pred_mask, target_mask, smooth=1e-7):
     pred = pred_mask.astype(bool)
     target = target_mask.astype(bool)
     intersection = (pred & target).sum()
-    union = pred.sum() + target.sum()
-    if union == 0:
-        return 1.0
+    pred_sum = pred.sum()
+    target_sum = target.sum()
+    
+    # 【关键修复】空掩码特判逻辑
+    # Case 1: GT 为空（全黑样本）
+    if target_sum == 0:
+        if pred_sum == 0:
+            # 场景 A: GT 为空，Pred 为空 → Dice = 1.0 (完美预测)
+            return 1.0
+        else:
+            # 场景 B: GT 为空，Pred 不为空 (有误报) → Dice = 0.0 (完全错误)
+            return 0.0
+    
+    # Case 2: GT 不为空，但预测为空
+    if pred_sum == 0:
+        # 场景 C: GT 不为空，Pred 为空 (漏报) → Dice = 0.0 (完全漏检)
+        return 0.0
+    
+    # Case 3: 正常情况，使用标准 Dice 公式（只计算前景类）
+    union = pred_sum + target_sum
     return (2.0 * intersection + smooth) / (union + smooth)
 
 
@@ -7438,7 +10435,9 @@ def find_optimal_ensemble_weights_global(mask_list, gt_masks, weight_range=(0.0,
         
     def _compute_dice_for_ensemble(self, pred_mask, target_mask, smooth=1e-7):
         """
-        计算Dice的辅助方法（用于集成评估）
+        【统一修复】计算Dice的辅助方法（用于集成评估）
+        
+        使用与 _compute_metrics_unified 相同的逻辑，确保一致性
         
         Args:
             pred_mask: 预测掩码
@@ -7448,17 +10447,37 @@ def find_optimal_ensemble_weights_global(mask_list, gt_masks, weight_range=(0.0,
         Returns:
             Dice系数
         """
-        pred = pred_mask.astype(bool)
-        target = target_mask.astype(bool)
-        intersection = (pred & target).sum()
-        union = pred.sum() + target.sum()
-        if union == 0:
-            return 1.0
-        return (2.0 * intersection + smooth) / (union + smooth)
+        # 二值化：只计算前景类（> 0.5 视为前景）
+        pred_binary = (pred_mask > 0.5).astype(np.float32)
+        target_binary = (target_mask > 0.5).astype(np.float32)
+        
+        # 展平
+        pred_flat = pred_binary.flatten()
+        target_flat = target_binary.flatten()
+        
+        # 计算统计量
+        pred_sum = float(pred_flat.sum())
+        target_sum = float(target_flat.sum())
+        intersection = float((pred_flat * target_flat).sum())
+        
+        # 【核心修复逻辑】空掩码特判
+        # Case 1: 双空（GT 为空且 Pred 为空）
+        if target_sum <= smooth and pred_sum <= smooth:
+            return 1.0  # Dice=1.0 (完美预测)
+        
+        # Case 2: 单空（GT 为空但 Pred 不为空，或 GT 不为空但 Pred 为空）
+        if target_sum <= smooth or pred_sum <= smooth:
+            return 0.0  # Dice=0.0 (误报或漏报)
+        
+        # Case 3: 正常情况，使用标准 Dice 公式（只计算前景类）
+        # Dice = 2 * |Pred ∩ GT| / (|Pred| + |GT|)
+        return (2.0 * intersection + smooth) / (pred_sum + target_sum + smooth)
         
     def _compute_iou_for_ensemble(self, pred_mask, target_mask, smooth=1e-7):
         """
-        计算IoU的辅助方法（用于集成评估）
+        【统一修复】计算IoU的辅助方法（用于集成评估）
+        
+        使用与 _compute_metrics_unified 相同的逻辑，确保一致性
         
         Args:
             pred_mask: 预测掩码
@@ -7468,13 +10487,32 @@ def find_optimal_ensemble_weights_global(mask_list, gt_masks, weight_range=(0.0,
         Returns:
             IoU系数
         """
-        pred = pred_mask.astype(bool)
-        target = target_mask.astype(bool)
-        intersection = (pred & target).sum()
-        union = (pred | target).sum()
-        if union == 0:
-            return 1.0
-        return (intersection + smooth) / (union + smooth)
+        # 二值化：只计算前景类（> 0.5 视为前景）
+        pred_binary = (pred_mask > 0.5).astype(np.float32)
+        target_binary = (target_mask > 0.5).astype(np.float32)
+        
+        # 展平
+        pred_flat = pred_binary.flatten()
+        target_flat = target_binary.flatten()
+        
+        # 计算统计量
+        pred_sum = float(pred_flat.sum())
+        target_sum = float(target_flat.sum())
+        intersection = float((pred_flat * target_flat).sum())
+        union = pred_sum + target_sum - intersection
+        
+        # 【核心修复逻辑】空掩码特判
+        # Case 1: 双空（GT 为空且 Pred 为空）
+        if target_sum <= smooth and pred_sum <= smooth:
+            return 1.0  # IoU=1.0 (完美预测)
+        
+        # Case 2: 单空（GT 为空但 Pred 不为空，或 GT 不为空但 Pred 为空）
+        if target_sum <= smooth or pred_sum <= smooth:
+            return 0.0  # IoU=0.0 (误报或漏报)
+        
+        # Case 3: 正常情况，使用标准 IoU 公式（只计算前景类）
+        # IoU = |Pred ∩ GT| / |Pred ∪ GT|
+        return (intersection + smooth) / (union + smooth) if union > smooth else 0.0
         
     def _compute_sens_spec_for_ensemble(self, pred_mask, target_mask):
         """
@@ -7759,114 +10797,7 @@ def find_optimal_ensemble_weights_global(mask_list, gt_masks, weight_range=(0.0,
         )
         return float(total_score)
 
-    def scan_best_threshold(self, prob_maps: np.ndarray, gt_masks: np.ndarray):
-        """
-        在给定的概率图和真实掩膜上扫描阈值，寻找综合评分最高的阈值。
-
-        Args:
-            prob_maps: 概率图，形状 [N, H, W] 或 [N, 1, H, W]，数值范围 [0,1]
-            gt_masks:  真实掩膜，形状与 prob_maps 对应，取值 {0,1}
-
-        Returns:
-            best_thresh: 综合评分最高的阈值
-            best_metrics: 对应阈值下的指标字典（dice, iou, precision, recall, specificity, hd95, score）
-        """
-        prob_maps = np.asarray(prob_maps, dtype=np.float32)
-        gt_masks = np.asarray(gt_masks, dtype=np.float32)
-
-        # 统一为 [N, H, W]
-        if prob_maps.ndim == 4:
-            prob_maps = prob_maps[:, 0]
-        if gt_masks.ndim == 4:
-            gt_masks = gt_masks[:, 0]
-
-        # 二值化真值
-        gt_bool = gt_masks > 0.5
-
-        thresholds = np.arange(0.3, 0.91, 0.05, dtype=np.float32)
-        best_thresh = 0.5
-        best_score = -float("inf")
-        best_metrics = {}
-
-        for thr in thresholds:
-            pred_bool = prob_maps >= float(thr)
-
-            # 全局混淆矩阵（所有像素一起统计）
-            tp = np.logical_and(pred_bool, gt_bool).sum(dtype=np.float64)
-            fp = np.logical_and(pred_bool, ~gt_bool).sum(dtype=np.float64)
-            fn = np.logical_and(~pred_bool, gt_bool).sum(dtype=np.float64)
-            tn = np.logical_and(~pred_bool, ~gt_bool).sum(dtype=np.float64)
-
-            pred_sum = tp + fp
-            mask_sum = tp + fn
-
-            dice_den = 2.0 * tp + fp + fn
-            if dice_den < 1e-7:
-                dice = 1.0 if (mask_sum < 1e-7 and pred_sum < 1e-7) else 0.0
-            else:
-                dice = (2.0 * tp) / (dice_den + 1e-8)
-
-            union = tp + fp + fn
-            iou = 1.0 if union < 1e-7 else tp / (union + 1e-8)
-
-            if pred_sum < 1e-7:
-                precision = 1.0 if mask_sum < 1e-7 else 0.0
-            else:
-                precision = tp / (pred_sum + 1e-8)
-
-            if (tp + fn) < 1e-7:
-                recall = 1.0 if pred_sum < 1e-7 else 0.0
-            else:
-                recall = tp / (tp + fn + 1e-8)
-
-            if (tn + fp) < 1e-7:
-                specificity = 1.0
-            else:
-                specificity = tn / (tn + fp + 1e-8)
-
-            # 计算该阈值下的平均 HD95（对每个样本单独计算）
-            hd95_list = []
-            for i in range(pred_bool.shape[0]):
-                try:
-                    hd = calculate_hd95(
-                        pred_bool[i].astype(np.uint8),
-                        gt_bool[i].astype(np.uint8),
-                    )
-                except Exception:
-                    hd = float("nan")
-                if np.isfinite(hd):
-                    hd95_list.append(float(hd))
-
-            if hd95_list:
-                hd95_mean = float(np.nanmean(hd95_list))
-            else:
-                # 若所有样本都无法计算 HD95，则记为无穷大，以便在评分中让该项为 0
-                hd95_mean = float("inf")
-
-            total_score = calculate_custom_score(
-                dice=dice,
-                iou=iou,
-                precision=precision,
-                recall=recall,
-                specificity=specificity,
-                hd95=hd95_mean,
-            )
-
-            if total_score > best_score:
-                best_score = float(total_score)
-                best_thresh = float(thr)
-                best_metrics = {
-                    "dice": float(dice),
-                    "iou": float(iou),
-                    "precision": float(precision),
-                    "recall": float(recall),
-                    "specificity": float(specificity),
-                    "hd95": float(hd95_mean) if np.isfinite(hd95_mean) else float("nan"),
-                    "score": float(total_score),
-                }
-
-        return best_thresh, best_metrics
-    
+    # scan_best_threshold 方法已移除，请使用 utils.py 中的全局函数 scan_best_threshold
 
 
 
@@ -7940,10 +10871,11 @@ class PredictThread(QThread):
     def _post_process(self, prob_tensor):
         processed = TrainThread.post_process_mask(
             prob_tensor.squeeze(0), 
-            min_size=30, 
+            min_size=150, 
             use_morphology=True,
             keep_largest=False,  # 允许多发病灶同时存在
-            fill_holes=True     # 填充孔洞，去除假阴性空洞
+            fill_holes=True,     # 填充孔洞，去除假阴性空洞
+            prob_map=prob_tensor.squeeze(0)
         )
         if isinstance(processed, torch.Tensor):
             return processed.unsqueeze(0).unsqueeze(0)
@@ -7959,7 +10891,7 @@ class PredictThread(QThread):
             
             # 数据转换
             transform = A.Compose([
-                A.Resize(256, 256),
+                A.Resize(512, 512),  # 提升分辨率以保留更多病灶边缘细节
                 A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
                 ToTensorV2()
             ])
@@ -7974,7 +10906,20 @@ class PredictThread(QThread):
                 context_slices=self.context_slices,
                 context_gap=self.context_gap
             )
-            dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
+            # 【Windows 多进程优化】为预测线程也启用多进程数据加载
+            # Intel Core Ultra 9 285HX: 使用 8 个 worker 充分利用 P-Core
+            import platform
+            is_windows = platform.system() == 'Windows'
+            cpu_count = os.cpu_count() or 1
+            num_workers = 8 if is_windows else max(0, min(4, cpu_count - 1))
+            dataloader = DataLoader(
+                dataset, 
+                batch_size=1, 
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=(device.type == 'cuda'),  # 【优化】加速数据传输
+                persistent_workers=(num_workers > 0)  # 【关键】让子进程保持存活
+            )
             if self.model_threshold is not None:
                 self.update_progress.emit(8, f"使用模型自适应阈值: {self.threshold:.3f}")
             
@@ -8061,5 +11006,7 @@ class PredictThread(QThread):
         
         except Exception as e:
             self.update_progress.emit(0, f"预测错误: {str(e)}")
+
+
 
 

@@ -1,8 +1,13 @@
-# Python
+# ==================== Python ====================
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
+
+# C extensions
 *.so
+
+# Distribution / packaging
 .Python
 build/
 develop-eggs/
@@ -16,93 +21,344 @@ parts/
 sdist/
 var/
 wheels/
+pip-wheel-metadata/
+share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+MANIFEST
 
-# Virtual Environment
-venv/
-env/
-ENV/
-.venv
+# PyInstaller
+*.manifest
+*.spec
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-.DS_Store
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
-*.ipynb
 
-# PyCharm
-.idea/
+# IPython
+profile_default/
+ipython_config.py
 
-# Model files (通常很大，建议使用 Git LFS 或不上传)
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# PEP 582
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# ==================== PyTorch / Deep Learning ====================
+# Model checkpoints (通常很大，不提交到仓库)
 *.pth
 *.pt
 *.ckpt
+*.pkl
 *.h5
-*.pb
+*.hdf5
 
-# Data files (通常很大，建议不上传)
-data/
-datasets/
-*.nii
-*.nii.gz
-*.dcm
-*.dicom
-
-# Temporary files
-*.tmp
-*.temp
-*.log
-*.cache
-temp/
-tmp/
-
-# OS files
-Thumbs.db
-.DS_Store
-desktop.ini
-
-# Output files
-outputs/
-results/
-predictions/
-*.png
-*.jpg
-*.jpeg
-*.mat
-
-# Keep example outputs if needed
-!examples/*.png
-!examples/*.jpg
-
-# Configuration files with sensitive information
-config.json
-secrets.json
-.env
-*.key
-
-# Training checkpoints (可选，如果不想上传模型)
+# 模型权重目录
 checkpoints/
 models/
+weights/
 saved_models/
+pretrained/
 
-# Performance analysis reports
-performance_reports/
-*.html
-*.pdf
+# TensorBoard logs
+runs/
+logs/
+tensorboard/
+tb_logs/
+.aider*
+# Weights & Biases
+wandb/
 
-# MATLAB files (如果使用)
-*.m
+# MLflow
+mlruns/
+
+# ==================== 数据集和大型文件 ====================
+# 数据集目录（通常很大，不应该提交）
+data/
+datasets/
+dataset/
+raw_data/
+processed_data/
+
+# 图像和视频文件（如果很大）
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.tif
+*.webp
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# 医学图像格式
+*.dcm
+*.dicom
+*.nii
+*.nii.gz
+*.nrrd
+
+# 大型数据文件
+*.mat
+*.h5
+*.hdf5
+*.npz
+*.npy
+
+# ==================== MATLAB ====================
+# MATLAB 自动保存文件
+*.asv
+*.m~
+
+# MATLAB 编译文件
+*.mex
+*.mexa64
+*.mexglx
+*.mexw32
+*.mexw64
+
+# MATLAB 缓存
+.m/
+
+# MATLAB 报告和输出（项目特定）
+matlab_reports/
 *.fig
 
-# Large visualization files
-visualizations/
-attention_maps/
+# ==================== 日志和结果 ====================
+# 训练日志
+*.log
+logs/
+log/
 
+# 结果输出
+results/
+outputs/
+output/
+predictions/
+visualizations/
+
+# 临时文件
+temp/
+tmp/
+*.tmp
+*.temp
+
+# 临时目录（Windows）
+AppData/Local/Temp/
+
+# ==================== IDE 和编辑器 ====================
+# Visual Studio Code
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+.vim/
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+.\#*
+
+# ==================== 操作系统 ====================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# ==================== 项目特定 ====================
+# 配置文件中的敏感信息（如果有）
+config_local.py
+secrets.py
+.env.local
+.env.production
+
+# 调试文件
+debug_*.py
+test_*.py
+*_test.py
+*_tests.py
+
+# 备份文件
+*.bak
+*.backup
+*.old
+*~
+
+# 压缩文件（通常很大）
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+
+# ==================== 其他 ====================
+# 系统文件
+.directory
+.Trash-*
+
+# 大型二进制文件
+*.bin
+*.exe
+*.dll
+*.dylib
+
+# 数据库文件
+*.db
+*.sqlite
+*.sqlite3
+
+# 注释：如果某些文件需要强制跟踪，可以使用以下命令：
+# git add -f <file>
+
+.aider
+# --- Aider AI Tools ---
+# 忽略聊天记录（防止隐私泄露）
+.aider.chat.history.md
+# 忽略输入历史（类似 bash_history）
+.aider.input.history
+# 忽略 Aider 的代码索引缓存（那个报错的 .tags.cache 文件夹）
+.aider.tags.cache*
+# 忽略所有以 .aider 开头的文件（以此类推）
+.aider*
+
+# --- Environment Secrets (重要！) ---
+# 既然你在用 API Key，防止手滑把 .env 传上去
+.env
+.aider.chat.history.md
+.aider.input.history

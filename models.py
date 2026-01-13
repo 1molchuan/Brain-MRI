@@ -6,6 +6,17 @@ import numpy as np
 from torchvision import models
 from typing import Optional, Tuple
 from utils import window_partition, window_reverse
+from config import get_model_config
+
+# 尝试导入 segmentation_models_pytorch (SMP)
+try:
+    import segmentation_models_pytorch as smp
+    SMP_AVAILABLE = True
+except ImportError:
+    SMP_AVAILABLE = False
+    print("[警告] segmentation_models_pytorch 未安装。")
+    print("      请运行: pip install segmentation-models-pytorch")
+    print("      或: pip install git+https://github.com/qubvel/segmentation_models.pytorch")
 
 class DropPath(nn.Module):
     """Stochastic Depth per sample."""
@@ -129,14 +140,15 @@ class CRFPostProcessor:
         return np.stack(results, axis=0)
 
 
-class CBAM(nn.Module):
+class CBAMBlock(nn.Module):
     """
-    Convolutional Block Attention Module (CBAM)
+    Convolutional Block Attention Module (CBAM) - Block version
     结合通道注意力和空间注意力，提升特征表达能力
     参考: "CBAM: Convolutional Block Attention Module" (ECCV 2018)
+    使用 nn.Linear 实现通道注意力，适用于通用特征块
     """
     def __init__(self, channels, reduction=16):
-        super(CBAM, self).__init__()
+        super(CBAMBlock, self).__init__()
         # 通道注意力模块
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
@@ -2182,10 +2194,12 @@ class SpatialAttention(nn.Module):
         return self.sigmoid(x)
 
 
-class CBAM(nn.Module):
-    """结合通道和空间注意力，放在Skip Connection处"""
+class CBAMSkip(nn.Module):
+    """结合通道和空间注意力，放在Skip Connection处
+    使用 ChannelAttention 和 SpatialAttention 模块，专门用于跳跃连接特征增强
+    """
     def __init__(self, in_planes, ratio=16, kernel_size=7):
-        super(CBAM, self).__init__()
+        super(CBAMSkip, self).__init__()
         self.ca = ChannelAttention(in_planes, ratio)
         self.sa = SpatialAttention(kernel_size)
 
@@ -2245,7 +2259,7 @@ class DecoderBlock(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        self.attention = CBAM(skip_channels) # 对跳跃连接特征应用注意力
+        self.attention = CBAMSkip(skip_channels) # 对跳跃连接特征应用注意力
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels + skip_channels, out_channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
@@ -2722,54 +2736,7 @@ class nnFormer(nn.Module):
 
 
 # 工具函数和数据处理类已移动到 utils.py
-
-def instantiate_model(model_type: str, device, swin_params: Optional[dict] = None, dstrans_params: Optional[dict] = None, mamba_params: Optional[dict] = None, resnet_params: Optional[dict] = None):
-    model_type = (model_type or "improved_unet").lower()
-    if model_type == "resnet_unet":
-        params = {
-            "in_channels": 3,
-            "out_channels": 1,
-            # 使用 ImageNet 预训练的 ResNet，可提升深层特征表达（Attention 更稳定）
-            "pretrained": True,
-            "backbone_name": "resnet101",
-            "use_aspp": True  # 默认使用ASPP
-        }
-        if resnet_params:
-            params.update(resnet_params)
-        return ResNetUNet(**params).to(device)
-    if model_type in ("trans_unet", "transunet"):
-        return TransUNet().to(device)
-    if model_type in ("ds_trans_unet", "dstransunet", "ds-transunet"):
-        params = {
-            "in_channels": 3,
-            "out_channels": 1,
-            "embed_dim": 256,
-            "num_heads": 8,
-            "num_layers": 2,
-            "mlp_ratio": 4.0,
-            "dropout": 0.1,
-        }
-        if dstrans_params:
-            params.update(dstrans_params)
-        return DSTransUNet(**params).to(device)
-    if model_type == "swin_unet" or model_type == "swinunet":
-        params = {
-            "in_channels": 3,
-            "out_channels": 1,
-            "img_size": 224,
-            "patch_size": 4,
-            "embed_dim": 96,
-            "depths": [2, 2, 6, 2],
-            "num_heads": [3, 6, 12, 24],
-            "window_size": 8,
-            "mlp_ratio": 4.0,
-            "drop_path_rate": 0.1,
-            "use_attention_gate": True
-        }
-        if swin_params:
-            params.update(swin_params)
-        return SwinUNet(**params).to(device)
-    return ImprovedUNet().to(device)
+# instantiate_model 函数定义在文件末尾（第2908行）
 
 
 class LayerNorm2d(nn.Module):
@@ -2903,64 +2870,610 @@ class SwinUMamba(nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__()
         raise RuntimeError("Swin-U Mamba 模型已从系统中删除")
+
+# ==================== SMP 模型 (UnetPlusPlus) ====================
+
+class SMPUnetPlusPlus(nn.Module):
+    """
+    基于 segmentation_models_pytorch 的 U-Net++ 模型
+    
+    使用 ResNet101 作为编码器（ImageNet 预训练）
+    支持 2.5D 输入（3通道：上一张、当前、下一张）
+    支持加载自定义预训练权重（完整模型或仅 Backbone）
+    """
+    
+    def __init__(
+        self,
+        encoder_name: str = 'resnet101',
+        in_channels: int = 3,
+        classes: int = 1,
+        encoder_weights: str = 'imagenet',
+        activation: Optional[str] = None,
+        pretrained_weights_path: Optional[str] = None,
+        **kwargs
+    ):
+        """
+        Args:
+            encoder_name: 编码器名称，如 'resnet101', 'efficientnet-b5' 等
+            in_channels: 输入通道数（默认3，用于2.5D输入）
+            classes: 输出类别数（默认1，二分类）
+            encoder_weights: 预训练权重（'imagenet' 或 None）
+            activation: 激活函数（None 表示无激活，用于二分类通常设为 None）
+            pretrained_weights_path: 自定义预训练权重路径（.pth 文件），默认为 None
+            **kwargs: 其他 SMP 参数
+        """
+        super().__init__()
+        
+        if not SMP_AVAILABLE:
+            raise ImportError(
+                "segmentation_models_pytorch 未安装。\n"
+                "请运行: pip install segmentation-models-pytorch"
+            )
+        
+        self.model = smp.UnetPlusPlus(
+            encoder_name=encoder_name,
+            encoder_weights=encoder_weights,
+            in_channels=in_channels,
+            classes=classes,
+            activation=activation,
+            **kwargs
+        )
+        
+        print(f"[SMP模型] 创建 U-Net++，编码器: {encoder_name}, 输入通道: {in_channels}")
+        
+        # 加载自定义预训练权重
+        if pretrained_weights_path is not None:
+            self._load_pretrained_weights(pretrained_weights_path)
+    
+    def _load_pretrained_weights(self, weights_path: str):
+        """
+        智能加载自定义预训练权重
+        
+        支持两种权重格式：
+        1. 完整模型权重（包含 encoder 和 decoder）
+        2. 仅 Backbone 权重（只包含 encoder 层）
+        
+        Args:
+            weights_path: 权重文件路径（.pth 文件）
+        """
+        if not os.path.exists(weights_path):
+            print(f"[警告] 权重文件不存在: {weights_path}，跳过加载")
+            return
+        
+        try:
+            # 加载权重文件
+            print(f"[权重加载] 正在加载权重: {weights_path}")
+            state_dict = torch.load(weights_path, map_location='cpu')
+            
+            # 处理不同的权重文件格式
+            # 有些权重文件可能包含 'model' 键或其他包装
+            if isinstance(state_dict, dict):
+                if 'model' in state_dict:
+                    state_dict = state_dict['model']
+                elif 'state_dict' in state_dict:
+                    state_dict = state_dict['state_dict']
+                elif 'weights' in state_dict:
+                    state_dict = state_dict['weights']
+            
+            # 获取模型的所有键名
+            model_keys = set(self.model.state_dict().keys())
+            weight_keys = set(state_dict.keys())
+            
+            # 判断权重类型：检查是否包含 encoder 相关的键
+            encoder_keys = {k for k in weight_keys if 'encoder' in k}
+            decoder_keys = {k for k in weight_keys if 'decoder' in k}
+            
+            # 策略1: 尝试加载完整模型权重
+            if len(decoder_keys) > 0 or len(encoder_keys) > 0:
+                # 包含 encoder 或 decoder，尝试完整加载
+                try:
+                    # 使用 strict=False 允许跳过不匹配的层（如输入通道不匹配）
+                    missing_keys, unexpected_keys = self.model.load_state_dict(
+                        state_dict, strict=False
+                    )
+                    
+                    if len(missing_keys) == 0 and len(unexpected_keys) == 0:
+                        print(f"[权重加载] ✅ 成功加载完整模型权重: {weights_path}")
+                    else:
+                        print(f"[权重加载] ⚠️ 部分加载完成（因形状不匹配跳过部分层）")
+                        if missing_keys:
+                            print(f"  - 缺失的键 ({len(missing_keys)} 个): {missing_keys[:5]}...")
+                        if unexpected_keys:
+                            print(f"  - 意外的键 ({len(unexpected_keys)} 个): {unexpected_keys[:5]}...")
+                    return
+                except RuntimeError as e:
+                    print(f"[权重加载] 完整模型加载失败: {e}")
+                    print(f"[权重加载] 尝试仅加载 encoder 权重...")
+            
+            # 策略2: 尝试仅加载 encoder 权重
+            if len(encoder_keys) > 0:
+                try:
+                    # 提取 encoder 相关的权重
+                    encoder_state_dict = {}
+                    for key, value in state_dict.items():
+                        if 'encoder' in key:
+                            # 移除 'encoder.' 前缀（如果存在）
+                            new_key = key.replace('encoder.', '') if key.startswith('encoder.') else key
+                            encoder_state_dict[new_key] = value
+                    
+                    if encoder_state_dict:
+                        missing_keys, unexpected_keys = self.model.encoder.load_state_dict(
+                            encoder_state_dict, strict=False
+                        )
+                        
+                        if len(missing_keys) == 0 and len(unexpected_keys) == 0:
+                            print(f"[权重加载] ✅ 成功加载 encoder 权重: {weights_path}")
+                        else:
+                            print(f"[权重加载] ⚠️ 部分加载 encoder（因形状不匹配跳过部分层）")
+                            if missing_keys:
+                                print(f"  - 缺失的键 ({len(missing_keys)} 个): {missing_keys[:5]}...")
+                            if unexpected_keys:
+                                print(f"  - 意外的键 ({len(unexpected_keys)} 个): {unexpected_keys[:5]}...")
+                        return
+                except RuntimeError as e:
+                    print(f"[权重加载] Encoder 加载失败: {e}")
+            
+            # 策略3: 尝试直接匹配（可能是扁平化的键名）
+            try:
+                missing_keys, unexpected_keys = self.model.load_state_dict(
+                    state_dict, strict=False
+                )
+                print(f"[权重加载] ⚠️ 使用宽松模式加载（可能部分层不匹配）")
+                if missing_keys:
+                    print(f"  - 缺失的键 ({len(missing_keys)} 个): {missing_keys[:5]}...")
+                if unexpected_keys:
+                    print(f"  - 意外的键 ({len(unexpected_keys)} 个): {unexpected_keys[:5]}...")
+            except RuntimeError as e:
+                print(f"[权重加载] ❌ 权重加载失败: {e}")
+                print(f"[权重加载] 模型将使用随机初始化或 ImageNet 预训练权重")
+        
+        except Exception as e:
+            print(f"[权重加载] ❌ 加载权重时发生异常: {e}")
+            print(f"[权重加载] 模型将使用随机初始化或 ImageNet 预训练权重")
+            import traceback
+            traceback.print_exc()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播
+        
+        Args:
+            x: 输入张量 (B, 3, H, W)
+        
+        Returns:
+            输出张量 (B, 1, H, W)
+        """
+        return self.model(x)
+    
+    def return_attention(self, x: torch.Tensor) -> Tuple[torch.Tensor, dict]:
+        """
+        返回注意力图（用于可视化）
+        
+        Args:
+            x: 输入张量
+        
+        Returns:
+            (output, attention_maps): 输出和注意力图字典
+        """
+        output = self.forward(x)
+        # SMP 模型默认不提供注意力图，返回空字典
+        attention_maps = {}
+        return output, attention_maps
+
+
+class SMPDeepLabV3Plus(nn.Module):
+    """
+    基于 segmentation_models_pytorch 的 DeepLabV3+ 模型
+    
+    使用 ResNet101 作为编码器（ImageNet 预训练）
+    【锁定3通道】强制使用3通道输入，不再支持通道适配
+    支持加载自定义预训练权重（完整模型或仅 Backbone）
+    
+    DeepLabV3+ 是备选方案，更接近纯ResNet的效果
+    """
+    
+    def __init__(
+        self,
+        encoder_name: str = 'resnet101',
+        in_channels: int = 3,
+        classes: int = 1,
+        encoder_weights: str = 'imagenet',
+        activation: Optional[str] = None,
+        pretrained_weights_path: Optional[str] = None,
+        **kwargs
+    ):
+        """
+        Args:
+            encoder_name: 编码器名称，如 'resnet101', 'efficientnet-b5' 等
+            in_channels: 输入通道数（锁定为3通道）
+            classes: 输出类别数（默认1，二分类）
+            encoder_weights: 预训练权重（'imagenet' 或 None）
+            activation: 激活函数（None 表示无激活，用于二分类通常设为 None）
+            pretrained_weights_path: 自定义预训练权重路径（.pth 文件），默认为 None
+            **kwargs: 其他 SMP 参数
+        """
+        super().__init__()
+        
+        if not SMP_AVAILABLE:
+            raise ImportError(
+                "segmentation_models_pytorch 未安装。\n"
+                "请运行: pip install segmentation-models-pytorch"
+            )
+        
+        # 【锁定3通道】强制使用3通道输入，不再支持通道适配
+        in_channels = 3
+        print(f"[SMP模型] 创建 DeepLabV3+（锁定3通道），编码器: {encoder_name}, 输入通道: {in_channels}")
+        
+        self.model = smp.DeepLabV3Plus(
+            encoder_name=encoder_name,
+            encoder_weights=encoder_weights,
+            in_channels=in_channels,
+            classes=classes,
+            activation=activation,
+            **kwargs
+        )
+        
+        # 加载自定义预训练权重
+        if pretrained_weights_path is not None:
+            self._load_pretrained_weights(pretrained_weights_path)
+    
+    def _load_pretrained_weights(self, weights_path: str):
+        """
+        智能加载自定义预训练权重（复用SMPUnetPlusPlus的逻辑）
+        
+        支持两种权重格式：
+        1. 完整模型权重（包含 encoder 和 decoder）
+        2. 仅 Backbone 权重（只包含 encoder 层）
+        
+        Args:
+            weights_path: 权重文件路径（.pth 文件）
+        """
+        if not os.path.exists(weights_path):
+            print(f"[警告] 权重文件不存在: {weights_path}，跳过加载")
+            return
+        
+        try:
+            # 加载权重文件
+            print(f"[权重加载] 正在加载权重: {weights_path}")
+            state_dict = torch.load(weights_path, map_location='cpu')
+            
+            # 处理不同的权重文件格式
+            if isinstance(state_dict, dict):
+                if 'model' in state_dict:
+                    state_dict = state_dict['model']
+                elif 'state_dict' in state_dict:
+                    state_dict = state_dict['state_dict']
+                elif 'weights' in state_dict:
+                    state_dict = state_dict['weights']
+            
+            # 获取模型的所有键名
+            model_keys = set(self.model.state_dict().keys())
+            weight_keys = set(state_dict.keys())
+            
+            # 判断权重类型：检查是否包含 encoder 相关的键
+            encoder_keys = {k for k in weight_keys if 'encoder' in k}
+            decoder_keys = {k for k in weight_keys if 'decoder' in k or 'segmentation_head' in k}
+            
+            # 策略1: 尝试加载完整模型权重
+            if len(decoder_keys) > 0 or len(encoder_keys) > 0:
+                try:
+                    missing_keys, unexpected_keys = self.model.load_state_dict(
+                        state_dict, strict=False
+                    )
+                    if len(missing_keys) == 0 and len(unexpected_keys) == 0:
+                        print(f"[权重加载] ✅ 成功加载完整模型权重: {weights_path}")
+                    else:
+                        print(f"[权重加载] ⚠️ 部分加载（因形状不匹配跳过部分层）")
+                    return
+                except RuntimeError as e:
+                    print(f"[权重加载] 完整模型加载失败: {e}")
+            
+            # 策略2: 尝试仅加载 encoder 权重
+            if encoder_keys:
+                try:
+                    encoder_state = {k: v for k, v in state_dict.items() if 'encoder' in k}
+                    if encoder_state:
+                        model_state = self.model.state_dict()
+                        for key, value in encoder_state.items():
+                            if key in model_state:
+                                if model_state[key].shape == value.shape:
+                                    model_state[key] = value
+                        self.model.load_state_dict(model_state, strict=False)
+                        print(f"[权重加载] ✅ 成功加载 encoder 权重: {weights_path}")
+                        return
+                except RuntimeError as e:
+                    print(f"[权重加载] Encoder 加载失败: {e}")
+            
+            # 策略3: 尝试直接匹配（可能是扁平化的键名）
+            try:
+                missing_keys, unexpected_keys = self.model.load_state_dict(
+                    state_dict, strict=False
+                )
+                print(f"[权重加载] ⚠️ 使用宽松模式加载（可能部分层不匹配）")
+            except RuntimeError as e:
+                print(f"[权重加载] ❌ 权重加载失败: {e}")
+                print(f"[权重加载] 模型将使用随机初始化或 ImageNet 预训练权重")
+        
+        except Exception as e:
+            print(f"[权重加载] ❌ 加载权重时发生异常: {e}")
+            print(f"[权重加载] 模型将使用随机初始化或 ImageNet 预训练权重")
+            import traceback
+            traceback.print_exc()
+    
+    def _ensure_resnet_first_conv_channels(self):
+        """
+        确保 ResNet 编码器的第一层卷积是 3 通道的（仅在 3 通道模式下调用）
+        
+        如果加载的权重是 1 通道的，我们需要修复第一层卷积以适应 3 通道输入
+        注意：此方法仅在 in_channels=3 时调用，不会影响 1 通道模式
+        """
+        try:
+            # 获取编码器的第一层卷积
+            encoder = self.model.encoder
+            first_conv = None
+            
+            # 尝试找到第一层卷积（可能是 encoder.conv1 或 encoder.stem.conv1）
+            if hasattr(encoder, 'conv1'):
+                first_conv = encoder.conv1
+            elif hasattr(encoder, 'stem') and hasattr(encoder.stem, 'conv1'):
+                first_conv = encoder.stem.conv1
+            
+            if first_conv is None:
+                print(f"[通道修复] 无法找到 ResNet 编码器的第一层卷积，跳过修复")
+                return
+            
+            # 检查第一层卷积的输入通道数
+            if first_conv.in_channels == 3:
+                print(f"[通道修复] ✅ ResNet 编码器第一层卷积已经是 3 通道，无需修复")
+                return
+            
+            if first_conv.in_channels == 1:
+                print(f"[通道修复] ⚠️  检测到 ResNet 编码器第一层卷积是 1 通道，正在修复为 3 通道...")
+                print(f"   注意：这是 3 通道模式下的自动修复，不会影响 1 通道模式的权重加载")
+                
+                # 获取当前权重
+                old_weight = first_conv.weight.data.clone()  # (out_channels, 1, H, W)
+                old_bias = first_conv.bias.data.clone() if first_conv.bias is not None else None
+                
+                # 创建新的 3 通道卷积层
+                out_channels = old_weight.shape[0]
+                kernel_size = old_weight.shape[2:]  # (H, W)
+                stride = first_conv.stride if hasattr(first_conv, 'stride') else (1, 1)
+                padding = first_conv.padding if hasattr(first_conv, 'padding') else (0, 0)
+                dilation = first_conv.dilation if hasattr(first_conv, 'dilation') else (1, 1)
+                groups = first_conv.groups if hasattr(first_conv, 'groups') else 1
+                
+                # 创建新的卷积层
+                new_conv = nn.Conv2d(
+                    in_channels=3,
+                    out_channels=out_channels,
+                    kernel_size=kernel_size,
+                    stride=stride,
+                    padding=padding,
+                    dilation=dilation,
+                    groups=groups,
+                    bias=(old_bias is not None)
+                )
+                
+                # 将 1 通道权重复制 3 份（使用平均策略）
+                old_weight_mean = old_weight.mean(dim=1, keepdim=True)  # (out_channels, 1, H, W)
+                new_weight = old_weight_mean.repeat(1, 3, 1, 1)  # (out_channels, 3, H, W)
+                new_conv.weight.data = new_weight
+                if old_bias is not None:
+                    new_conv.bias.data = old_bias.clone()
+                
+                # 替换第一层卷积
+                if hasattr(encoder, 'conv1'):
+                    encoder.conv1 = new_conv
+                elif hasattr(encoder, 'stem') and hasattr(encoder.stem, 'conv1'):
+                    encoder.stem.conv1 = new_conv
+                
+                print(f"[通道修复] ✅ 成功将 ResNet 编码器第一层卷积从 1 通道修复为 3 通道")
+            else:
+                print(f"[通道修复] ⚠️  ResNet 编码器第一层卷积的通道数 ({first_conv.in_channels}) 不是 1 或 3，跳过修复")
+        
+        except Exception as e:
+            print(f"[通道修复] ❌ 修复 ResNet 编码器第一层卷积时发生异常: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播
+        
+        Args:
+            x: 输入张量 (B, C, H, W)，C 可以是 1 或 3（根据模式）
+        
+        Returns:
+            输出张量 (B, 1, H, W)
+        """
+        return self.model(x)
+    
+    def return_attention(self, x: torch.Tensor) -> Tuple[torch.Tensor, dict]:
+        """
+        返回注意力图（用于可视化）
+        
+        从 DeepLabV3+ 的 encoder 特征图中提取注意力图
+        使用 ResNet 不同层的特征图作为注意力图
+        
+        Args:
+            x: 输入张量
+        
+        Returns:
+            (output, attention_maps): 输出和注意力图字典
+        """
+        # 获取输出
+        output = self.forward(x)
+        
+        # 提取 encoder 特征图作为注意力图
+        attention_maps = {}
+        
+        try:
+            encoder = self.model.encoder
+            B, C, H, W = x.shape
+            
+            # 获取不同层的特征图
+            with torch.no_grad():
+                # 通过 encoder 的前向传播获取中间特征
+                # ResNet encoder 通常有 layer1, layer2, layer3, layer4
+                features = x
+                
+                # 第一层卷积后的特征
+                if hasattr(encoder, 'conv1'):
+                    features = encoder.conv1(features)
+                    if hasattr(encoder, 'bn1'):
+                        features = encoder.bn1(features)
+                    if hasattr(encoder, 'relu'):
+                        features = encoder.relu(features)
+                    if hasattr(encoder, 'maxpool'):
+                        features = encoder.maxpool(features)
+                    
+                    # 计算注意力图：对通道维度求平均，然后上采样到输入尺寸
+                    att_map = features.mean(dim=1, keepdim=True)  # (B, 1, H', W')
+                    att_map = F.interpolate(att_map, size=(H, W), mode='bilinear', align_corners=False)
+                    attention_maps['encoder_conv1'] = att_map
+                
+                # Layer1 特征
+                if hasattr(encoder, 'layer1'):
+                    features = encoder.layer1(features)
+                    att_map = features.mean(dim=1, keepdim=True)
+                    att_map = F.interpolate(att_map, size=(H, W), mode='bilinear', align_corners=False)
+                    attention_maps['encoder_layer1'] = att_map
+                
+                # Layer2 特征
+                if hasattr(encoder, 'layer2'):
+                    features = encoder.layer2(features)
+                    att_map = features.mean(dim=1, keepdim=True)
+                    att_map = F.interpolate(att_map, size=(H, W), mode='bilinear', align_corners=False)
+                    attention_maps['encoder_layer2'] = att_map
+                
+                # Layer3 特征（通常是最重要的特征层）
+                if hasattr(encoder, 'layer3'):
+                    features = encoder.layer3(features)
+                    att_map = features.mean(dim=1, keepdim=True)
+                    att_map = F.interpolate(att_map, size=(H, W), mode='bilinear', align_corners=False)
+                    attention_maps['encoder_layer3'] = att_map
+                
+                # Layer4 特征（最高层特征）
+                if hasattr(encoder, 'layer4'):
+                    features = encoder.layer4(features)
+                    att_map = features.mean(dim=1, keepdim=True)
+                    att_map = F.interpolate(att_map, size=(H, W), mode='bilinear', align_corners=False)
+                    attention_maps['encoder_layer4'] = att_map
+                
+                # 如果 decoder 存在，也可以提取 decoder 的特征
+                if hasattr(self.model, 'decoder'):
+                    try:
+                        # 获取 decoder 的中间特征（如果可访问）
+                        # 注意：SMP 的 decoder 可能不直接暴露中间特征
+                        # 这里我们使用 encoder 的最后层特征作为主要注意力图
+                        if 'encoder_layer4' in attention_maps:
+                            # 使用 layer4 作为主要注意力图
+                            attention_maps['decoder_input'] = attention_maps['encoder_layer4']
+                    except:
+                        pass
+                
+                # 如果没有提取到任何注意力图，使用输出概率图作为注意力图
+                if not attention_maps:
+                    # 使用输出的概率图作为注意力图
+                    prob_map = torch.sigmoid(output)
+                    attention_maps['output_probability'] = prob_map
+        
+        except Exception as e:
+            # 如果提取失败，使用输出概率图作为后备
+            print(f"[注意力图] 提取特征图失败: {e}，使用输出概率图作为注意力图")
+            prob_map = torch.sigmoid(output)
+            attention_maps['output_probability'] = prob_map
+        
+        return output, attention_maps
+
 # ==================== 模型实例化工厂函数 ====================
 
-def instantiate_model(model_type: str, device, swin_params=None, dstrans_params=None, mamba_params=None, resnet_params=None):
+def instantiate_model(model_type: str, device, swin_params=None, dstrans_params=None, mamba_params=None, resnet_params=None, in_channels_override=None):
     """
     实例化模型的工厂函数
     根据 model_type 创建对应的模型实例
+    
+    使用 config.py 中的配置，支持参数覆盖
+    
+    Args:
+        in_channels_override: 覆盖输入通道数（用于从checkpoint恢复时）
     """
     model_type = (model_type or "improved_unet").lower()
     
-    if model_type == "resnet_unet":
-        params = {
-            "in_channels": 3,
-            "out_channels": 1,
-            "pretrained": True,
-            "backbone_name": "resnet101",
-            "use_aspp": True
-        }
-        if resnet_params:
-            params.update(resnet_params)
-        return ResNetUNet(**params).to(device)
-        
-    if model_type in ("trans_unet", "transunet"):
-        return TransUNet().to(device)
-        
-    if model_type in ("ds_trans_unet", "dstransunet", "ds-transunet"):
-        params = {
-            "in_channels": 3,
-            "out_channels": 1,
-            "embed_dim": 256,
-            "num_heads": 8,
-            "num_layers": 2,
-            "mlp_ratio": 4.0,
-            "dropout": 0.1,
-        }
-        if dstrans_params:
-            params.update(dstrans_params)
-        return DSTransUNet(**params).to(device)
-        
-    if model_type == "swin_unet" or model_type == "swinunet":
-        params = {
-            "in_channels": 3,
-            "out_channels": 1,
-            "img_size": 224,
-            "patch_size": 4,
-            "embed_dim": 96,
-            "depths": [2, 2, 6, 2],
-            "num_heads": [3, 6, 12, 24],
-            "window_size": 8,
-            "mlp_ratio": 4.0,
-            "drop_path_rate": 0.1,
-            "use_attention_gate": True
-        }
-        if swin_params:
-            params.update(swin_params)
-        return SwinUNet(**params).to(device)
+    # 处理 Swin-U Mamba（已移除）
+    if model_type == "swinumamba" or model_type == "swin-u-mamba":
+        raise RuntimeError("Swin-U Mamba 模型已从系统中删除，请使用其他模型类型")
     
-    if model_type == "nnformer":
-        return nnFormer(in_channels=3, out_channels=1).to(device)
-        
-    # 默认返回 ImprovedUNet
-    return ImprovedUNet().to(device)
+    # 处理别名
+    if model_type in ("transunet",):
+        model_type = "trans_unet"
+    elif model_type in ("dstransunet", "ds-transunet"):
+        model_type = "ds_trans_unet"
+    elif model_type in ("swinunet",):
+        model_type = "swin_unet"
+    elif model_type in ("unetplusplus", "unet++", "smp_unet++"):
+        model_type = "smp_unetplusplus"
+    elif model_type in ("deeplabv3plus", "deeplabv3+", "deeplab", "smp_deeplabv3plus"):
+        model_type = "smp_deeplabv3plus"
+    
+    # 根据模型类型选择对应的参数覆盖
+    override_params = {}
+    if model_type == "resnet_unet" and resnet_params:
+        override_params = resnet_params
+    elif model_type == "ds_trans_unet" and dstrans_params:
+        override_params = dstrans_params
+    elif model_type == "swin_unet" and swin_params:
+        override_params = swin_params
+    
+    # 从配置中心获取模型参数
+    params = get_model_config(model_type, **override_params)
+    
+    # 根据模型类型实例化
+    if model_type == "resnet_unet":
+        return ResNetUNet(**params).to(device)
+    elif model_type == "trans_unet":
+        return TransUNet().to(device)
+    elif model_type == "ds_trans_unet":
+        return DSTransUNet(**params).to(device)
+    elif model_type == "swin_unet":
+        return SwinUNet(**params).to(device)
+    elif model_type == "nnformer":
+        return nnFormer(**params).to(device)
+    elif model_type == "smp_unetplusplus":
+        # SMP U-Net++ 模型
+        # 【2.5D支持】如果提供了in_channels_override，优先使用（从checkpoint恢复时）
+        encoder_name = params.get('encoder_name', 'resnet101')
+        in_channels = in_channels_override if in_channels_override is not None else params.get('in_channels', 3)
+        classes = params.get('out_channels', 1)
+        encoder_weights = params.get('encoder_weights', 'imagenet')
+        activation = params.get('activation', None)
+        pretrained_weights_path = params.get('pretrained_weights_path', None)
+        return SMPUnetPlusPlus(
+            encoder_name=encoder_name,
+            in_channels=in_channels,
+            classes=classes,
+            encoder_weights=encoder_weights,
+            activation=activation,
+            pretrained_weights_path=pretrained_weights_path
+        ).to(device)
+    elif model_type == "smp_deeplabv3plus":
+        # 【降维打击】SMP DeepLabV3+ 模型（更接近纯ResNet，训练更稳定）
+        # 【2.5D支持】如果提供了in_channels_override，优先使用（从checkpoint恢复时）
+        encoder_name = params.get('encoder_name', 'resnet101')
+        in_channels = in_channels_override if in_channels_override is not None else params.get('in_channels', 3)
+        classes = params.get('out_channels', 1)
+        encoder_weights = params.get('encoder_weights', 'imagenet')
+        activation = params.get('activation', None)
+        pretrained_weights_path = params.get('pretrained_weights_path', None)
+        return SMPDeepLabV3Plus(
+            encoder_name=encoder_name,
+            in_channels=in_channels,
+            classes=classes,
+            encoder_weights=encoder_weights,
+            activation=activation,
+            pretrained_weights_path=pretrained_weights_path
+        ).to(device)
+    else:
+        # 默认返回 ImprovedUNet
+        return ImprovedUNet().to(device)

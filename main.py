@@ -1,5 +1,64 @@
-import sys
 import os
+import sys
+
+# ============================================================================
+# 【核弹级修复】DLL 冲突终极解决方案：预热启动 (Warm-up Launch)
+# ============================================================================
+# 问题：torch、PyQt5 等库在 MATLAB 之前加载时，它们的 DLL 会抢占进程空间，
+#       导致 MATLAB 引擎无法加载自己的 DLL，报错 "找不到指定的程序"。
+#
+# 解决方案：必须在导入 torch 或 PyQt 之前执行，否则 Anaconda 的 DLL 会抢占位置。
+#           仅 import 是不够的，必须真实启动一次引擎才能强制加载底层 DLL。
+#           通过启动 -> 锁定 DLL -> 立即关闭的方式，将 MATLAB 核心 DLL 锁定在进程内存中。
+# ============================================================================
+
+# 标记 MATLAB 引擎是否可用（全局变量，但初始化在 if __name__ == '__main__' 中）
+MATLAB_ENGINE_AVAILABLE = False
+
+def _warmup_matlab_engine():
+    """预热 MATLAB 引擎，防止 DLL 冲突"""
+    global MATLAB_ENGINE_AVAILABLE
+    try:
+        # 1. 配置路径
+        # 请根据实际安装路径修改，当前环境为 R2025b
+        MATLAB_BIN_PATH = r"C:\Program Files\MATLAB\R2025b\bin\win64"
+        
+        if os.path.exists(MATLAB_BIN_PATH):
+            # 传统 PATH 设置
+            if MATLAB_BIN_PATH not in os.environ.get('PATH', ''):
+                os.environ['PATH'] = MATLAB_BIN_PATH + ";" + os.environ.get('PATH', '')
+            
+            # Python 3.8+ 安全目录白名单
+            if hasattr(os, 'add_dll_directory'):
+                try:
+                    os.add_dll_directory(MATLAB_BIN_PATH)
+                except: 
+                    pass
+
+        # 2. 【关键步骤】真实启动一次引擎
+        # 仅 import 是不够的，必须 start_matlab 才能强制加载底层 DLL
+        print("[System] 正在预热 MATLAB 引擎 (防止 DLL 冲突，约需 5-10秒)...")
+        import matlab.engine
+        
+        # 启动临时会话 -> 锁定 DLL -> 立即关闭
+        temp_eng = matlab.engine.start_matlab()
+        temp_eng.quit()
+        
+        MATLAB_ENGINE_AVAILABLE = True
+        print("✅ MATLAB 引擎预热成功！核心 DLL 已锁定。")
+        
+    except ImportError:
+        MATLAB_ENGINE_AVAILABLE = False
+        print("⚠️ 未检测到 matlab.engine，跳过预热。")
+    except Exception as e:
+        MATLAB_ENGINE_AVAILABLE = False
+        print(f"❌ MATLAB 预热失败: {e}")
+        print("提示：如果后续报错 '找不到指定的程序'，请检查 Visual C++ 运行库或路径配置。")
+
+# ============================================================================
+# 其他库必须在此之后导入
+# ============================================================================
+
 import argparse
 import random
 import shutil   # 文件操作可能用到
@@ -17,7 +76,7 @@ from PyQt5.QtWidgets import (
     QGroupBox, QTabWidget, QScrollArea, QMessageBox, QTableWidget, 
     QTableWidgetItem, QHeaderView, QSplitter, QTextEdit, QDialog,
     QCheckBox, QLineEdit, QDoubleSpinBox, QListWidget, QListWidgetItem,
-    QTextBrowser, QSizePolicy
+    QTextBrowser, QSizePolicy, QInputDialog, QProgressDialog
 )
 from PyQt5.QtCore import Qt, QTimer, QThread, QMutex, pyqtSignal, QObject
 from PyQt5.QtGui import QPixmap, QImage, QIcon, QFont, QColor, QTextCursor
@@ -68,8 +127,7 @@ except ImportError:
 
 # 设置随机种子
 random.seed(42)
-import numpy as np
-np.random.seed(42)
+np.random.seed(42)  # numpy 已在上面导入
 torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
@@ -108,6 +166,10 @@ class MedicalSegmentationApp(QMainWindow):
         self.resnet_model_path = None
         self.data_dir = None
         self.output_dir = None
+        
+        # 【Bug修复】图表防抖去重：记录上一次绘制的轮次，防止重复绘制
+        self.last_plotted_epoch = -1
+        self.epoch_history = []  # 存储真实的epoch值，用于X轴
 
         self.train_thread = None
         self.predict_thread = None
@@ -597,6 +659,45 @@ class MedicalSegmentationApp(QMainWindow):
         self.save_best_checkbox.setToolTip("训练过程中自动保存表现最好的模型\n模型将保存在输出目录中")
         control_layout.addWidget(self.save_best_checkbox)
 
+        # 添加MATLAB可视化开关
+        self.use_matlab_checkbox = QCheckBox("📊 使用MATLAB可视化")
+        # 默认根据MATLAB_ENGINE_AVAILABLE设置初始状态
+        self.use_matlab_checkbox.setChecked(MATLAB_ENGINE_AVAILABLE)
+        self.use_matlab_checkbox.setEnabled(MATLAB_ENGINE_AVAILABLE)
+        if not MATLAB_ENGINE_AVAILABLE:
+            self.use_matlab_checkbox.setToolTip("MATLAB引擎不可用（已禁用）\n系统将仅使用Matplotlib绘图")
+            self.use_matlab_checkbox.setStyleSheet("color: #94a3b8;")  # 灰色显示，表示禁用
+        else:
+            self.use_matlab_checkbox.setToolTip("启用MATLAB高清绘图功能\n取消勾选将仅使用Matplotlib绘图\n建议：MATLAB绘图质量更高但速度较慢")
+        control_layout.addWidget(self.use_matlab_checkbox)
+        
+        # 添加关闭MATLAB引擎按钮
+        # QPushButton已在文件顶部导入，无需重复导入
+        self.close_matlab_btn = QPushButton("🔴 关闭MATLAB引擎")
+        self.close_matlab_btn.setEnabled(MATLAB_ENGINE_AVAILABLE)
+        self.close_matlab_btn.setToolTip("完全关闭MATLAB引擎进程\n关闭后需要重启程序才能重新使用MATLAB功能")
+        if not MATLAB_ENGINE_AVAILABLE:
+            self.close_matlab_btn.setStyleSheet("color: #94a3b8; background-color: #f1f5f9;")
+        else:
+            self.close_matlab_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #ef4444;
+                    color: white;
+                    border: none;
+                    padding: 6px 12px;
+                    border-radius: 4px;
+                    font-weight: 500;
+                }
+                QPushButton:hover {
+                    background-color: #dc2626;
+                }
+                QPushButton:pressed {
+                    background-color: #b91c1c;
+                }
+            """)
+        self.close_matlab_btn.clicked.connect(self._close_matlab_engine)
+        control_layout.addWidget(self.close_matlab_btn)
+
         self.create_system_status_group(control_layout)
         self.create_quick_nav_group(control_layout)
 
@@ -608,6 +709,62 @@ class MedicalSegmentationApp(QMainWindow):
         control_panel.setLayout(control_layout)
 
         self.main_layout.addWidget(control_panel)
+
+    def _close_matlab_engine(self):
+        """
+        关闭MATLAB引擎
+        禁用MATLAB相关功能，强制使用Matplotlib
+        """
+        global MATLAB_ENGINE_AVAILABLE
+        
+        reply = QMessageBox.question(
+            self, 
+            "关闭MATLAB引擎",
+            "确定要关闭MATLAB引擎吗？\n\n"
+            "关闭后：\n"
+            "• 将禁用所有MATLAB可视化功能\n"
+            "• 系统将仅使用Matplotlib绘图\n"
+            "• 需要重启程序才能重新启用MATLAB\n\n"
+            "是否继续？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            try:
+                # 尝试关闭所有MATLAB引擎会话
+                # 注意：由于MATLAB引擎是全局的，这里主要是禁用功能
+                MATLAB_ENGINE_AVAILABLE = False
+                
+                # 更新UI状态
+                self.use_matlab_checkbox.setChecked(False)
+                self.use_matlab_checkbox.setEnabled(False)
+                self.use_matlab_checkbox.setToolTip("MATLAB引擎已关闭（已禁用）\n系统将仅使用Matplotlib绘图\n需要重启程序才能重新启用")
+                self.use_matlab_checkbox.setStyleSheet("color: #94a3b8;")
+                
+                self.close_matlab_btn.setEnabled(False)
+                self.close_matlab_btn.setStyleSheet("color: #94a3b8; background-color: #f1f5f9;")
+                self.close_matlab_btn.setText("🔴 MATLAB引擎已关闭")
+                self.close_matlab_btn.setToolTip("MATLAB引擎已关闭\n需要重启程序才能重新启用")
+                
+                QMessageBox.information(
+                    self,
+                    "MATLAB引擎已关闭",
+                    "MATLAB引擎功能已禁用。\n\n"
+                    "系统将仅使用Matplotlib进行可视化。\n"
+                    "如需重新启用MATLAB，请重启程序。"
+                )
+                
+                print("[MATLAB] 用户已手动关闭MATLAB引擎功能")
+                
+            except Exception as e:
+                QMessageBox.warning(
+                    self,
+                    "关闭失败",
+                    f"关闭MATLAB引擎时发生错误：\n{str(e)}\n\n"
+                    "MATLAB功能可能仍在使用中。"
+                )
+                print(f"[MATLAB] 关闭引擎时出错: {e}")
 
     def _init_hidden_api_controls(self, parent):
         """创建但不显示API服务控件，保留相关功能兼容"""
@@ -924,14 +1081,19 @@ class MedicalSegmentationApp(QMainWindow):
         self.arch_combo.addItem("Transformer+UNet (TransUNet)", "trans_unet")
         self.arch_combo.addItem("DS-TransUNet (双尺度Transformer+UNet) ⭐", "ds_trans_unet")
         self.arch_combo.addItem("SwinUNet (Swin Transformer+UNet) ⭐推荐", "swin_unet")
-        self.arch_combo.setCurrentIndex(4)  # 默认选择SwinUNet
+        self.arch_combo.addItem("SMP U-Net++ (ResNet101) 🚀高级", "smp_unetplusplus")
+        self.arch_combo.addItem("DeepLabV3+ (ResNet101) 🔥降维打击", "smp_deeplabv3plus")
+        # 【降维打击】默认使用DeepLabV3+，更接近纯ResNet效果
+        self.arch_combo.setCurrentIndex(6)  # 默认选择DeepLabV3+
         self.arch_combo.setToolTip(
             "选择模型架构类型：\n"
             "• ImprovedUNet: 基础改进UNet\n"
             "• ResNetUNet: 使用ResNet101编码器\n"
             "• TransUNet: Transformer+UNet混合架构\n"
             "• DS-TransUNet: 双尺度Transformer+UNet，在多个尺度使用Transformer增强多尺度特征提取\n"
-            "• SwinUNet: Swin Transformer+UNet混合架构，可配合GWO优化提高Dice指标"
+            "• SwinUNet: Swin Transformer+UNet混合架构，可配合GWO优化提高Dice指标\n"
+            "• SMP U-Net++: 使用segmentation-models-pytorch的U-Net++，支持标准数据集（1通道）和2.5D数据集（3通道）\n"
+            "• DeepLabV3+: 使用segmentation-models-pytorch的DeepLabV3+，锁定3通道输入，更接近纯ResNet效果（降维打击，默认选择）"
         )
         
         # GWO优化选项（SwinUNet / DS-TransUNet / nnFormer 可用）
@@ -943,6 +1105,31 @@ class MedicalSegmentationApp(QMainWindow):
         self.gwo_checkbox.setEnabled(False)  # 默认禁用，只有选择支持的架构时启用
         self.arch_combo.currentIndexChanged.connect(self._on_arch_changed)
         self._on_arch_changed()
+        
+        # 【GUI优化】训练时自动切换到分析页选项（默认关闭）
+        self.auto_switch_tab_checkbox = QCheckBox("训练时自动切换到分析页")
+        self.auto_switch_tab_checkbox.setChecked(False)  # 默认关闭
+        self.auto_switch_tab_checkbox.setToolTip(
+            "勾选后，训练过程中会在第1个epoch或每5个epoch自动切换到性能分析标签页\n"
+            "取消勾选则只更新图表数据，不自动切换标签页（避免打断用户）"
+        )
+        
+        # 数据集类型选择（2.5D vs 普通）
+        dataset_type_label = QLabel("📊 数据集类型:")
+        dataset_type_label.setStyleSheet("font-weight: 600; color: #475569;")
+        self.dataset_type_combo = QComboBox()
+        self.dataset_type_combo.addItem("普通数据集 (单通道输入)", "standard")
+        self.dataset_type_combo.addItem("2.5D数据集 (TCGA-LGG格式) 🚀", "2.5d")
+        self.dataset_type_combo.setCurrentIndex(0)  # 默认普通数据集
+        self.dataset_type_combo.setToolTip(
+            "选择数据集类型：\n"
+            "• 普通数据集: 标准单通道图像输入，适用于大多数分割任务\n"
+            "• 2.5D数据集: TCGA-LGG格式，使用相邻切片堆叠为3通道输入\n"
+            "  注意：2.5D数据集需要文件名格式为 TCGA_CS_5393_19990606_1.tif\n"
+            "  所有模型都支持2.5D数据集，系统会自动调整输入通道数"
+        )
+        self.dataset_type_combo.currentIndexChanged.connect(self._on_dataset_type_changed)
+        self._on_dataset_type_changed()
         
         # 优化器选择
         optimizer_label = QLabel("⚙️ 优化器:")
@@ -968,6 +1155,9 @@ class MedicalSegmentationApp(QMainWindow):
         params_layout.addWidget(arch_label)
         params_layout.addWidget(self.arch_combo)
         params_layout.addWidget(self.gwo_checkbox)
+        params_layout.addWidget(self.auto_switch_tab_checkbox)
+        params_layout.addWidget(dataset_type_label)
+        params_layout.addWidget(self.dataset_type_combo)
         params_layout.addWidget(optimizer_label)
         params_layout.addWidget(self.optimizer_combo)
         params_group.setLayout(params_layout)
@@ -1179,6 +1369,12 @@ class MedicalSegmentationApp(QMainWindow):
         output_layout.setSpacing(12)
         output_layout.setContentsMargins(15, 20, 15, 15)
         
+        # 【GUI优化】添加保存结果checkbox
+        self.save_results_checkbox = QCheckBox("💾 保存/导出结果")
+        self.save_results_checkbox.setChecked(True)  # 默认勾选
+        self.save_results_checkbox.setToolTip("勾选后将保存预测结果到输出目录")
+        self.save_results_checkbox.stateChanged.connect(self.on_save_results_changed)
+        
         self.output_dir_label = QLabel("✗ 未选择输出目录")
         self.output_dir_label.setWordWrap(True)
         self.output_dir_label.setStyleSheet("""
@@ -1197,6 +1393,7 @@ class MedicalSegmentationApp(QMainWindow):
         browse_output_btn.setToolTip("选择保存预测结果的目录")
         browse_output_btn.clicked.connect(self.browse_output_dir)
 
+        output_layout.addWidget(self.save_results_checkbox)
         output_layout.addWidget(self.output_dir_label)
         output_layout.addWidget(browse_output_btn)
         output_group.setLayout(output_layout)
@@ -1913,13 +2110,69 @@ class MedicalSegmentationApp(QMainWindow):
         self.test_arch_combo.addItem("改进UNet (ImprovedUNet)", "improved_unet")
         self.test_arch_combo.addItem("ResNet-UNet (ResNetUNet)", "resnet_unet")
         self.test_arch_combo.addItem("Transformer+UNet (TransUNet)", "trans_unet")
-        self.test_arch_combo.addItem("DS-TransUNet", "ds_trans_unet")
-        self.test_arch_combo.addItem("SwinUNet", "swin_unet")
+        self.test_arch_combo.addItem("DS-TransUNet (双尺度Transformer+UNet) ⭐", "ds_trans_unet")
+        self.test_arch_combo.addItem("SwinUNet (Swin Transformer+UNet) ⭐推荐", "swin_unet")
+        self.test_arch_combo.addItem("SMP U-Net++ (ResNet101) 🚀高级", "smp_unetplusplus")
+        self.test_arch_combo.addItem("DeepLabV3+ (ResNet101) 🔥降维打击", "smp_deeplabv3plus")
+        self.test_arch_combo.setToolTip(
+            "选择模型架构类型：\n"
+            "• ImprovedUNet: 基础改进UNet\n"
+            "• ResNetUNet: 使用ResNet101编码器\n"
+            "• TransUNet: Transformer+UNet混合架构\n"
+            "• DS-TransUNet: 双尺度Transformer+UNet，在多个尺度使用Transformer增强多尺度特征提取\n"
+            "• SwinUNet: Swin Transformer+UNet混合架构，可配合GWO优化提高Dice指标\n"
+            "• SMP U-Net++: 使用segmentation-models-pytorch的U-Net++，支持标准数据集（1通道）和2.5D数据集（3通道）\n"
+            "• DeepLabV3+: 使用segmentation-models-pytorch的DeepLabV3+，锁定3通道输入，更接近纯ResNet效果（降维打击，默认选择）"
+        )
+        
+        # 数据集类型选择（测试模块）
+        test_dataset_type_label = QLabel("📊 数据集类型:")
+        test_dataset_type_label.setStyleSheet("font-weight: 600; color: #475569;")
+        self.test_dataset_type_combo = QComboBox()
+        self.test_dataset_type_combo.addItem("普通数据集 (单通道输入)", "standard")
+        self.test_dataset_type_combo.addItem("2.5D数据集 (TCGA-LGG格式) 🚀", "2.5d")
+        self.test_dataset_type_combo.setCurrentIndex(0)  # 默认普通数据集
+        self.test_dataset_type_combo.setToolTip(
+            "选择测试数据集类型：\n"
+            "• 普通数据集: 标准单通道图像输入，适用于大多数分割任务\n"
+            "• 2.5D数据集: TCGA-LGG格式，使用相邻切片堆叠为3通道输入\n"
+            "  注意：2.5D数据集需要文件名格式为 TCGA_CS_5393_19990606_1.tif\n"
+            "  所有模型都支持2.5D数据集，系统会自动调整输入通道数"
+        )
         
         # 使用TTA选项
         self.test_use_tta_checkbox = QCheckBox("使用测试时增强 (TTA)")
         self.test_use_tta_checkbox.setChecked(True)
         self.test_use_tta_checkbox.setToolTip("启用TTA可以提升1-3%的Dice系数，但会增加推理时间")
+        
+        # 导出ONNX按钮
+        self.export_onnx_btn = QPushButton("📦 导出ONNX模型")
+        self.export_onnx_btn.setMinimumHeight(40)
+        self.export_onnx_btn.setToolTip(
+            "将选中的PyTorch模型导出为ONNX格式\n"
+            "• 支持动态batch size和输入尺寸\n"
+            "• 自动从checkpoint读取输入通道数\n"
+            "• 默认输入尺寸: 512x512"
+        )
+        self.export_onnx_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #3b82f6, stop:1 #2563eb);
+                font-size: 11pt;
+                font-weight: bold;
+                color: white;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #2563eb, stop:1 #1d4ed8);
+            }
+            QPushButton:disabled {
+                background: #94a3b8;
+                color: #64748b;
+            }
+        """)
+        self.export_onnx_btn.clicked.connect(self.export_model_to_onnx)
+        self.export_onnx_btn.setEnabled(False)  # 默认禁用，需要先选择模型
         
         # 开始测试按钮
         self.start_test_btn = QPushButton("🚀 开始测试")
@@ -1945,7 +2198,10 @@ class MedicalSegmentationApp(QMainWindow):
         config_layout.addWidget(browse_test_data_btn)
         config_layout.addWidget(arch_label)
         config_layout.addWidget(self.test_arch_combo)
+        config_layout.addWidget(test_dataset_type_label)
+        config_layout.addWidget(self.test_dataset_type_combo)
         config_layout.addWidget(self.test_use_tta_checkbox)
+        config_layout.addWidget(self.export_onnx_btn)
         config_layout.addWidget(self.start_test_btn)
         config_group.setLayout(config_layout)
         test_content_layout.addWidget(config_group)
@@ -2335,6 +2591,10 @@ class MedicalSegmentationApp(QMainWindow):
                 item = QListWidgetItem(f"✓ {os.path.basename(path)}")
                 item.setData(Qt.UserRole, path)  # 存储完整路径
                 self.test_model_list.addItem(item)
+        
+        # 如果有模型，启用导出ONNX按钮
+        if self.test_model_paths:
+            self.export_onnx_btn.setEnabled(True)
     
     def remove_test_model(self):
         """移除选中的模型"""
@@ -2344,6 +2604,10 @@ class MedicalSegmentationApp(QMainWindow):
             if path in self.test_model_paths:
                 self.test_model_paths.remove(path)
             self.test_model_list.takeItem(self.test_model_list.row(current_item))
+        
+        # 如果没有模型了，禁用导出ONNX按钮
+        if not self.test_model_paths:
+            self.export_onnx_btn.setEnabled(False)
     
     def browse_test_data_dir(self):
         """选择测试数据目录"""
@@ -2364,16 +2628,120 @@ class MedicalSegmentationApp(QMainWindow):
                 }
             """)
     
+    def export_model_to_onnx(self):
+        """导出模型为ONNX格式"""
+        if not self.test_model_paths:
+            QMessageBox.warning(self, "警告", "请先选择要导出的模型文件")
+            return
+        
+        # 使用第一个选中的模型，或者让用户选择
+        model_path = self.test_model_paths[0]
+        if len(self.test_model_paths) > 1:
+            # 如果有多个模型，让用户选择
+            items = [os.path.basename(p) for p in self.test_model_paths]
+            item, ok = QInputDialog.getItem(self, "选择模型", "请选择要导出的模型:", items, 0, False)
+            if not ok:
+                return
+            model_path = self.test_model_paths[items.index(item)]
+        
+        # 获取模型架构和数据集类型
+        model_type = self.test_arch_combo.currentData() or self.test_arch_combo.currentText()
+        dataset_type = self.test_dataset_type_combo.currentData() or self.test_dataset_type_combo.currentText()
+        
+        # 询问输入尺寸
+        input_size_str, ok = QInputDialog.getText(
+            self, 
+            "输入尺寸", 
+            "请输入输入图像尺寸 (格式: HxW，例如: 512x512):",
+            text="512x512"
+        )
+        if not ok:
+            return
+        
+        try:
+            h, w = map(int, input_size_str.split('x'))
+            input_size = (h, w)
+        except:
+            QMessageBox.warning(self, "错误", "输入尺寸格式错误，请使用 HxW 格式（例如: 512x512）")
+            return
+        
+        # 选择输出路径
+        base_name = os.path.splitext(os.path.basename(model_path))[0]
+        default_path = os.path.join(os.path.dirname(model_path) or ".", f"{base_name}.onnx")
+        output_path, _ = QFileDialog.getSaveFileName(
+            self, 
+            "保存ONNX模型", 
+            default_path,
+            "ONNX模型 (*.onnx)"
+        )
+        
+        if not output_path:
+            return
+        
+        # 显示进度对话框
+        progress_dialog = QProgressDialog("正在导出ONNX模型...", "取消", 0, 0, self)
+        progress_dialog.setWindowTitle("导出ONNX")
+        progress_dialog.setWindowModality(Qt.WindowModal)
+        progress_dialog.setCancelButton(None)  # 不允许取消
+        progress_dialog.show()
+        QApplication.processEvents()
+        
+        try:
+            # 创建临时ModelTestThread来使用其导出方法
+            from worker import ModelTestThread
+            temp_test_thread = ModelTestThread(
+                model_paths=[model_path],
+                data_dir=".",  # 不需要数据目录
+                model_type=model_type,
+                use_tta=False,
+                enable_matlab_plots=False,
+                dataset_type=dataset_type
+            )
+            
+            # 执行导出
+            result_path = temp_test_thread.export_to_onnx(
+                model_path=model_path,
+                output_path=output_path,
+                input_size=input_size,
+                input_channels=None,  # 自动推断
+                opset_version=11
+            )
+            
+            progress_dialog.close()
+            
+            if result_path:
+                QMessageBox.information(
+                    self, 
+                    "导出成功", 
+                    f"ONNX模型已成功导出到:\n{result_path}\n\n"
+                    f"输入尺寸: {input_size[0]}x{input_size[1]}\n"
+                    f"模型架构: {model_type}\n"
+                    f"数据集类型: {dataset_type}"
+                )
+            else:
+                QMessageBox.critical(self, "导出失败", "ONNX模型导出失败，请查看控制台输出获取详细信息")
+                
+        except Exception as e:
+            progress_dialog.close()
+            QMessageBox.critical(
+                self, 
+                "导出失败", 
+                f"导出过程中发生错误:\n{str(e)}\n\n请查看控制台输出获取详细信息"
+            )
+            import traceback
+            print(f"[ONNX导出] 错误详情:\n{traceback.format_exc()}")
+    
     def start_model_test(self):
         """开始模型测试"""
         # 检查模型文件（集成功能已删除，仅支持单模型）
         if len(self.test_model_paths) < 1:
             QMessageBox.warning(self, "警告", "请至少选择一个模型文件")
             return
-            # 验证第一个模型文件
-            if not os.path.exists(self.test_model_paths[0]):
-                QMessageBox.warning(self, "警告", "模型文件不存在")
-                return
+        
+        # 验证第一个模型文件
+        if not os.path.exists(self.test_model_paths[0]):
+            QMessageBox.warning(self, "警告", "模型文件不存在")
+            return
         
         if not self.test_data_dir or not os.path.exists(self.test_data_dir):
             QMessageBox.warning(self, "警告", "请先选择有效的测试数据目录")
@@ -2382,13 +2750,19 @@ class MedicalSegmentationApp(QMainWindow):
         # 获取模型架构（从checkpoint推断或用户选择）
         model_type = self.test_arch_combo.currentData() or self.test_arch_combo.currentText()
         use_tta = self.test_use_tta_checkbox.isChecked()
+        # 获取数据集类型
+        dataset_type = self.test_dataset_type_combo.currentData() or self.test_dataset_type_combo.currentText()
+        # 获取MATLAB开关状态（与训练模块保持一致）
+        use_matlab = self.use_matlab_checkbox.isChecked() if hasattr(self, 'use_matlab_checkbox') else MATLAB_ENGINE_AVAILABLE
         
         # 创建测试线程（集成功能已删除）
         self.test_thread = ModelTestThread(
             model_paths=[self.test_model_paths[0]],  # 仅使用第一个模型
             data_dir=self.test_data_dir,
             model_type=model_type,
-            use_tta=use_tta
+            use_tta=use_tta,
+            enable_matlab_plots=use_matlab,  # 传递MATLAB开关状态，保持与主界面设置一致
+            dataset_type=dataset_type  # 传递数据集类型
         )
         self.test_thread.update_progress.connect(self.update_test_progress)
         self.test_thread.threshold_sweep_ready.connect(self.on_threshold_sweep_ready)
@@ -2740,15 +3114,26 @@ class MedicalSegmentationApp(QMainWindow):
                     font-weight: 500;
                 }
             """)
+            # 【GUI优化】如果勾选了保存结果，确保checkbox也勾选
+            if hasattr(self, 'save_results_checkbox'):
+                self.save_results_checkbox.setChecked(True)
             self.update_predict_btn_state()
             self.update_system_status("output_dir", directory, status="success")
     
     def update_predict_btn_state(self):
         """更新预测按钮状态"""
+        # 【GUI优化】如果勾选了保存结果，必须选择输出目录；否则不要求
+        save_results = self.save_results_checkbox.isChecked() if hasattr(self, 'save_results_checkbox') else True
+        output_dir_required = save_results and (self.output_dir is not None)
         enabled = (self.input_list.count() > 0 and 
                    self.model_path is not None and 
-                   self.output_dir is not None)
+                   (not save_results or output_dir_required))
         self.predict_btn.setEnabled(enabled)
+    
+    def on_save_results_changed(self, state):
+        """处理保存结果checkbox状态变化"""
+        # 如果取消勾选，允许不选输出目录；如果勾选，必须选择输出目录
+        self.update_predict_btn_state()
 
     def start_api_server(self):
         """启动内置API服务"""
@@ -3255,6 +3640,22 @@ class MedicalSegmentationApp(QMainWindow):
             QMessageBox.warning(self, "警告", "请先选择数据目录")
             return
         
+        # 【Bug修复】清空图表，确保每次训练都从空白图表开始
+        if hasattr(self, 'dice_ax'):
+            self.dice_ax.clear()
+            self.dice_ax.set_xlabel('训练轮次', fontsize=11, fontweight='bold')
+            self.dice_ax.set_ylabel('Dice系数', fontsize=11, fontweight='bold')
+            self.dice_ax.set_title('训练过程中Dice系数的变化', fontsize=12, fontweight='bold', pad=15)
+            self.dice_ax.grid(True, alpha=0.3, linestyle='--')
+            self.dice_ax.set_ylim([0, 1])
+            self.dice_ax.set_xlim([0, 10])
+            if hasattr(self, 'dice_canvas'):
+                self.dice_canvas.draw()
+        
+        # 【Bug修复】重置图表防抖状态，确保每次新训练都从第1轮开始
+        self.last_plotted_epoch = -1
+        self.epoch_history = []
+        
         self.train_btn.setEnabled(False)
         self.stop_train_btn.setEnabled(True)
         self.train_progress.setValue(0)
@@ -3274,10 +3675,46 @@ class MedicalSegmentationApp(QMainWindow):
         
         selected_optimizer = self.optimizer_combo.currentData() or "adam"
         os.environ["SEG_OPTIMIZER"] = selected_optimizer
+        
+        # 获取数据集类型
+        dataset_type = self.dataset_type_combo.currentData() or self.dataset_type_combo.currentText()
+        
+        # 【已移除限制】SMP模型（U-Net++和DeepLabV3+）现在支持标准数据集和2.5D数据集
+        # 系统会根据数据集类型自动调整输入通道数（标准=1通道，2.5D=3通道）
 
         # 准备实例化 TrainThread，添加异常捕获以排查初始化失败问题
         print(">>> [DEBUG] 准备实例化 TrainThread...")
+        print(f">>> [DEBUG] 数据集类型: {dataset_type}")
+        print(f">>> [DEBUG] 模型架构: {selected_arch}")
         try:
+            # 获取MATLAB开关状态
+            use_matlab = self.use_matlab_checkbox.isChecked() if hasattr(self, 'use_matlab_checkbox') else MATLAB_ENGINE_AVAILABLE
+            
+            # 【GUI优化】修复训练线程信号重复连接问题
+            # 在创建新线程之前，先断开旧线程的所有信号连接（如果存在）
+            old_thread = getattr(self, 'train_thread', None)
+            if old_thread is not None:
+                try:
+                    # 断开旧线程的所有信号连接
+                    old_thread.update_progress.disconnect()
+                    old_thread.update_val_progress.disconnect()
+                    old_thread.training_finished.disconnect()
+                    old_thread.model_saved.disconnect()
+                    old_thread.epoch_completed.disconnect()
+                    old_thread.test_results_ready.disconnect()
+                    old_thread.metrics_ready.disconnect()
+                    old_thread.visualization_ready.disconnect()
+                    old_thread.epoch_analysis_ready.disconnect()
+                    old_thread.attention_analysis_ready.disconnect()
+                    print(">>> [DEBUG] 已断开旧线程的信号连接")
+                except (TypeError, RuntimeError):
+                    # 如果信号未连接或已断开，忽略错误（这是正常的）
+                    pass
+                # 等待旧线程完全结束
+                if old_thread.isRunning():
+                    old_thread.wait()
+            
+            # 创建新线程
             self.train_thread = TrainThread(
                 data_dir=self.data_dir,
                 epochs=self.epochs_spin.value(),
@@ -3285,21 +3722,23 @@ class MedicalSegmentationApp(QMainWindow):
                 model_path=self.model_path,
                 save_best=save_best,
                 use_gwo=use_gwo,
-                optimizer_type=selected_optimizer
+                optimizer_type=selected_optimizer,
+                dataset_type=dataset_type,  # 传递数据集类型
+                enable_matlab_plots=use_matlab  # 传递MATLAB开关状态
             )
             print(">>> [DEBUG] TrainThread 实例化成功")
             
-            # 连接所有信号
+            # 连接所有信号（确保只连接一次）
             self.train_thread.update_progress.connect(self.update_train_progress)
-            self.train_thread.update_val_progress.connect(self.update_val_progress)  # 添加这行
+            self.train_thread.update_val_progress.connect(self.update_val_progress)
             self.train_thread.training_finished.connect(self.training_complete)
             self.train_thread.model_saved.connect(self.model_saved)
-            self.train_thread.epoch_completed.connect(self.update_train_stats)  # 添加这行
-            self.train_thread.test_results_ready.connect(self.display_test_results)  # 添加测试结果展示
-            self.train_thread.metrics_ready.connect(self.display_performance_metrics)  # 添加性能指标展示
-            self.train_thread.visualization_ready.connect(self.display_performance_chart)  # 添加性能分析图表展示
-            self.train_thread.epoch_analysis_ready.connect(self.display_epoch_analysis)  # 添加每个epoch的分析展示
-            self.train_thread.attention_analysis_ready.connect(self.display_attention_analysis)  # 添加注意力分析展示
+            self.train_thread.epoch_completed.connect(self.update_train_stats)
+            self.train_thread.test_results_ready.connect(self.display_test_results)
+            self.train_thread.metrics_ready.connect(self.display_performance_metrics)
+            self.train_thread.visualization_ready.connect(self.display_performance_chart)
+            self.train_thread.epoch_analysis_ready.connect(self.display_epoch_analysis)
+            self.train_thread.attention_analysis_ready.connect(self.display_attention_analysis)
             
             print(">>> [DEBUG] 所有信号连接成功，准备启动线程...")
             self.train_thread.start()
@@ -3332,6 +3771,22 @@ class MedicalSegmentationApp(QMainWindow):
         self.gwo_checkbox.setEnabled(is_gwo_supported)
         if not is_gwo_supported:
             self.gwo_checkbox.setChecked(False)
+        
+        # 【已移除限制】SMP模型（U-Net++和DeepLabV3+）现在支持标准数据集和2.5D数据集
+        # 用户可以根据需要自由选择数据集类型，系统会自动调整输入通道数
+    
+    def _on_dataset_type_changed(self):
+        """处理数据集类型选择变化"""
+        # 【已移除限制】所有模型都支持标准数据集和2.5D数据集
+        # 系统会根据数据集类型自动调整输入通道数，无需强制配对
+        dataset_type = self.dataset_type_combo.currentData() or self.dataset_type_combo.currentText()
+        selected_arch = self.arch_combo.currentData() or self.arch_combo.currentText()
+        
+        # 可选：显示信息提示（不强制）
+        if dataset_type == "2.5d":
+            # 2.5D数据集会使用3通道输入（上一张、当前、下一张切片堆叠）
+            # 所有模型都支持，系统会自动调整
+            pass
     
     def stop_training(self):
         """停止训练"""
@@ -3354,8 +3809,8 @@ class MedicalSegmentationApp(QMainWindow):
         self.val_loss_label.setText(f"验证Loss: {val_loss:.4f}")  
         self.dice_label.setText(f"Dice系数: {val_dice:.4f}")
         
-        # 更新Dice系数折线图
-        self.update_dice_chart()
+        # 更新Dice系数折线图（传入当前epoch，用于防抖去重）
+        self.update_dice_chart(epoch)
     
     def update_train_progress(self, value, message):
         """更新训练进度"""
@@ -3421,23 +3876,17 @@ class MedicalSegmentationApp(QMainWindow):
             QMessageBox.warning(self, "警告", "请添加要预测的图像")
             return
         
-        # 询问用户是否保存结果
-
-        reply = QMessageBox.question(self, '保存结果', 
-                                    '您想要保存预测结果吗?',
-                                    QMessageBox.Yes | QMessageBox.No, 
-                                    QMessageBox.Yes)
+        # 【GUI优化】统一预测输出目录流程：不再弹窗询问，直接使用checkbox状态和已选择的目录
+        save_results = self.save_results_checkbox.isChecked() if hasattr(self, 'save_results_checkbox') else True
         
-        save_results = reply == QMessageBox.Yes
-        output_dir = None
-        
+        # 如果勾选了保存但未选择输出目录，提示用户
         if save_results:
-            # 让用户选择输出目录
-            directory = QFileDialog.getExistingDirectory(self, "选择输出目录")
-            if not directory:
-                save_results = False
-            else:
-                output_dir = directory
+            if not self.output_dir:
+                QMessageBox.warning(self, "警告", "您已勾选保存结果，请先选择输出目录")
+                return
+            output_dir = self.output_dir
+        else:
+            output_dir = None
         
         image_paths = [self.input_list.itemText(i) for i in range(self.input_list.count())]
         self.predict_btn.setEnabled(False)
@@ -3771,12 +4220,18 @@ f"结果已保存到:\n{input_path}\n{output_path}")
         
         self.metrics_text.setText(metrics_text)
         
-        # 更新Dice系数折线图
-        self.update_dice_chart()
+        # 【Bug修复】移除重复的图表更新调用
+        # update_dice_chart() 已由 update_train_stats (epoch_completed 信号) 负责更新
+        # 这里不再重复调用，避免每个 epoch 的数据点被绘制两次
+        # self.update_dice_chart()  # 已移除
         
-        # 自动切换到性能分析标签页（仅在第一个epoch或每5个epoch切换一次，避免过于频繁）
-        if epoch == 1 or epoch % 5 == 0:
-            self.tab_widget.setCurrentIndex(3)  # 性能分析标签页是第4个（索引3）
+        # 【GUI优化】训练过程中不要自动切换Tab（避免打断用户）
+        # 只有在用户勾选了"训练时自动切换到分析页"时才自动切换
+        auto_switch = getattr(self, 'auto_switch_tab_checkbox', None)
+        if auto_switch and auto_switch.isChecked():
+            # 仅在第一个epoch或每5个epoch切换一次，避免过于频繁
+            if epoch == 1 or epoch % 5 == 0:
+                self.tab_widget.setCurrentIndex(3)  # 性能分析标签页是第4个（索引3）
     
     def display_test_results(self, viz_path, detailed_metrics):
         """显示测试集分割结果"""
@@ -3789,8 +4244,8 @@ f"结果已保存到:\n{input_path}\n{output_path}")
             self.test_zoom_factor = 1.0
             # 初始显示：适应窗口大小，但保持比例
             self._display_image_with_zoom('test', pixmap, 'fit')
-            # 自动切换到性能分析标签页以查看图表和指标
-            self.tab_widget.setCurrentIndex(3)  # 性能分析标签页是第4个（索引3）
+            # 【GUI优化】不再自动切换Tab，只更新数据（避免打断用户）
+            # 如果需要查看结果，用户可以手动切换到性能分析标签页
         else:
             self.test_results_label.setText(f"无法加载图像: {viz_path}")
             self.test_original_pixmap = None
@@ -3806,8 +4261,8 @@ f"结果已保存到:\n{input_path}\n{output_path}")
             self.perf_zoom_factor = 1.0
             # 初始显示：适应窗口大小，但保持比例
             self._display_image_with_zoom('perf', pixmap, 'fit')
-            # 自动切换到性能分析标签页
-            self.tab_widget.setCurrentIndex(3)  # 性能分析标签页是第4个（索引3）
+            # 【GUI优化】不再自动切换Tab，只更新数据（避免打断用户）
+            # 如果需要查看结果，用户可以手动切换到性能分析标签页
     
     def display_performance_metrics(self, detailed_metrics):
         """显示性能指标"""
@@ -3889,83 +4344,114 @@ f"结果已保存到:\n{input_path}\n{output_path}")
         # 更新Dice系数折线图
         self.update_dice_chart()
     
-    def update_dice_chart(self):
-        """更新Dice系数折线图"""
-        if (self.train_thread is not None and 
-            hasattr(self.train_thread, 'val_dice_history') and 
-            len(self.train_thread.val_dice_history) > 0):
+    def update_dice_chart(self, epoch=None):
+        """更新Dice系数折线图
+        
+        Args:
+            epoch: 当前epoch值（用于防抖去重）。如果为None，则从历史记录长度推断
+        """
+        if (self.train_thread is None or 
+            not hasattr(self.train_thread, 'val_dice_history') or 
+            len(self.train_thread.val_dice_history) == 0):
+            return
+        
+        # 【核心修复】防抖去重：如果这个 epoch 已经画过了，直接忽略
+        # 如果未传入epoch，从历史记录长度推断（向后兼容）
+        if epoch is None:
+            epoch = len(self.train_thread.val_dice_history)
+        
+        if epoch == self.last_plotted_epoch:
+            print(f"[UI防抖] 忽略重复的绘图请求: Epoch {epoch}")
+            return
+        
+        # 更新记录
+        self.last_plotted_epoch = epoch
+        
+        dice_values = self.train_thread.val_dice_history
+        
+        # 【核心修复】确保X轴使用真实的epoch值，而不是基于数据点数量自动生成
+        # 如果历史记录长度与epoch不匹配，说明数据可能有问题，使用实际长度
+        actual_length = len(dice_values)
+        if actual_length != epoch:
+            print(f"[UI警告] Epoch {epoch} 与历史记录长度 {actual_length} 不匹配，使用实际长度")
+            epoch = actual_length
+        
+        # 确保 epoch_history 与 dice_values 同步
+        # 如果 epoch_history 长度小于 dice_values，补齐缺失的epoch值
+        while len(self.epoch_history) < len(dice_values):
+            self.epoch_history.append(len(self.epoch_history) + 1)
+        
+        # 使用真实的epoch值作为X轴（确保每个epoch只对应一个数据点）
+        epochs = self.epoch_history[:len(dice_values)]
+        
+        # 更新折线图数据
+        self.dice_ax.clear()
+        self.dice_ax.plot(epochs, dice_values, 'o-', color='#4CAF50', linewidth=2.5, 
+                        markersize=8, label='Dice系数', markerfacecolor='#66BB6A',
+                        markeredgecolor='#2E7D32', markeredgewidth=1.5)
+        self.dice_ax.set_xlabel('训练轮次', fontsize=11, fontweight='bold')
+        self.dice_ax.set_ylabel('Dice系数', fontsize=11, fontweight='bold')
+        self.dice_ax.set_title('训练过程中Dice系数的变化', fontsize=12, fontweight='bold', pad=15)
+        self.dice_ax.grid(True, alpha=0.3, linestyle='--')
+        self.dice_ax.set_ylim([0, 1])
+        
+        # 智能调整X轴范围，确保所有数据点可见
+        max_epoch = max(epochs) if epochs else 1
+        # 如果轮次较少，显示更多空间；如果轮次较多，自动扩展
+        if max_epoch <= 10:
+            x_max = 10
+        else:
+            x_max = max_epoch + 2  # 留出一些边距
+        
+        self.dice_ax.set_xlim([0, x_max])
+        
+        # 设置X轴刻度，避免过于密集
+        if max_epoch <= 20:
+            self.dice_ax.set_xticks(range(0, x_max + 1, max(1, x_max // 10)))
+        else:
+            # 轮次较多时，只显示部分刻度
+            step = max(1, max_epoch // 10)
+            self.dice_ax.set_xticks(range(0, max_epoch + 1, step))
+        
+        # 设置Y轴刻度
+        self.dice_ax.set_yticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
+        self.dice_ax.set_yticklabels(['0.0', '0.2', '0.4', '0.6', '0.8', '1.0'])
+        
+        self.dice_ax.legend(loc='lower right', fontsize=10, framealpha=0.9)
+        
+        # 添加当前最大值标注
+        if dice_values:
+            max_idx = dice_values.index(max(dice_values))
+            max_epoch = epochs[max_idx]
+            max_dice = dice_values[max_idx]
             
-            epochs = list(range(1, len(self.train_thread.val_dice_history) + 1))
-            dice_values = self.train_thread.val_dice_history
+            # 确保标注不会超出图表范围
+            annotation_y = min(max_dice + 0.1, 0.95)
             
-            # 更新折线图数据
-            self.dice_ax.clear()
-            self.dice_ax.plot(epochs, dice_values, 'o-', color='#4CAF50', linewidth=2.5, 
-                            markersize=8, label='Dice系数', markerfacecolor='#66BB6A',
-                            markeredgecolor='#2E7D32', markeredgewidth=1.5)
-            self.dice_ax.set_xlabel('训练轮次', fontsize=11, fontweight='bold')
-            self.dice_ax.set_ylabel('Dice系数', fontsize=11, fontweight='bold')
-            self.dice_ax.set_title('训练过程中Dice系数的变化', fontsize=12, fontweight='bold', pad=15)
-            self.dice_ax.grid(True, alpha=0.3, linestyle='--')
-            self.dice_ax.set_ylim([0, 1])
-            
-            # 智能调整X轴范围，确保所有数据点可见
-            max_epoch = max(epochs) if epochs else 1
-            # 如果轮次较少，显示更多空间；如果轮次较多，自动扩展
-            if max_epoch <= 10:
-                x_max = 10
-            else:
-                x_max = max_epoch + 2  # 留出一些边距
-            
-            self.dice_ax.set_xlim([0, x_max])
-            
-            # 设置X轴刻度，避免过于密集
-            if max_epoch <= 20:
-                self.dice_ax.set_xticks(range(0, x_max + 1, max(1, x_max // 10)))
-            else:
-                # 轮次较多时，只显示部分刻度
-                step = max(1, max_epoch // 10)
-                self.dice_ax.set_xticks(range(0, max_epoch + 1, step))
-            
-            # 设置Y轴刻度
-            self.dice_ax.set_yticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
-            self.dice_ax.set_yticklabels(['0.0', '0.2', '0.4', '0.6', '0.8', '1.0'])
-            
-            self.dice_ax.legend(loc='lower right', fontsize=10, framealpha=0.9)
-            
-            # 添加当前最大值标注
-            if dice_values:
-                max_idx = dice_values.index(max(dice_values))
-                max_epoch = epochs[max_idx]
-                max_dice = dice_values[max_idx]
-                
-                # 确保标注不会超出图表范围
-                annotation_y = min(max_dice + 0.1, 0.95)
-                
-                self.dice_ax.annotate(f'最佳: {max_dice:.4f}\n轮次: {max_epoch}', 
-                                     xy=(max_epoch, max_dice),
-                                     xytext=(max_epoch, annotation_y),
-                                     arrowprops=dict(arrowstyle='->', color='#f44336', lw=2, 
-                                                   connectionstyle="arc3,rad=0.2"),
-                                     fontsize=9,
-                                     color='#f44336',
-                                     fontweight='bold',
-                                     bbox=dict(boxstyle='round,pad=0.5', facecolor='yellow', alpha=0.7))
-            
-            # 添加当前值标注（最后一个点）
-            if len(dice_values) > 0:
-                current_epoch = epochs[-1]
-                current_dice = dice_values[-1]
-                self.dice_ax.annotate(f'当前: {current_dice:.4f}', 
-                                     xy=(current_epoch, current_dice),
-                                     xytext=(current_epoch + 0.5, current_dice),
-                                     fontsize=8,
-                                     color='#1976d2',
-                                     bbox=dict(boxstyle='round,pad=0.3', facecolor='lightblue', alpha=0.6))
-            
-            # 优化布局，确保所有元素可见
-            self.dice_figure.subplots_adjust(left=0.12, right=0.95, top=0.90, bottom=0.15)
-            self.dice_canvas.draw()
+            self.dice_ax.annotate(f'最佳: {max_dice:.4f}\n轮次: {max_epoch}', 
+                                 xy=(max_epoch, max_dice),
+                                 xytext=(max_epoch, annotation_y),
+                                 arrowprops=dict(arrowstyle='->', color='#f44336', lw=2, 
+                                               connectionstyle="arc3,rad=0.2"),
+                                 fontsize=9,
+                                 color='#f44336',
+                                 fontweight='bold',
+                                 bbox=dict(boxstyle='round,pad=0.5', facecolor='yellow', alpha=0.7))
+        
+        # 添加当前值标注（最后一个点）
+        if len(dice_values) > 0:
+            current_epoch = epochs[-1]
+            current_dice = dice_values[-1]
+            self.dice_ax.annotate(f'当前: {current_dice:.4f}', 
+                                 xy=(current_epoch, current_dice),
+                                 xytext=(current_epoch + 0.5, current_dice),
+                                 fontsize=8,
+                                 color='#1976d2',
+                                 bbox=dict(boxstyle='round,pad=0.3', facecolor='lightblue', alpha=0.6))
+        
+        # 优化布局，确保所有元素可见
+        self.dice_figure.subplots_adjust(left=0.12, right=0.95, top=0.90, bottom=0.15)
+        self.dice_canvas.draw()
     
     def display_attention_analysis(self, viz_path, attention_stats):
         """显示注意力可解释性分析结果 - 优化版"""
@@ -4626,85 +5112,13 @@ f"结果已保存到:\n{input_path}\n{output_path}")
         # 请求可视化更新
         self.visualizer.plot_history(self.training_history)
 
-
-class EarlyStopping:
-    """自适应的早停策略，适配小数据场景（更平滑+暖启动+相对增益判定）。"""
-
-    def __init__(
-        self,
-        patience: int = 6,
-        min_delta: float = 5e-4,
-        min_rel_improve: float = 0.005,
-        warmup_epochs: int = 3,
-        cooldown: int = 1,
-        smoothing: float = 0.4,
-    ):
-        self.patience = max(1, patience)
-        self.min_delta = min_delta
-        self.min_rel = min_rel_improve
-        self.warmup_epochs = max(0, warmup_epochs)
-        self.cooldown = max(0, cooldown)
-        self.smoothing = min(max(smoothing, 0.0), 0.99)
-
-        self.best_score = -float("inf")
-        self.best_epoch = -1
-        self.bad_epochs = 0
-        self.epoch_counter = 0
-        self.cooldown_counter = 0
-        self._smoothed = None
-
-    def _update_smooth(self, score: float) -> float:
-        if self._smoothed is None:
-            self._smoothed = score
-        else:
-            self._smoothed = (
-                self.smoothing * self._smoothed + (1 - self.smoothing) * score
-            )
-        return self._smoothed
-
-    def step(self, score: float) :  # -> bool
-        self.epoch_counter += 1
-        smoothed = self._update_smooth(score)
-
-        # warmup: always observe a few epochs before starting to stop
-        if self.epoch_counter <= self.warmup_epochs:
-            if smoothed > self.best_score:
-                self.best_score = smoothed
-                self.best_epoch = self.epoch_counter
-            self.bad_epochs = 0
-            self.cooldown_counter = self.cooldown
-            return False
-
-        improvement = smoothed - self.best_score
-        rel_improvement = (
-            improvement / (abs(self.best_score) + 1e-8)
-            if self.best_score > -float("inf")
-            else float("inf")
-        )
-
-        if improvement > self.min_delta or rel_improvement > self.min_rel:
-            self.best_score = smoothed
-            self.best_epoch = self.epoch_counter
-            self.bad_epochs = 0
-            self.cooldown_counter = self.cooldown
-            return False
-
-        if self.cooldown_counter > 0:
-            self.cooldown_counter -= 1
-            return False
-
-        self.bad_epochs += 1
-        return self.bad_epochs >= self.patience
-
-
-
 # 注意：以下类和函数已在 utils.py 中定义，通过 from utils import * 导入：
 # - parse_extra_modalities_spec
 # - build_extra_modalities_lists
 # - normalize_volume_percentile
 # - MedicalImageDataset
 
-# EarlyStopping 类保留在此文件中（如果 worker.py 需要，可以考虑移到 utils.py）
+# EarlyStopping 类已在 utils.py 中定义，worker.py 从 utils.py 导入
 
 # 注意：以下 MATLAB 相关类已标记为已移除，但保留在此文件中以避免导入错误
 # 如果不再需要，可以删除这些类定义
@@ -4781,184 +5195,6 @@ class MatlabMetricsBridge:
             return None
 
 
-class MatlabVisualizationBridge:
-    """使用MATLAB绘制预测可视化网格。"""
-
-    _instance = None
-    _instance_lock = threading.Lock()
-
-    def __init__(self):
-        self.session = MatlabEngineSession.instance()
-
-    @classmethod
-    def instance(cls):
-        # MATLAB 功能已移除，直接返回 None，避免引用未定义的 MATLAB_ENGINE_AVAILABLE
-            return None
-
-    def render_prediction_grid(self, payload_mat_path: str, save_path: str):
-        engine, lock = self.session.acquire()
-        payload_mat = MatlabEngineSession.to_matlab_path(payload_mat_path)
-        save_mat = MatlabEngineSession.to_matlab_path(save_path)
-
-        script = f"""
-data = load('{payload_mat}');
-images = data.images;
-masks = data.masks;
-preds = data.preds;
-numSamples = min(size(images, 4), 4);
-cols = 4;
-fig = figure('Visible','off');
-tl = tiledlayout(fig, numSamples, cols, 'Padding','compact', 'TileSpacing','compact');
-for idx = 1:numSamples
-    img = images(:,:,:,idx);
-    mask = masks(:,:,idx) > 0.5;
-    predMask = preds(:,:,idx) > 0.5;
-    overlay = img;
-    channel1 = overlay(:,:,1);
-    channel1(mask) = 1;
-    overlay(:,:,1) = channel1;
-    channel2 = overlay(:,:,2);
-    channel2(predMask) = 1;
-    overlay(:,:,2) = channel2;
-    nexttile(tl); imshow(img, []); title(sprintf('样本 %d 输入', idx));
-    nexttile(tl); imshow(mask); title('真实Mask');
-    nexttile(tl); imshow(predMask); title('预测Mask');
-    nexttile(tl); imshow(overlay); title('叠加图');
-end
-exportgraphics(fig, '{save_mat}', 'Resolution', 200);
-close(fig);
-"""
-
-        with lock:
-            engine.eval(script, nargout=0)
-
-    def render_training_history(self, payload_mat_path: str, save_path: str):
-        engine, lock = self.session.acquire()
-        payload = MatlabEngineSession.to_matlab_path(payload_mat_path)
-        save_mat = MatlabEngineSession.to_matlab_path(save_path)
-        script = f"""
-data = load('{payload}');
-epochs = data.epochs;
-trainLoss = data.train_loss;
-valLoss = data.val_loss;
-valDice = data.val_dice;
-fig = figure('Visible','off');
-tiledlayout(fig,1,2,'Padding','compact','TileSpacing','compact');
-nexttile;
-plot(epochs, trainLoss, '-ob', 'LineWidth', 2); hold on;
-plot(epochs, valLoss, '-or', 'LineWidth', 2);
-title('训练/验证损失'); xlabel('轮次'); ylabel('Loss');
-legend('训练','验证','Location','best'); grid on;
-nexttile;
-plot(epochs, valDice, '-og', 'LineWidth', 2);
-title('验证Dice'); xlabel('轮次'); ylabel('Dice'); ylim([0 1]); grid on;
-exportgraphics(fig, '{save_mat}', 'Resolution', 200);
-close(fig);
-"""
-        with lock:
-            engine.eval(script, nargout=0)
-
-    def render_performance_analysis(self, payload_mat_path: str, save_path: str):
-        engine, lock = self.session.acquire()
-        payload = MatlabEngineSession.to_matlab_path(payload_mat_path)
-        save_mat = MatlabEngineSession.to_matlab_path(save_path)
-        script = f"""
-data = load('{payload}');
-metrics = data.metrics;
-avg = data.avg_metrics;
-stdVals = data.std_metrics;
-fig = figure('Visible','off');
-tiledlayout(fig,2,3,'Padding','compact','TileSpacing','compact');
-nexttile;
-histogram(metrics.dice,20,'FaceColor',[0.2 0.4 0.8]);
-xline(avg.dice,'r--','LineWidth',1.5);
-title('Dice分布'); xlabel('Dice'); ylabel('数量'); grid on;
-nexttile;
-histogram(metrics.iou,20,'FaceColor',[0.2 0.7 0.3]);
-xline(avg.iou,'r--','LineWidth',1.5);
-title('IoU分布'); xlabel('IoU'); ylabel('数量'); grid on;
-nexttile;
-histogram(metrics.precision,20,'FaceColor',[0.9 0.5 0.2]);
-xline(avg.precision,'r--','LineWidth',1.5);
-title('精确率分布'); xlabel('Precision'); ylabel('数量'); grid on;
-nexttile;
-vals = [avg.dice, avg.iou, avg.precision, avg.sensitivity, avg.specificity, avg.f1];
-err = [stdVals.dice, stdVals.iou, stdVals.precision, stdVals.sensitivity, stdVals.specificity, stdVals.f1];
-bar(vals,'FaceColor',[0.3 0.6 0.9]); hold on;
-errorbar(1:numel(vals), vals, err, 'k.', 'LineWidth', 1.5);
-set(gca,'XTickLabel',{'Dice','IoU','Precision','Recall','Specificity','F1'},'XTickLabelRotation',30);
-ylim([0 1]); title('平均性能'); grid on;
-nexttile;
-boxplot([metrics.dice', metrics.iou', metrics.precision', metrics.sensitivity', metrics.specificity', metrics.f1'],...
-    'Labels',{'Dice','IoU','Precision','Recall','Specificity','F1'});
-ylim([0 1]); title('指标箱线图'); grid on;
-nexttile;
-valsTable = [
-    avg.dice, stdVals.dice, data.min_metrics.dice, data.max_metrics.dice, data.median_metrics.dice;
-    avg.iou, stdVals.iou, data.min_metrics.iou, data.max_metrics.iou, data.median_metrics.iou;
-    avg.precision, stdVals.precision, data.min_metrics.precision, data.max_metrics.precision, data.median_metrics.precision;
-    avg.sensitivity, stdVals.sensitivity, data.min_metrics.sensitivity, data.max_metrics.sensitivity, data.median_metrics.sensitivity;
-    avg.specificity, stdVals.specificity, data.min_metrics.specificity, data.max_metrics.specificity, data.median_metrics.specificity;
-    avg.f1, stdVals.f1, data.min_metrics.f1, data.max_metrics.f1, data.median_metrics.f1;
-    avg.hd95, stdVals.hd95, data.min_metrics.hd95, data.max_metrics.hd95, data.median_metrics.hd95];
-ax = nexttile;
-axis(ax,'off');
-rowLabels = {{'Dice','IoU','Precision','Recall','Specificity','F1','HD95'}};
-for row = 1:size(valsTable,1)
-    yPos = 1 - row * 0.12;
-    text(0.01, yPos, sprintf('%-11s: 均值%.4f | std %.4f | min %.4f | max %.4f | median %.4f', ...
-        rowLabels{{row}}, valsTable(row,1), valsTable(row,2), valsTable(row,3), valsTable(row,4), valsTable(row,5)), ...
-        'FontSize',9,'Parent',ax);
-end
-title(ax,'统计摘要');
-exportgraphics(fig, '{save_mat}', 'Resolution', 200);
-close(fig);
-"""
-        with lock:
-            engine.eval(script, nargout=0)
-
-    def render_test_results(self, payload_mat_path: str, save_path: str):
-        engine, lock = self.session.acquire()
-        payload = MatlabEngineSession.to_matlab_path(payload_mat_path)
-        save_mat = MatlabEngineSession.to_matlab_path(save_path)
-        script = f"""
-data = load('{payload}');
-images = data.images;
-masks = data.masks;
-preds = data.preds;
-diceVals = data.dice;
-iouVals = data.iou;
-numSamples = size(images, 4);
-fig = figure('Visible','off');
-tiledlayout(fig, numSamples, 4, 'Padding','compact','TileSpacing','compact');
-for idx = 1:numSamples
-    img = images(:,:,:,idx);
-    mask = masks(:,:,idx) > 0.5;
-    pred = preds(:,:,idx) > 0.5;
-    overlay = img;
-    overlay(:,:,1) = max(overlay(:,:,1), mask);
-    overlay(:,:,2) = max(overlay(:,:,2), pred);
-    overlay(:,:,3) = max(overlay(:,:,3), mask & pred);
-    nexttile; imshow(img, []); title(sprintf('样本 %d 原图', idx));
-    nexttile; imshow(mask); title('真实Mask');
-    nexttile; imshow(pred); title(sprintf('预测Mask\\nDice %.3f / IoU %.3f', diceVals(idx), iouVals(idx)));
-    nexttile; imshow(overlay); title('叠加对比');
-end
-exportgraphics(fig, '{save_mat}', 'Resolution', 200);
-close(fig);
-"""
-        with lock:
-            engine.eval(script, nargout=0)
-
-    def render_attention_maps(self, payload_mat_path: str, save_path: str):
-        engine, lock = self.session.acquire()
-        payload = MatlabEngineSession.to_matlab_path(payload_mat_path)
-        save_mat = MatlabEngineSession.to_matlab_path(save_path)
-        script = f"""
-"""
-        with lock:
-            engine.eval(script, nargout=0)
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="医学图像分割GUI/API应用")
     parser.add_argument(
@@ -4993,13 +5229,16 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    if args.mode == "gui":
-        from PyQt5.QtWidgets import QApplication
+    # 【Windows 多进程支持】在 if __name__ == '__main__' 中预热 MATLAB 引擎
+    # 确保所有执行逻辑都在主进程中进行，避免多进程导入时的问题
+    _warmup_matlab_engine()
 
+    if args.mode == "gui":
+        # QApplication已在文件顶部导入，无需重复导入
         qt_app = QApplication(sys.argv)
         window = MedicalSegmentationApp()
         window.show()
-        sys.exit(qt_app.exec_())
+        sys.exit(qt_app.exec_())    
     else:
         if not args.model:
             parser.error("API模式必须通过--model提供模型路径")
