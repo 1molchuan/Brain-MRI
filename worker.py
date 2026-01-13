@@ -2599,7 +2599,8 @@ class TrainThread(QThread):
                     min_size=0,
                     use_morphology=True,
                     keep_largest=False,
-                    fill_holes=True
+                    fill_holes=True,
+                    prob_map=prob_map
                 )
                 return pred_mask_final
             
@@ -2630,7 +2631,8 @@ class TrainThread(QThread):
                 progress_callback=gwo_progress_callback,
                 use_mean_dice=True,  # 使用Mean Dice
                 postprocess_func=postprocess_func,  # 传递后处理函数
-                sample_ratio=0.2  # 【效率优化】在迭代过程中只使用20%的样本计算Fitness
+                sample_ratio=0.2,  # 【效率优化】在迭代过程中只使用20%的样本计算Fitness
+                metrics_func=self.calculate_batch_metrics  # 统一指标计算入口
             )
             
             # 执行优化（带错误处理和自动回退）
@@ -2714,7 +2716,8 @@ class TrainThread(QThread):
                     min_size=0,
                     use_morphology=True,
                     keep_largest=False,
-                    fill_holes=True
+                    fill_holes=True,
+                    prob_map=prob_map_tensor
                 )
                 
                 # 转换回numpy
@@ -2956,8 +2959,8 @@ class TrainThread(QThread):
                 if brain_mask is not None:
                     outputs = outputs * brain_mask
                 
-                preds = torch.sigmoid(outputs)
-                preds = (preds > optimal_thresh).float()  # 使用最优阈值
+                prob_maps = torch.sigmoid(outputs)
+                preds = (prob_maps > optimal_thresh).float()  # 使用最优阈值
                 
                 # 应用后处理优化：填充孔洞，不再强制只保留最大连通域
                 for i in range(preds.shape[0]):
@@ -2966,7 +2969,8 @@ class TrainThread(QThread):
                         min_size=30, 
                         use_morphology=True,
                         keep_largest=False,  # 允许多发病灶同时存在
-                        fill_holes=True     # 填充孔洞，去除假阴性空洞
+                        fill_holes=True,     # 填充孔洞，去除假阴性空洞
+                        prob_map=prob_maps[i, 0]
                     )
                 
                 # 计算批次中每个图像的指标
@@ -3204,7 +3208,8 @@ class TrainThread(QThread):
                         min_size=0,
                         use_morphology=True,
                         keep_largest=False,  # 允许多发病灶同时存在
-                        fill_holes=True     # 填充孔洞，去除假阴性空洞
+                        fill_holes=True,     # 填充孔洞，去除假阴性空洞
+                        prob_map=prob_map_tensor
                     )
                     preds[i, 0] = pred_mask_processed
                 
@@ -5450,7 +5455,8 @@ class TrainThread(QThread):
                                 min_size=0,
                                 use_morphology=True,
                                 keep_largest=False,  # 允许多发病灶同时存在
-                                fill_holes=True     # 填充孔洞，去除假阴性空洞
+                                fill_holes=True,     # 填充孔洞，去除假阴性空洞
+                                prob_map=prob_map_tensor
                             )
                             # post_process_mask会返回tensor或numpy，需要确保是tensor
                             if isinstance(pred_mask_processed, torch.Tensor):
@@ -5729,7 +5735,8 @@ class TrainThread(QThread):
                                 min_size=0,
                                 use_morphology=True,
                                 keep_largest=False,
-                                fill_holes=True
+                                fill_holes=True,
+                                prob_map=prob_map_tensor
                             )
                             if isinstance(pred_mask_processed, torch.Tensor):
                                 preds[i, 0] = pred_mask_processed.to(preds.device)
@@ -9275,6 +9282,9 @@ class TrainThread(QThread):
         enable_opening=True,
         opening_kernel_size: int = 3,
         opening_iterations: int = 1,
+        prob_map=None,
+        confidence_gate: float = 0.85,
+        min_largest_avg_prob: float = 0.5,
     ):
         """
         后处理优化预测mask - 增强版
@@ -9300,21 +9310,26 @@ class TrainThread(QThread):
             pred_np = pred_mask.copy()
             is_tensor = False
         
+        # 提取概率图用于置信度判断与平均概率计算
+        if prob_map is None:
+            prob_np = pred_np
+        else:
+            if isinstance(prob_map, torch.Tensor):
+                prob_np = prob_map.detach().cpu().numpy()
+            else:
+                prob_np = np.asarray(prob_map)
+        
         # 【关键修复】对于几乎为空的预测，更严格地处理，避免后处理引入假阳性
         pred_sum = pred_np.sum()
         
         # 【置信度预过滤】如果全图最大概率低于阈值，直接判定为全黑
         # 这可以避免低置信度的噪声被形态学操作放大
-        if hasattr(pred_mask, 'max') or (isinstance(pred_mask, torch.Tensor) and pred_mask.numel() > 0):
-            # 获取原始概率图（如果可用）
-            # 注意：这里pred_mask已经是二值化的，我们需要从外部传入prob_map
-            # 但为了简化，我们使用pred_np的最大值作为代理
-            max_prob_proxy = pred_np.max() if pred_np.size > 0 else 0.0
-            if max_prob_proxy < 0.3:  # 如果最大概率很低，直接清空
-                if is_tensor:
-                    return torch.zeros_like(pred_mask)
-                else:
-                    return np.zeros_like(pred_np)
+        max_prob_proxy = float(prob_np.max()) if prob_np.size > 0 else 0.0
+        if max_prob_proxy < confidence_gate:
+            if is_tensor:
+                return torch.zeros_like(pred_mask)
+            else:
+                return np.zeros_like(pred_np)
         
         # 如果预测像素数很少（< 100像素），可能是噪声，直接清空
         # 【动态阈值】根据图像大小调整阈值
@@ -9362,11 +9377,21 @@ class TrainThread(QThread):
                 
                 # 【关键优化】绝对最小面积限制：如果最大的块都小于阈值，说明全是噪点，直接清空
                 # 这样可以避免在空 GT 的情况下，微小噪点被保留导致 Dice 从 1.0 变成 0.0
+                largest_component = (labeled == largest_label).astype(np.uint8)
                 if max_size < min_size:
                     pred_binary = np.zeros_like(pred_binary)
                 else:
-                    # 只保留最大连通域
-                    pred_binary = (labeled == largest_label).astype(np.uint8)
+                    # 计算最大连通域的平均概率，避免低置信度大块被误保留
+                    if prob_np is not None and prob_np.size > 0:
+                        largest_mean_prob = float((prob_np * largest_component).sum() / max_size)
+                    else:
+                        largest_mean_prob = 1.0
+                    
+                    if largest_mean_prob < min_largest_avg_prob:
+                        pred_binary = np.zeros_like(pred_binary)
+                    else:
+                        # 只保留最大连通域
+                        pred_binary = largest_component
         else:
             # 4. 连通域分析 - 移除小区域（如果不使用keep_largest）
             # 【动态连通域过滤】根据图像大小和预测块大小动态调整min_size

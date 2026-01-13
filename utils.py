@@ -2146,7 +2146,7 @@ class GreyWolfThresholdOptimizer:
     """
     
     def __init__(self, num_wolves=10, max_iter=20, progress_callback=None, use_multiprocessing=True, 
-                 use_mean_dice=False, postprocess_func=None, sample_ratio=1.0):
+                 use_mean_dice=False, postprocess_func=None, sample_ratio=1.0, metrics_func=None):
         """
         Args:
             num_wolves: 灰狼数量（种群大小），默认10
@@ -2164,6 +2164,7 @@ class GreyWolfThresholdOptimizer:
         self.use_mean_dice = use_mean_dice
         self.postprocess_func = postprocess_func
         self.sample_ratio = sample_ratio
+        self.metrics_func = metrics_func
         # 搜索空间 [0.1, 0.9]
         self.lb = 0.1
         self.ub = 0.9
@@ -2364,20 +2365,10 @@ class GreyWolfThresholdOptimizer:
                         scores_np[wolf_idx] = self._threshold_cache[threshold_rounded]
                         continue
                     
-                    empty_dice_scores = []
-                    non_empty_dice_scores = []
-                    
-                    # 对每个样本计算Dice（分类统计）- 使用采样后的数据
+                    # 构建当前阈值下的预测mask列表
+                    pred_masks_list = []
                     for sample_idx in range(num_samples_sampled):
                         prob_map = prob_maps[sample_idx]  # (H, W)
-                        mask_gt = mask_gts[sample_idx]    # (H, W)
-                        
-                        # 判断是否为空mask
-                        gt_flat = mask_gt.flatten()
-                        mask_sum = gt_flat.sum()
-                        empty_threshold = max(1e-7, float(gt_flat.size) * 0.001)  # 0.1%像素
-                        
-                        # 使用阈值二值化
                         pred_mask = (prob_map >= threshold).astype(np.float32)
                         
                         # 应用后处理（如果提供）
@@ -2394,49 +2385,54 @@ class GreyWolfThresholdOptimizer:
                                 # 确保是2D数组
                                 if pred_mask.ndim > 2:
                                     pred_mask = pred_mask.squeeze()
-                                # 确保数据类型和形状正确
                                 pred_mask = pred_mask.astype(np.float32)
                                 if pred_mask.shape != prob_map.shape:
-                                    # 如果形状不匹配，使用原始预测
                                     pred_mask = (prob_map >= threshold).astype(np.float32)
-                            except Exception as e:
-                                # 如果后处理失败，使用原始预测（避免优化中断）
-                                pass
-                        
-                        # 计算单个样本的Dice
-                        pred_flat = pred_mask.flatten()
-                        pred_sum = pred_flat.sum()
-                        
-                        if mask_sum <= empty_threshold:
-                            # 空mask样本：GT为空
-                            if pred_sum <= 1e-7:
-                                dice_sample = 1.0  # GT为空，预测也为空，Dice=1.0
-                            else:
-                                dice_sample = 0.0  # GT为空，预测不为空（假阳性），Dice=0.0
-                            empty_dice_scores.append(float(dice_sample))
-                        else:
-                            # 有前景样本：计算标准Dice
-                            intersection = (pred_flat * gt_flat).sum()
-                            dice_den = 2.0 * intersection + pred_sum + mask_sum
-                            if dice_den < 1e-7:
-                                dice_sample = 0.0
-                            else:
-                                dice_sample = (2.0 * intersection) / dice_den
-                            non_empty_dice_scores.append(float(dice_sample))
+                            except Exception:
+                                # 后处理失败则回退原始预测
+                                pred_mask = (prob_map >= threshold).astype(np.float32)
+                        pred_masks_list.append(pred_mask)
                     
-                    # 【关键修复】使用Balanced Mean Dice：分别计算前景样本和空样本的平均分，再取均值
-                    # 这样可以防止数量众多的空样本带偏阈值搜索方向
-                    empty_mean = np.mean(empty_dice_scores) if empty_dice_scores else 1.0
-                    non_empty_mean = np.mean(non_empty_dice_scores) if non_empty_dice_scores else 0.0
-                    
-                    # 如果只有一类样本，使用该类样本的平均分
-                    if len(empty_dice_scores) == 0:
-                        balanced_dice = non_empty_mean
-                    elif len(non_empty_dice_scores) == 0:
-                        balanced_dice = empty_mean
+                    # 使用统一的指标计算函数（calculate_batch_metrics）作为单一真理源
+                    if self.metrics_func is not None:
+                        preds_batch_np = np.stack(pred_masks_list, axis=0)  # (N, H, W)
+                        targets_batch_np = mask_gts[:num_samples_sampled]
+                        preds_batch = torch.from_numpy(preds_batch_np).float().unsqueeze(1)   # (N,1,H,W)
+                        targets_batch = torch.from_numpy(targets_batch_np).float().unsqueeze(1)  # (N,1,H,W)
+                        metrics = self.metrics_func(preds_batch, targets_batch)
+                        dice_scores = metrics.get("dice", [])
+                        balanced_dice = float(np.mean(dice_scores)) if len(dice_scores) > 0 else 0.0
                     else:
-                        # 两类样本都存在，取均值（平衡权重，防止空样本带偏阈值）
-                        balanced_dice = (empty_mean + non_empty_mean) / 2.0
+                        # 回退逻辑：保持原有的平衡Dice计算
+                        empty_dice_scores = []
+                        non_empty_dice_scores = []
+                        for sample_idx in range(num_samples_sampled):
+                            mask_gt = mask_gts[sample_idx]    # (H, W)
+                            gt_flat = mask_gt.flatten()
+                            mask_sum = gt_flat.sum()
+                            empty_threshold = max(1e-7, float(gt_flat.size) * 0.001)  # 0.1%像素
+                            
+                            pred_mask = pred_masks_list[sample_idx]
+                            pred_flat = pred_mask.flatten()
+                            pred_sum = pred_flat.sum()
+                            
+                            if mask_sum <= empty_threshold:
+                                dice_sample = 1.0 if pred_sum <= 1e-7 else 0.0
+                                empty_dice_scores.append(float(dice_sample))
+                            else:
+                                intersection = (pred_flat * gt_flat).sum()
+                                dice_den = 2.0 * intersection + pred_sum + mask_sum
+                                dice_sample = 0.0 if dice_den < 1e-7 else (2.0 * intersection) / dice_den
+                                non_empty_dice_scores.append(float(dice_sample))
+                        
+                        empty_mean = np.mean(empty_dice_scores) if empty_dice_scores else 1.0
+                        non_empty_mean = np.mean(non_empty_dice_scores) if non_empty_dice_scores else 0.0
+                        if len(empty_dice_scores) == 0:
+                            balanced_dice = non_empty_mean
+                        elif len(non_empty_dice_scores) == 0:
+                            balanced_dice = empty_mean
+                        else:
+                            balanced_dice = (empty_mean + non_empty_mean) / 2.0
                     
                     scores_np[wolf_idx] = float(balanced_dice)
                     # 【缓存机制】缓存结果
@@ -2658,19 +2654,9 @@ class GreyWolfThresholdOptimizer:
                 # 【调试】验证样本数量
                 if num_samples < 500:  # 如果样本数太少，可能是采样数据而不是全量数据
                     print(f">>> [GWO警告] 全量评估样本数: {num_samples}，可能使用了采样数据而非全量数据")
-                empty_dice_scores = []
-                non_empty_dice_scores = []
-                
+                pred_masks_list = []
                 for sample_idx in range(num_samples):
                     prob_map = preds_np[sample_idx]
-                    mask_gt = targets_np[sample_idx]
-                    
-                    # 判断是否为空mask
-                    gt_flat = mask_gt.flatten()
-                    mask_sum = gt_flat.sum()
-                    empty_threshold = max(1e-7, float(gt_flat.size) * 0.001)
-                    
-                    # 使用阈值二值化
                     pred_mask = (prob_map >= threshold).astype(np.float32)
                     
                     # 应用后处理（如果提供）
@@ -2689,39 +2675,44 @@ class GreyWolfThresholdOptimizer:
                             if pred_mask.shape != prob_map.shape:
                                 pred_mask = (prob_map >= threshold).astype(np.float32)
                         except Exception:
-                            pass
-                    
-                    # 计算单个样本的Dice
-                    pred_flat = pred_mask.flatten()
-                    pred_sum = pred_flat.sum()
-                    
-                    if mask_sum <= empty_threshold:
-                        # 空mask样本
-                        if pred_sum <= 1e-7:
-                            dice_sample = 1.0
-                        else:
-                            dice_sample = 0.0
-                        empty_dice_scores.append(float(dice_sample))
-                    else:
-                        # 有前景样本
-                        intersection = (pred_flat * gt_flat).sum()
-                        dice_den = 2.0 * intersection + pred_sum + mask_sum
-                        if dice_den < 1e-7:
-                            dice_sample = 0.0
-                        else:
-                            dice_sample = (2.0 * intersection) / dice_den
-                        non_empty_dice_scores.append(float(dice_sample))
+                            pred_mask = (prob_map >= threshold).astype(np.float32)
+                    pred_masks_list.append(pred_mask)
                 
-                # 计算Balanced Mean Dice
-                empty_mean = np.mean(empty_dice_scores) if empty_dice_scores else 1.0
-                non_empty_mean = np.mean(non_empty_dice_scores) if non_empty_dice_scores else 0.0
-                
-                if len(empty_dice_scores) == 0:
-                    balanced_dice = non_empty_mean
-                elif len(non_empty_dice_scores) == 0:
-                    balanced_dice = empty_mean
+                if self.metrics_func is not None:
+                    preds_batch_np = np.stack(pred_masks_list, axis=0)
+                    preds_batch = torch.from_numpy(preds_batch_np).float().unsqueeze(1)
+                    targets_batch = torch.from_numpy(targets_np).float().unsqueeze(1)
+                    metrics = self.metrics_func(preds_batch, targets_batch)
+                    dice_scores = metrics.get("dice", [])
+                    balanced_dice = float(np.mean(dice_scores)) if len(dice_scores) > 0 else 0.0
                 else:
-                    balanced_dice = (empty_mean + non_empty_mean) / 2.0
+                    # 回退到原有的平衡Dice计算
+                    empty_dice_scores = []
+                    non_empty_dice_scores = []
+                    for sample_idx in range(num_samples):
+                        mask_gt = targets_np[sample_idx]
+                        gt_flat = mask_gt.flatten()
+                        mask_sum = gt_flat.sum()
+                        empty_threshold = max(1e-7, float(gt_flat.size) * 0.001)
+                        pred_mask = pred_masks_list[sample_idx]
+                        pred_flat = pred_mask.flatten()
+                        pred_sum = pred_flat.sum()
+                        if mask_sum <= empty_threshold:
+                            dice_sample = 1.0 if pred_sum <= 1e-7 else 0.0
+                            empty_dice_scores.append(float(dice_sample))
+                        else:
+                            intersection = (pred_flat * gt_flat).sum()
+                            dice_den = 2.0 * intersection + pred_sum + mask_sum
+                            dice_sample = 0.0 if dice_den < 1e-7 else (2.0 * intersection) / dice_den
+                            non_empty_dice_scores.append(float(dice_sample))
+                    empty_mean = np.mean(empty_dice_scores) if empty_dice_scores else 1.0
+                    non_empty_mean = np.mean(non_empty_dice_scores) if non_empty_dice_scores else 0.0
+                    if len(empty_dice_scores) == 0:
+                        balanced_dice = non_empty_mean
+                    elif len(non_empty_dice_scores) == 0:
+                        balanced_dice = empty_mean
+                    else:
+                        balanced_dice = (empty_mean + non_empty_mean) / 2.0
                 
                 return float(balanced_dice)
         except Exception as e:
