@@ -1106,6 +1106,14 @@ class MedicalSegmentationApp(QMainWindow):
         self.arch_combo.currentIndexChanged.connect(self._on_arch_changed)
         self._on_arch_changed()
         
+        # 【GUI优化】训练时自动切换到分析页选项（默认关闭）
+        self.auto_switch_tab_checkbox = QCheckBox("训练时自动切换到分析页")
+        self.auto_switch_tab_checkbox.setChecked(False)  # 默认关闭
+        self.auto_switch_tab_checkbox.setToolTip(
+            "勾选后，训练过程中会在第1个epoch或每5个epoch自动切换到性能分析标签页\n"
+            "取消勾选则只更新图表数据，不自动切换标签页（避免打断用户）"
+        )
+        
         # 数据集类型选择（2.5D vs 普通）
         dataset_type_label = QLabel("📊 数据集类型:")
         dataset_type_label.setStyleSheet("font-weight: 600; color: #475569;")
@@ -1147,6 +1155,7 @@ class MedicalSegmentationApp(QMainWindow):
         params_layout.addWidget(arch_label)
         params_layout.addWidget(self.arch_combo)
         params_layout.addWidget(self.gwo_checkbox)
+        params_layout.addWidget(self.auto_switch_tab_checkbox)
         params_layout.addWidget(dataset_type_label)
         params_layout.addWidget(self.dataset_type_combo)
         params_layout.addWidget(optimizer_label)
@@ -1360,6 +1369,12 @@ class MedicalSegmentationApp(QMainWindow):
         output_layout.setSpacing(12)
         output_layout.setContentsMargins(15, 20, 15, 15)
         
+        # 【GUI优化】添加保存结果checkbox
+        self.save_results_checkbox = QCheckBox("💾 保存/导出结果")
+        self.save_results_checkbox.setChecked(True)  # 默认勾选
+        self.save_results_checkbox.setToolTip("勾选后将保存预测结果到输出目录")
+        self.save_results_checkbox.stateChanged.connect(self.on_save_results_changed)
+        
         self.output_dir_label = QLabel("✗ 未选择输出目录")
         self.output_dir_label.setWordWrap(True)
         self.output_dir_label.setStyleSheet("""
@@ -1378,6 +1393,7 @@ class MedicalSegmentationApp(QMainWindow):
         browse_output_btn.setToolTip("选择保存预测结果的目录")
         browse_output_btn.clicked.connect(self.browse_output_dir)
 
+        output_layout.addWidget(self.save_results_checkbox)
         output_layout.addWidget(self.output_dir_label)
         output_layout.addWidget(browse_output_btn)
         output_group.setLayout(output_layout)
@@ -3098,15 +3114,26 @@ class MedicalSegmentationApp(QMainWindow):
                     font-weight: 500;
                 }
             """)
+            # 【GUI优化】如果勾选了保存结果，确保checkbox也勾选
+            if hasattr(self, 'save_results_checkbox'):
+                self.save_results_checkbox.setChecked(True)
             self.update_predict_btn_state()
             self.update_system_status("output_dir", directory, status="success")
     
     def update_predict_btn_state(self):
         """更新预测按钮状态"""
+        # 【GUI优化】如果勾选了保存结果，必须选择输出目录；否则不要求
+        save_results = self.save_results_checkbox.isChecked() if hasattr(self, 'save_results_checkbox') else True
+        output_dir_required = save_results and (self.output_dir is not None)
         enabled = (self.input_list.count() > 0 and 
                    self.model_path is not None and 
-                   self.output_dir is not None)
+                   (not save_results or output_dir_required))
         self.predict_btn.setEnabled(enabled)
+    
+    def on_save_results_changed(self, state):
+        """处理保存结果checkbox状态变化"""
+        # 如果取消勾选，允许不选输出目录；如果勾选，必须选择输出目录
+        self.update_predict_btn_state()
 
     def start_api_server(self):
         """启动内置API服务"""
@@ -3663,21 +3690,8 @@ class MedicalSegmentationApp(QMainWindow):
             # 获取MATLAB开关状态
             use_matlab = self.use_matlab_checkbox.isChecked() if hasattr(self, 'use_matlab_checkbox') else MATLAB_ENGINE_AVAILABLE
             
-            self.train_thread = TrainThread(
-                data_dir=self.data_dir,
-                epochs=self.epochs_spin.value(),
-                batch_size=self.batch_spin.value(),
-                model_path=self.model_path,
-                save_best=save_best,
-                use_gwo=use_gwo,
-                optimizer_type=selected_optimizer,
-                dataset_type=dataset_type,  # 传递数据集类型
-                enable_matlab_plots=use_matlab  # 传递MATLAB开关状态
-            )
-            print(">>> [DEBUG] TrainThread 实例化成功")
-            
-            # 【Bug修复】防止信号重复连接导致数据重复显示
-            # 在连接新信号之前，先断开旧线程的所有信号连接（如果存在）
+            # 【GUI优化】修复训练线程信号重复连接问题
+            # 在创建新线程之前，先断开旧线程的所有信号连接（如果存在）
             old_thread = getattr(self, 'train_thread', None)
             if old_thread is not None:
                 try:
@@ -3696,6 +3710,23 @@ class MedicalSegmentationApp(QMainWindow):
                 except (TypeError, RuntimeError):
                     # 如果信号未连接或已断开，忽略错误（这是正常的）
                     pass
+                # 等待旧线程完全结束
+                if old_thread.isRunning():
+                    old_thread.wait()
+            
+            # 创建新线程
+            self.train_thread = TrainThread(
+                data_dir=self.data_dir,
+                epochs=self.epochs_spin.value(),
+                batch_size=self.batch_spin.value(),
+                model_path=self.model_path,
+                save_best=save_best,
+                use_gwo=use_gwo,
+                optimizer_type=selected_optimizer,
+                dataset_type=dataset_type,  # 传递数据集类型
+                enable_matlab_plots=use_matlab  # 传递MATLAB开关状态
+            )
+            print(">>> [DEBUG] TrainThread 实例化成功")
             
             # 连接所有信号（确保只连接一次）
             self.train_thread.update_progress.connect(self.update_train_progress)
@@ -3845,23 +3876,17 @@ class MedicalSegmentationApp(QMainWindow):
             QMessageBox.warning(self, "警告", "请添加要预测的图像")
             return
         
-        # 询问用户是否保存结果
-
-        reply = QMessageBox.question(self, '保存结果', 
-                                    '您想要保存预测结果吗?',
-                                    QMessageBox.Yes | QMessageBox.No, 
-                                    QMessageBox.Yes)
+        # 【GUI优化】统一预测输出目录流程：不再弹窗询问，直接使用checkbox状态和已选择的目录
+        save_results = self.save_results_checkbox.isChecked() if hasattr(self, 'save_results_checkbox') else True
         
-        save_results = reply == QMessageBox.Yes
-        output_dir = None
-        
+        # 如果勾选了保存但未选择输出目录，提示用户
         if save_results:
-            # 让用户选择输出目录
-            directory = QFileDialog.getExistingDirectory(self, "选择输出目录")
-            if not directory:
-                save_results = False
-            else:
-                output_dir = directory
+            if not self.output_dir:
+                QMessageBox.warning(self, "警告", "您已勾选保存结果，请先选择输出目录")
+                return
+            output_dir = self.output_dir
+        else:
+            output_dir = None
         
         image_paths = [self.input_list.itemText(i) for i in range(self.input_list.count())]
         self.predict_btn.setEnabled(False)
@@ -4200,9 +4225,13 @@ f"结果已保存到:\n{input_path}\n{output_path}")
         # 这里不再重复调用，避免每个 epoch 的数据点被绘制两次
         # self.update_dice_chart()  # 已移除
         
-        # 自动切换到性能分析标签页（仅在第一个epoch或每5个epoch切换一次，避免过于频繁）
-        if epoch == 1 or epoch % 5 == 0:
-            self.tab_widget.setCurrentIndex(3)  # 性能分析标签页是第4个（索引3）
+        # 【GUI优化】训练过程中不要自动切换Tab（避免打断用户）
+        # 只有在用户勾选了"训练时自动切换到分析页"时才自动切换
+        auto_switch = getattr(self, 'auto_switch_tab_checkbox', None)
+        if auto_switch and auto_switch.isChecked():
+            # 仅在第一个epoch或每5个epoch切换一次，避免过于频繁
+            if epoch == 1 or epoch % 5 == 0:
+                self.tab_widget.setCurrentIndex(3)  # 性能分析标签页是第4个（索引3）
     
     def display_test_results(self, viz_path, detailed_metrics):
         """显示测试集分割结果"""
@@ -4215,8 +4244,8 @@ f"结果已保存到:\n{input_path}\n{output_path}")
             self.test_zoom_factor = 1.0
             # 初始显示：适应窗口大小，但保持比例
             self._display_image_with_zoom('test', pixmap, 'fit')
-            # 自动切换到性能分析标签页以查看图表和指标
-            self.tab_widget.setCurrentIndex(3)  # 性能分析标签页是第4个（索引3）
+            # 【GUI优化】不再自动切换Tab，只更新数据（避免打断用户）
+            # 如果需要查看结果，用户可以手动切换到性能分析标签页
         else:
             self.test_results_label.setText(f"无法加载图像: {viz_path}")
             self.test_original_pixmap = None
@@ -4232,8 +4261,8 @@ f"结果已保存到:\n{input_path}\n{output_path}")
             self.perf_zoom_factor = 1.0
             # 初始显示：适应窗口大小，但保持比例
             self._display_image_with_zoom('perf', pixmap, 'fit')
-            # 自动切换到性能分析标签页
-            self.tab_widget.setCurrentIndex(3)  # 性能分析标签页是第4个（索引3）
+            # 【GUI优化】不再自动切换Tab，只更新数据（避免打断用户）
+            # 如果需要查看结果，用户可以手动切换到性能分析标签页
     
     def display_performance_metrics(self, detailed_metrics):
         """显示性能指标"""
