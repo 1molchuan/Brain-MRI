@@ -1638,6 +1638,158 @@ def ensemble_post_process_global(ensemble_mask, use_lcc=True, use_remove_holes=T
     return binary_mask.astype(np.float32)
 
 
+def refine_segmentation_mask(mask, 
+                             closing_kernel_size=5, 
+                             opening_kernel_size=3,
+                             use_largest_component=True,
+                             use_gaussian_blur=True,
+                             gaussian_sigma=1.0,
+                             use_median_filter=True,
+                             median_kernel_size=5,
+                             hole_area_threshold=500):
+    """
+    分割结果后处理函数：去除噪声点、填充空洞、平滑边缘（改进版）
+    
+    改进的处理流程（重点解决边缘毛刺问题）：
+    1. 形态学闭运算：确保边界闭合，填充小裂缝
+    2. 多级平滑：
+       - 先执行中值滤波（5×5）去除孤立像素和"狗啃"状毛刺
+       - 再执行高斯滤波平滑边缘
+    3. 重新二值化：确保掩码清晰
+    4. 开运算：移除细小噪点
+    5. 孔洞修补：使用 remove_small_holes 填补内部空洞（area_threshold=500）
+    6. 最大连通域提取：只保留面积最大的分割区域
+    
+    Args:
+        mask: 输入的分割掩码 (numpy array, H x W)，可以是二值掩码(0/1)或概率图(0-1)
+        closing_kernel_size: 闭运算的核大小（奇数，推荐5-7）
+        opening_kernel_size: 开运算的核大小（奇数，推荐3-5）
+        use_largest_component: 是否使用最大连通域提取
+        use_gaussian_blur: 是否使用高斯滤波平滑边缘
+        gaussian_sigma: 高斯滤波的标准差（推荐0.5-2.0）
+        use_median_filter: 是否使用中值滤波（默认True，用于去除毛刺）
+        median_kernel_size: 中值滤波的核大小（默认5，推荐5×5）
+        hole_area_threshold: 孔洞修补的面积阈值（默认500像素）
+    
+    Returns:
+        refined_mask: 处理后的二值掩码 (numpy array, H x W, 0-1)
+    
+    Example:
+        >>> import numpy as np
+        >>> mask = np.random.rand(512, 512) > 0.5
+        >>> refined = refine_segmentation_mask(mask)
+        >>> print(f"原始掩码面积: {mask.sum()}, 处理后面积: {refined.sum()}")
+    """
+    # 确保输入是numpy数组
+    if isinstance(mask, torch.Tensor):
+        mask_np = mask.detach().cpu().numpy()
+    else:
+        mask_np = np.asarray(mask)
+    
+    # 确保是2D数组
+    if mask_np.ndim > 2:
+        mask_np = mask_np.squeeze()
+    
+    # 二值化：如果输入是概率图，转换为二值掩码
+    if mask_np.max() <= 1.0 and mask_np.min() >= 0.0:
+        # 可能是概率图，使用0.5作为阈值
+        binary_mask = (mask_np > 0.5).astype(np.uint8)
+    else:
+        # 已经是二值掩码
+        binary_mask = (mask_np > 0).astype(np.uint8)
+    
+    # 如果掩码全为空，直接返回
+    if binary_mask.sum() == 0:
+        return binary_mask.astype(np.float32)
+    
+    # 【步骤1：形态学闭运算 - 确保边界闭合】
+    # 闭运算 = 先膨胀后腐蚀，可以填充物体内部的小空洞和小裂缝，确保边界闭合
+    if closing_kernel_size > 0:
+        kernel_closing = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, 
+            (closing_kernel_size, closing_kernel_size)
+        )
+        binary_mask = cv2.morphologyEx(
+            binary_mask, 
+            cv2.MORPH_CLOSE, 
+            kernel_closing, 
+            iterations=1
+        )
+    
+    # 【步骤2：多级平滑 - 先中值滤波再高斯滤波】
+    # 中值滤波：去除孤立像素和"狗啃"状毛刺（关键步骤）
+    if use_median_filter and binary_mask.sum() > 0:
+        # 使用5×5中值滤波去除毛刺和孤立像素
+        binary_mask = cv2.medianBlur(binary_mask, median_kernel_size)
+    
+    # 高斯滤波：进一步平滑边缘
+    if use_gaussian_blur and binary_mask.sum() > 0:
+        # 高斯滤波需要先将二值掩码转换为浮点数
+        mask_float = binary_mask.astype(np.float32)
+        smoothed = cv2.GaussianBlur(
+            mask_float, 
+            (0, 0),  # 自动计算核大小
+            sigmaX=gaussian_sigma, 
+            sigmaY=gaussian_sigma
+        )
+        # 重新二值化，确保掩码清晰
+        binary_mask = (smoothed > 0.5).astype(np.uint8)
+    
+    # 【步骤3：开运算 - 移除细小噪点】
+    # 开运算 = 先腐蚀后膨胀，可以移除小的孤立噪点
+    if opening_kernel_size > 0 and binary_mask.sum() > 0:
+        kernel_opening = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, 
+            (opening_kernel_size, opening_kernel_size)
+        )
+        binary_mask = cv2.morphologyEx(
+            binary_mask, 
+            cv2.MORPH_OPEN, 
+            kernel_opening, 
+            iterations=1
+        )
+    
+    # 【步骤4：孔洞修补 - 填补内部空洞】
+    # 使用 skimage.morphology.remove_small_holes 填补病灶内部的黑色空洞
+    if binary_mask.sum() > 0:
+        if SKIMAGE_MORPHOLOGY_AVAILABLE:
+            # 使用 skimage.morphology.remove_small_holes（更精确）
+            binary_mask = morphology.remove_small_holes(
+                binary_mask.astype(bool), 
+                area_threshold=hole_area_threshold
+            ).astype(np.uint8)
+        else:
+            # 使用 scipy 实现（回退方案）
+            # 反转掩码，找到孔洞（背景中的连通域）
+            inverted = (~binary_mask.astype(bool)).astype(np.uint8)
+            labeled_holes, num_holes = ndimage.label(inverted)
+            if num_holes > 0:
+                # 计算每个孔洞的大小
+                hole_sizes = ndimage.sum(inverted, labeled_holes, range(1, num_holes + 1))
+                # 找到需要填补的小孔洞
+                small_holes = []
+                for i, size in enumerate(hole_sizes):
+                    if size < hole_area_threshold:
+                        small_holes.append(i + 1)
+                # 填补小孔洞
+                if small_holes:
+                    for hole_label in small_holes:
+                        binary_mask[labeled_holes == hole_label] = 1
+    
+    # 【步骤5：最大连通域提取 - 只保留最大区域】
+    if use_largest_component and binary_mask.sum() > 0:
+        labeled, num_features = ndimage.label(binary_mask)
+        if num_features > 0:
+            # 计算每个连通域的面积
+            sizes = ndimage.sum(binary_mask, labeled, range(1, num_features + 1))
+            # 找到最大的连通域
+            largest_label = np.argmax(sizes) + 1
+            # 只保留最大连通域
+            binary_mask = (labeled == largest_label).astype(np.uint8)
+    
+    return binary_mask.astype(np.float32)
+
+
 def calculate_official_total_score_global(dice, iou, hd95, sensitivity, specificity):
     """
     计算比赛官方总分公式：
@@ -2165,9 +2317,9 @@ class GreyWolfThresholdOptimizer:
         self.postprocess_func = postprocess_func
         self.sample_ratio = sample_ratio
         self.metrics_func = metrics_func
-        # 搜索空间 [0.1, 0.9]
-        self.lb = 0.1
-        self.ub = 0.9
+        # 搜索空间 [0.05, 0.95]（扩大范围，覆盖更广的阈值空间）
+        self.lb = 0.05
+        self.ub = 0.95
         # 【缓存机制】缓存阈值和对应的Dice分数，避免重复计算
         self._threshold_cache = {}  # {threshold_rounded: dice_score}
         self._cache_tolerance = 0.001  # 阈值差值<0.001时复用结果

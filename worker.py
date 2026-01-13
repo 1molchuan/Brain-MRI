@@ -6508,7 +6508,7 @@ class TrainThread(QThread):
             in_channels = 3  # 2.5D输入：上一张、当前、下一张
             dataset_mode = "2.5D模式"
         else:
-            in_channels = 1  # 标准数据集：单通道输入
+            in_channels = 3  # 标准数据集：单通道输入
             dataset_mode = "标准模式"
         
         if self.model_type == "resnet_unet":
