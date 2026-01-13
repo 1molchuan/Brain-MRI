@@ -2145,21 +2145,31 @@ class GreyWolfThresholdOptimizer:
     相比线性扫描，GWO 能够更智能地搜索阈值空间，在更少的迭代次数内找到更优解。
     """
     
-    def __init__(self, num_wolves=10, max_iter=20, progress_callback=None, use_multiprocessing=True):
+    def __init__(self, num_wolves=10, max_iter=20, progress_callback=None, use_multiprocessing=True, 
+                 use_mean_dice=False, postprocess_func=None, sample_ratio=1.0):
         """
         Args:
             num_wolves: 灰狼数量（种群大小），默认10
             max_iter: 最大迭代次数，默认20
             progress_callback: 进度回调函数，接收 (iteration, max_iter, best_score, best_threshold) 参数
             use_multiprocessing: 是否在CPU模式下使用多进程（默认True）
+            use_mean_dice: 是否使用Mean Dice（每个样本分别计算再平均），默认False（使用Global Dice）
+            postprocess_func: 后处理函数，接收(pred_mask, prob_map)返回处理后的mask，默认None（不使用后处理）
+            sample_ratio: 采样比例，在迭代过程中只使用部分样本计算Fitness（0.0-1.0），默认1.0（使用全部样本）
         """
         self.num_wolves = num_wolves
         self.max_iter = max_iter
         self.progress_callback = progress_callback
         self.use_multiprocessing = use_multiprocessing
+        self.use_mean_dice = use_mean_dice
+        self.postprocess_func = postprocess_func
+        self.sample_ratio = sample_ratio
         # 搜索空间 [0.1, 0.9]
         self.lb = 0.1
         self.ub = 0.9
+        # 【缓存机制】缓存阈值和对应的Dice分数，避免重复计算
+        self._threshold_cache = {}  # {threshold_rounded: dice_score}
+        self._cache_tolerance = 0.001  # 阈值差值<0.001时复用结果
 
     def optimize(self, preds, targets, device=None):
         """
@@ -2233,28 +2243,75 @@ class GreyWolfThresholdOptimizer:
         
         # 统一维度：如果是4D，取第一个通道
         if preds.ndim == 4:
-            preds = preds[:, 0]
+            preds = preds[:, 0]  # (N, H, W)
         if targets.ndim == 4:
-            targets = targets[:, 0]
+            targets = targets[:, 0]  # (N, H, W)
         
-        # 展平为一维tensor
-        preds_flat = preds.flatten().float()
-        targets_flat = targets.flatten().float()
+        # 【关键修复】保存原始形状（用于Mean Dice计算）
+        num_samples = preds.shape[0]
+        spatial_shape = preds.shape[1:]  # (H, W)
         
-        # 如果是CPU模式，转换为numpy数组（多进程和单进程都需要）
-        if not use_gpu:
-            preds_flat_np = preds_flat.cpu().numpy()
-            targets_flat_np = targets_flat.cpu().numpy()
-            # 如果启用多进程，获取全局进程池管理器
-            if self.use_multiprocessing:
-                pool_manager = ProcessPoolManager()
-                pool = pool_manager.get_pool(pool_size=min(self.num_wolves, mp.cpu_count() - 1))
-            else:
-                pool = None
+        # 【效率优化】保存全量数据，用于最终评估
+        # 在迭代过程中使用采样数据，最终评估时使用全量数据
+        if isinstance(preds, torch.Tensor):
+            full_preds = preds.clone()
+            full_targets = targets.clone()
         else:
+            full_preds = preds.copy()
+            full_targets = targets.copy()
+        
+        # 【效率优化】计算采样索引（等间隔采样）
+        num_samples_sampled = num_samples
+        sample_indices = None
+        if self.sample_ratio < 1.0:
+            sample_size = max(1, int(num_samples * self.sample_ratio))
+            # 等间隔采样
+            sample_indices = np.linspace(0, num_samples - 1, sample_size, dtype=np.int32)
+            # 在迭代过程中使用采样数据
+            if isinstance(preds, torch.Tensor):
+                preds = preds[sample_indices]
+                targets = targets[sample_indices]
+            else:
+                preds = preds[sample_indices]
+                targets = targets[sample_indices]
+            num_samples_sampled = len(sample_indices)
+            print(f">>> [GWO效率优化] 采样计算: {num_samples_sampled}/{num_samples} 样本 ({100*self.sample_ratio:.0f}%)")
+        
+        # 根据是否使用Mean Dice决定数据处理方式
+        if self.use_mean_dice:
+            # Mean Dice模式：保持(N, H, W)形状，按样本分别计算
+            # 如果是CPU模式，转换为numpy数组
+            if not use_gpu:
+                preds_np = preds.cpu().numpy() if isinstance(preds, torch.Tensor) else preds
+                targets_np = targets.cpu().numpy() if isinstance(targets, torch.Tensor) else targets
+            else:
+                # GPU模式：保持在GPU上，但需要按样本处理
+                preds_np = None
+                targets_np = None
+            preds_flat = None
+            targets_flat = None
             preds_flat_np = None
             targets_flat_np = None
             pool = None
+        else:
+            # Global Dice模式：展平为一维tensor（原有逻辑）
+            preds_flat = preds.flatten().float()
+            targets_flat = targets.flatten().float()
+            
+            # 如果是CPU模式，转换为numpy数组（多进程和单进程都需要）
+            if not use_gpu:
+                preds_flat_np = preds_flat.cpu().numpy()
+                targets_flat_np = targets_flat.cpu().numpy()
+                # 如果启用多进程，获取全局进程池管理器
+                if self.use_multiprocessing:
+                    pool_manager = ProcessPoolManager()
+                    pool = pool_manager.get_pool(pool_size=min(self.num_wolves, mp.cpu_count() - 1))
+                else:
+                    pool = None
+            else:
+                preds_flat_np = None
+                targets_flat_np = None
+                pool = None
         
         # 初始化狼群位置（阈值）
         positions = np.random.uniform(self.lb, self.ub, self.num_wolves)
@@ -2263,6 +2320,17 @@ class GreyWolfThresholdOptimizer:
             positions_tensor = torch.from_numpy(positions).float().to(device)
         else:
             positions_tensor = None
+        
+        # 【性能优化】Mean Dice模式：如果使用GPU，预先转换到CPU（避免每次迭代都转换）
+        if self.use_mean_dice and use_gpu:
+            preds_cpu = preds.cpu().numpy()  # (N, H, W) - 采样后的数据
+            targets_cpu = targets.cpu().numpy()  # (N, H, W) - 采样后的数据
+        else:
+            preds_cpu = None
+            targets_cpu = None
+        
+        # 【缓存机制】清空缓存（每次optimize调用时）
+        self._threshold_cache.clear()
         
         # 初始化 Alpha, Beta, Delta 狼 (前三名)
         alpha_pos, alpha_score = 0.5, -float('inf')
@@ -2277,22 +2345,165 @@ class GreyWolfThresholdOptimizer:
             positions = np.clip(positions, self.lb, self.ub)
             
             # 计算所有狼的适应度（Dice分数）
-            if use_gpu:
-                # GPU模式：使用批量计算
+            if self.use_mean_dice:
+                # Mean Dice模式：按样本分别计算Dice，然后取平均
+                if use_gpu:
+                    prob_maps = preds_cpu
+                    mask_gts = targets_cpu
+                else:
+                    prob_maps = preds_np
+                    mask_gts = targets_np
+                
+                scores_np = np.zeros(self.num_wolves)
+                for wolf_idx in range(self.num_wolves):
+                    threshold = float(positions[wolf_idx])
+                    
+                    # 【缓存机制】检查是否有缓存的阈值结果
+                    threshold_rounded = round(threshold / self._cache_tolerance) * self._cache_tolerance
+                    if threshold_rounded in self._threshold_cache:
+                        scores_np[wolf_idx] = self._threshold_cache[threshold_rounded]
+                        continue
+                    
+                    empty_dice_scores = []
+                    non_empty_dice_scores = []
+                    
+                    # 对每个样本计算Dice（分类统计）- 使用采样后的数据
+                    for sample_idx in range(num_samples_sampled):
+                        prob_map = prob_maps[sample_idx]  # (H, W)
+                        mask_gt = mask_gts[sample_idx]    # (H, W)
+                        
+                        # 判断是否为空mask
+                        gt_flat = mask_gt.flatten()
+                        mask_sum = gt_flat.sum()
+                        empty_threshold = max(1e-7, float(gt_flat.size) * 0.001)  # 0.1%像素
+                        
+                        # 使用阈值二值化
+                        pred_mask = (prob_map >= threshold).astype(np.float32)
+                        
+                        # 应用后处理（如果提供）
+                        if self.postprocess_func is not None:
+                            try:
+                                pred_mask_tensor = torch.from_numpy(pred_mask).float()
+                                prob_map_tensor = torch.from_numpy(prob_map).float()
+                                pred_mask_processed = self.postprocess_func(pred_mask_tensor, prob_map_tensor)
+                                # 转换回numpy
+                                if isinstance(pred_mask_processed, torch.Tensor):
+                                    pred_mask = pred_mask_processed.detach().cpu().numpy()
+                                else:
+                                    pred_mask = np.asarray(pred_mask_processed)
+                                # 确保是2D数组
+                                if pred_mask.ndim > 2:
+                                    pred_mask = pred_mask.squeeze()
+                                # 确保数据类型和形状正确
+                                pred_mask = pred_mask.astype(np.float32)
+                                if pred_mask.shape != prob_map.shape:
+                                    # 如果形状不匹配，使用原始预测
+                                    pred_mask = (prob_map >= threshold).astype(np.float32)
+                            except Exception as e:
+                                # 如果后处理失败，使用原始预测（避免优化中断）
+                                pass
+                        
+                        # 计算单个样本的Dice
+                        pred_flat = pred_mask.flatten()
+                        pred_sum = pred_flat.sum()
+                        
+                        if mask_sum <= empty_threshold:
+                            # 空mask样本：GT为空
+                            if pred_sum <= 1e-7:
+                                dice_sample = 1.0  # GT为空，预测也为空，Dice=1.0
+                            else:
+                                dice_sample = 0.0  # GT为空，预测不为空（假阳性），Dice=0.0
+                            empty_dice_scores.append(float(dice_sample))
+                        else:
+                            # 有前景样本：计算标准Dice
+                            intersection = (pred_flat * gt_flat).sum()
+                            dice_den = 2.0 * intersection + pred_sum + mask_sum
+                            if dice_den < 1e-7:
+                                dice_sample = 0.0
+                            else:
+                                dice_sample = (2.0 * intersection) / dice_den
+                            non_empty_dice_scores.append(float(dice_sample))
+                    
+                    # 【关键修复】使用Balanced Mean Dice：分别计算前景样本和空样本的平均分，再取均值
+                    # 这样可以防止数量众多的空样本带偏阈值搜索方向
+                    empty_mean = np.mean(empty_dice_scores) if empty_dice_scores else 1.0
+                    non_empty_mean = np.mean(non_empty_dice_scores) if non_empty_dice_scores else 0.0
+                    
+                    # 如果只有一类样本，使用该类样本的平均分
+                    if len(empty_dice_scores) == 0:
+                        balanced_dice = non_empty_mean
+                    elif len(non_empty_dice_scores) == 0:
+                        balanced_dice = empty_mean
+                    else:
+                        # 两类样本都存在，取均值（平衡权重，防止空样本带偏阈值）
+                        balanced_dice = (empty_mean + non_empty_mean) / 2.0
+                    
+                    scores_np[wolf_idx] = float(balanced_dice)
+                    # 【缓存机制】缓存结果
+                    self._threshold_cache[threshold_rounded] = float(balanced_dice)
+            elif use_gpu:
+                # GPU模式：使用批量计算（Global Dice）
                 positions_tensor = torch.from_numpy(positions).float().to(device)
                 positions_tensor = torch.clamp(positions_tensor, self.lb, self.ub)
-                scores = self._calculate_dice_batch(preds_flat, targets_flat, positions_tensor)
-                scores_np = scores.cpu().numpy()
+                # 【缓存机制】检查缓存，只计算未缓存的阈值
+                scores_np = np.zeros(self.num_wolves)
+                uncached_indices = []
+                uncached_positions = []
+                for wolf_idx in range(self.num_wolves):
+                    threshold = float(positions[wolf_idx])
+                    threshold_rounded = round(threshold / self._cache_tolerance) * self._cache_tolerance
+                    if threshold_rounded in self._threshold_cache:
+                        scores_np[wolf_idx] = self._threshold_cache[threshold_rounded]
+                    else:
+                        uncached_indices.append(wolf_idx)
+                        uncached_positions.append(threshold)
+                
+                # 只计算未缓存的阈值
+                if uncached_positions:
+                    uncached_tensor = torch.tensor(uncached_positions, device=device)
+                    uncached_tensor = torch.clamp(uncached_tensor, self.lb, self.ub)
+                    uncached_scores = self._calculate_dice_batch(preds_flat, targets_flat, uncached_tensor)
+                    uncached_scores_np = uncached_scores.cpu().numpy()
+                    # 填充结果并缓存
+                    for i, wolf_idx in enumerate(uncached_indices):
+                        threshold_rounded = round(uncached_positions[i] / self._cache_tolerance) * self._cache_tolerance
+                        scores_np[wolf_idx] = float(uncached_scores_np[i])
+                        self._threshold_cache[threshold_rounded] = float(uncached_scores_np[i])
             elif pool is not None:
-                # CPU多进程模式：并行计算每只狼的Dice
-                # 准备参数列表
-                args_list = [(preds_flat_np, targets_flat_np, float(pos)) for pos in positions]
-                # 并行计算
-                scores_np = np.array(pool.map(_calculate_dice_worker, args_list))
+                # CPU多进程模式：并行计算每只狼的Dice（Global Dice）
+                # 【缓存机制】检查缓存，只计算未缓存的阈值
+                scores_np = np.zeros(self.num_wolves)
+                uncached_args = []
+                uncached_indices = []
+                for wolf_idx, pos in enumerate(positions):
+                    threshold = float(pos)
+                    threshold_rounded = round(threshold / self._cache_tolerance) * self._cache_tolerance
+                    if threshold_rounded in self._threshold_cache:
+                        scores_np[wolf_idx] = self._threshold_cache[threshold_rounded]
+                    else:
+                        uncached_args.append((preds_flat_np, targets_flat_np, threshold))
+                        uncached_indices.append(wolf_idx)
+                
+                # 只计算未缓存的阈值
+                if uncached_args:
+                    uncached_scores = np.array(pool.map(_calculate_dice_worker, uncached_args))
+                    for i, wolf_idx in enumerate(uncached_indices):
+                        threshold_rounded = round(float(uncached_args[i][2]) / self._cache_tolerance) * self._cache_tolerance
+                        scores_np[wolf_idx] = float(uncached_scores[i])
+                        self._threshold_cache[threshold_rounded] = float(uncached_scores[i])
             else:
-                # CPU单进程模式：循环计算
-                scores_np = np.array([self._calculate_dice(preds_flat_np, targets_flat_np, float(pos)) 
-                                     for pos in positions])
+                # CPU单进程模式：循环计算（Global Dice）
+                # 【缓存机制】检查缓存，只计算未缓存的阈值
+                scores_np = np.zeros(self.num_wolves)
+                for wolf_idx in range(self.num_wolves):
+                    threshold = float(positions[wolf_idx])
+                    threshold_rounded = round(threshold / self._cache_tolerance) * self._cache_tolerance
+                    if threshold_rounded in self._threshold_cache:
+                        scores_np[wolf_idx] = self._threshold_cache[threshold_rounded]
+                    else:
+                        dice = self._calculate_dice(preds_flat_np, targets_flat_np, threshold)
+                        scores_np[wolf_idx] = float(dice)
+                        self._threshold_cache[threshold_rounded] = float(dice)
             
             positions_np = positions.copy()
             
@@ -2382,7 +2593,140 @@ class GreyWolfThresholdOptimizer:
                     # 如果回调函数出错，不影响优化过程
                     pass
         
+        # 【效率优化】最终评估：使用全量样本重新计算最佳阈值的Dice分数
+        if self.sample_ratio < 1.0 and alpha_pos is not None:
+            # 保存采样阶段的Dice值，用于日志对比
+            sampled_dice = alpha_score
+            print(f">>> [GWO最终评估] 使用全量 {num_samples} 个样本重新计算最佳阈值 {alpha_pos:.4f} 的Dice...")
+            # 【关键修复】确保使用全量数据（full_preds, full_targets）进行最终评估
+            final_dice = self._evaluate_threshold_full(full_preds, full_targets, alpha_pos, use_gpu, device)
+            if final_dice is not None:
+                alpha_score = final_dice
+                print(f">>> [GWO最终评估] 全量样本Dice: {alpha_score:.4f} (采样Dice: {sampled_dice:.4f})")
+            else:
+                print(f">>> [GWO最终评估警告] 全量评估失败，使用采样Dice: {sampled_dice:.4f}")
+        
         return alpha_pos, alpha_score
+    
+    def _evaluate_threshold_full(self, preds, targets, threshold, use_gpu, device):
+        """
+        使用全量样本评估阈值的Dice分数（用于最终评估）
+        
+        Args:
+            preds: 全量概率图 (N, H, W)
+            targets: 全量真实标签 (N, H, W)
+            threshold: 阈值
+            use_gpu: 是否使用GPU
+            device: 计算设备
+            
+        Returns:
+            dice: Dice分数，如果计算失败返回None
+        """
+        # 【调试】验证全量数据形状
+        if isinstance(preds, torch.Tensor):
+            full_num_samples = preds.shape[0]
+        else:
+            full_num_samples = preds.shape[0]
+        
+        try:
+            if not self.use_mean_dice:
+                # Global Dice模式：展平计算
+                if isinstance(preds, torch.Tensor):
+                    preds_flat = preds.flatten().float()
+                    targets_flat = targets.flatten().float()
+                else:
+                    preds_flat = torch.from_numpy(preds.flatten()).float()
+                    targets_flat = torch.from_numpy(targets.flatten()).float()
+                
+                if use_gpu:
+                    preds_flat = preds_flat.to(device)
+                    targets_flat = targets_flat.to(device)
+                
+                dice = self._calculate_dice_batch(preds_flat, targets_flat, 
+                                                  torch.tensor([threshold], device=device if use_gpu else None))
+                return float(dice[0].item() if isinstance(dice, torch.Tensor) else dice[0])
+            else:
+                # Mean Dice模式：按样本分别计算
+                if isinstance(preds, torch.Tensor):
+                    preds_np = preds.cpu().numpy() if use_gpu else preds.numpy()
+                    targets_np = targets.cpu().numpy() if use_gpu else targets.numpy()
+                else:
+                    preds_np = preds
+                    targets_np = targets
+                
+                num_samples = preds_np.shape[0]
+                # 【调试】验证样本数量
+                if num_samples < 500:  # 如果样本数太少，可能是采样数据而不是全量数据
+                    print(f">>> [GWO警告] 全量评估样本数: {num_samples}，可能使用了采样数据而非全量数据")
+                empty_dice_scores = []
+                non_empty_dice_scores = []
+                
+                for sample_idx in range(num_samples):
+                    prob_map = preds_np[sample_idx]
+                    mask_gt = targets_np[sample_idx]
+                    
+                    # 判断是否为空mask
+                    gt_flat = mask_gt.flatten()
+                    mask_sum = gt_flat.sum()
+                    empty_threshold = max(1e-7, float(gt_flat.size) * 0.001)
+                    
+                    # 使用阈值二值化
+                    pred_mask = (prob_map >= threshold).astype(np.float32)
+                    
+                    # 应用后处理（如果提供）
+                    if self.postprocess_func is not None:
+                        try:
+                            pred_mask_tensor = torch.from_numpy(pred_mask).float()
+                            prob_map_tensor = torch.from_numpy(prob_map).float()
+                            pred_mask_processed = self.postprocess_func(pred_mask_tensor, prob_map_tensor)
+                            if isinstance(pred_mask_processed, torch.Tensor):
+                                pred_mask = pred_mask_processed.detach().cpu().numpy()
+                            else:
+                                pred_mask = np.asarray(pred_mask_processed)
+                            if pred_mask.ndim > 2:
+                                pred_mask = pred_mask.squeeze()
+                            pred_mask = pred_mask.astype(np.float32)
+                            if pred_mask.shape != prob_map.shape:
+                                pred_mask = (prob_map >= threshold).astype(np.float32)
+                        except Exception:
+                            pass
+                    
+                    # 计算单个样本的Dice
+                    pred_flat = pred_mask.flatten()
+                    pred_sum = pred_flat.sum()
+                    
+                    if mask_sum <= empty_threshold:
+                        # 空mask样本
+                        if pred_sum <= 1e-7:
+                            dice_sample = 1.0
+                        else:
+                            dice_sample = 0.0
+                        empty_dice_scores.append(float(dice_sample))
+                    else:
+                        # 有前景样本
+                        intersection = (pred_flat * gt_flat).sum()
+                        dice_den = 2.0 * intersection + pred_sum + mask_sum
+                        if dice_den < 1e-7:
+                            dice_sample = 0.0
+                        else:
+                            dice_sample = (2.0 * intersection) / dice_den
+                        non_empty_dice_scores.append(float(dice_sample))
+                
+                # 计算Balanced Mean Dice
+                empty_mean = np.mean(empty_dice_scores) if empty_dice_scores else 1.0
+                non_empty_mean = np.mean(non_empty_dice_scores) if non_empty_dice_scores else 0.0
+                
+                if len(empty_dice_scores) == 0:
+                    balanced_dice = non_empty_mean
+                elif len(non_empty_dice_scores) == 0:
+                    balanced_dice = empty_mean
+                else:
+                    balanced_dice = (empty_mean + non_empty_mean) / 2.0
+                
+                return float(balanced_dice)
+        except Exception as e:
+            print(f">>> [GWO最终评估] 计算失败: {e}，使用采样Dice")
+            return None
 
     def _calculate_dice(self, preds, targets, threshold):
         """

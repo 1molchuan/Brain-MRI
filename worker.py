@@ -2583,14 +2583,33 @@ class TrainThread(QThread):
                 except Exception as e:
                     print(f">>> [GWO] 显存检查失败: {e}，使用CPU模式")
             
+            # 【关键修复】保存样本数量（在删除前）
+            total_samples = all_probs_np.shape[0]
+            print(f">>> [GWO] 参与计算的样本数: {total_samples}")
+            
             # 【GWO优化】使用灰狼优化算法替代线性扫描，更智能地寻找最佳阈值
+            # 【关键修复】传递后处理函数，使GWO在搜索过程中也应用后处理
+            def postprocess_func(pred_mask, prob_map):
+                """后处理函数，用于GWO的Fitness Function"""
+                # 先执行智能后处理
+                pred_mask_processed = self.smart_post_processing(pred_mask, prob_map)
+                # 再执行传统形态学后处理（与验证阶段参数一致）
+                pred_mask_final = self.post_process_mask(
+                    pred_mask_processed,
+                    min_size=0,
+                    use_morphology=True,
+                    keep_largest=False,
+                    fill_holes=True
+                )
+                return pred_mask_final
+            
             if use_gpu_for_gwo:
-                print(">>> [GWO] 灰狼群正在搜索最佳阈值（GPU加速）...")
+                print(">>> [GWO] 灰狼群正在搜索最佳阈值（GPU加速，使用Mean Dice+后处理）...")
                 # 转换为tensor并移到GPU（在GWO内部会处理OOM）
                 all_probs_tensor = torch.from_numpy(all_probs_np).to(device)
                 all_masks_tensor = torch.from_numpy(all_masks_np).to(device)
             else:
-                print(">>> [GWO] 灰狼群正在搜索最佳阈值（CPU模式）...")
+                print(">>> [GWO] 灰狼群正在搜索最佳阈值（CPU模式，使用Mean Dice+后处理）...")
                 # 保持在CPU上
                 all_probs_tensor = all_probs_np
                 all_masks_tensor = all_masks_np
@@ -2602,13 +2621,16 @@ class TrainThread(QThread):
                 device_str = "GPU" if use_gpu_for_gwo else "CPU"
                 self.update_progress.emit(
                     gwo_progress,
-                    f"阈值优化: GWO迭代 {iteration}/{max_iter} | 最佳阈值: {best_threshold:.4f} | 最佳Dice: {best_score:.4f} ({device_str})"
+                    f"阈值优化: GWO迭代 {iteration}/{max_iter} | 最佳阈值: {best_threshold:.4f} | 最佳Dice(Mean+后处理): {best_score:.4f} ({device_str})"
                 )
             
             gwo = GreyWolfThresholdOptimizer(
                 num_wolves=10, 
-                max_iter=15,
-                progress_callback=gwo_progress_callback
+                max_iter=8,  # 【效率优化】缩减迭代次数到8次
+                progress_callback=gwo_progress_callback,
+                use_mean_dice=True,  # 使用Mean Dice
+                postprocess_func=postprocess_func,  # 传递后处理函数
+                sample_ratio=0.2  # 【效率优化】在迭代过程中只使用20%的样本计算Fitness
             )
             
             # 执行优化（带错误处理和自动回退）
@@ -2630,30 +2652,194 @@ class TrainThread(QThread):
                 else:
                     raise
             
-            # GWO优化完成
-            self.update_progress.emit(90, f"阈值优化: GWO完成 | 最佳阈值: {best_threshold:.4f} | 最佳Dice: {best_dice:.4f}")
+            # GWO优化完成（已使用Mean Dice+后处理）
+            print(f">>> [GWO] 搜索完成! 最佳阈值: {best_threshold:.4f}, 最佳Dice(Mean+后处理): {best_dice:.4f}")
+            self.update_progress.emit(90, f"阈值优化: GWO完成 | 最佳阈值: {best_threshold:.4f} | 最佳Dice(Mean+后处理): {best_dice:.4f}")
             
-            # 为了兼容性，计算完整的指标字典（使用找到的最佳阈值）
-            # 使用 scan_best_threshold 计算完整指标，但只使用我们找到的阈值
-            # 注意：需要确保使用numpy数组，如果之前用的是tensor需要转换
+            # 【关键修复】GWO已经使用了Mean Dice+后处理，所以best_dice可以直接用于best_model判定
+            # 但为了兼容性和诊断，我们仍然重新计算一次以验证一致性
+            print(">>> [GWO] 验证计算一致性（重新计算一次）...")
+            self.update_progress.emit(92, "阈值优化: 验证计算一致性...")
+            
+            # 【关键修复】确保total_samples在删除前已保存（修复日志显示0个样本的问题）
+            # 必须在删除all_probs_np之前保存
+            if 'total_samples' not in locals():
+                if all_probs_np is not None:
+                    total_samples = all_probs_np.shape[0]
+                elif isinstance(all_probs_tensor, torch.Tensor):
+                    total_samples = all_probs_tensor.shape[0]
+                else:
+                    total_samples = 0
+            
             # 统一处理：无论GPU还是CPU模式，都转换为numpy数组
             if isinstance(all_probs_tensor, torch.Tensor):
                 # 如果是tensor，转换回numpy
-                all_probs_for_metrics = all_probs_tensor.cpu().numpy()
-                all_masks_for_metrics = all_masks_tensor.cpu().numpy()
+                all_probs_for_postprocess = all_probs_tensor.cpu().numpy()
+                all_masks_for_postprocess = all_masks_tensor.cpu().numpy()
             else:
                 # 如果已经是numpy数组，直接使用（CPU模式）
-                all_probs_for_metrics = all_probs_tensor
-                all_masks_for_metrics = all_masks_tensor
+                all_probs_for_postprocess = all_probs_np.copy()
+                all_masks_for_postprocess = all_masks_np.copy()
             
-            pred_bool = (all_probs_for_metrics >= best_threshold)
-            gt_bool = (all_masks_for_metrics > 0.5)
+            # 再次确认total_samples
+            if total_samples == 0:
+                total_samples = all_probs_for_postprocess.shape[0]
             
-            # 混淆矩阵统计
-            tp = np.logical_and(pred_bool, gt_bool).sum()
-            fp = np.logical_and(pred_bool, ~gt_bool).sum()
-            fn = np.logical_and(~pred_bool, gt_bool).sum()
-            tn = np.logical_and(~pred_bool, ~gt_bool).sum()
+            # 对每个样本应用后处理并计算Dice（与验证阶段保持一致）
+            processed_preds_list = []
+            dice_scores_per_sample = []  # 用于计算Mean Dice
+            empty_mask_count = 0
+            empty_mask_dice_sum = 0.0
+            non_empty_mask_count = 0
+            non_empty_mask_dice_sum = 0.0
+            
+            for i in range(total_samples):
+                # 获取单个样本的概率图和真实标签
+                prob_map = all_probs_for_postprocess[i, 0]  # (H, W)
+                mask_gt = all_masks_for_postprocess[i, 0]    # (H, W)
+                
+                # 使用最佳阈值二值化
+                pred_mask = (prob_map >= best_threshold).astype(np.float32)
+                
+                # 转换为tensor进行后处理（后处理函数支持tensor和numpy）
+                pred_mask_tensor = torch.from_numpy(pred_mask).float()
+                prob_map_tensor = torch.from_numpy(prob_map).float()
+                
+                # 先执行智能后处理
+                pred_mask_tensor = self.smart_post_processing(pred_mask_tensor, prob_map_tensor)
+                
+                # 再执行传统形态学后处理（与验证阶段参数一致）
+                pred_mask_processed = self.post_process_mask(
+                    pred_mask_tensor,
+                    min_size=0,
+                    use_morphology=True,
+                    keep_largest=False,
+                    fill_holes=True
+                )
+                
+                # 转换回numpy
+                if isinstance(pred_mask_processed, torch.Tensor):
+                    pred_mask_processed = pred_mask_processed.cpu().numpy()
+                
+                processed_preds_list.append(pred_mask_processed)
+                
+                # 【统一计算】使用统一的指标计算函数
+                pred_tensor = torch.from_numpy(pred_mask_processed).float().unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+                mask_tensor = torch.from_numpy(mask_gt).float().unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+                sample_metrics = self.calculate_batch_metrics(pred_tensor, mask_tensor)
+                
+                dice_sample = sample_metrics['dice'][0]
+                is_empty = sample_metrics['is_empty'][0]
+                
+                if is_empty:
+                    empty_mask_count += 1
+                    empty_mask_dice_sum += dice_sample
+                    # 【诊断】记录假阳性情况
+                    if dice_sample < 1.0 and empty_mask_count <= 5:  # 只记录前5个，避免日志过多
+                        pred_sum = pred_mask_processed.sum()
+                        fp_pixels = int(pred_sum)
+                        print(f">>> [诊断] 空mask样本 #{i+1}: 后处理后仍有 {fp_pixels} 个假阳性像素")
+                else:
+                    non_empty_mask_count += 1
+                    non_empty_mask_dice_sum += dice_sample
+                
+                dice_scores_per_sample.append(float(dice_sample))
+                
+                # 每处理100个样本显示一次进度
+                if (i + 1) % 100 == 0:
+                    self.update_progress.emit(92 + int(6 * (i + 1) / total_samples), 
+                                             f"阈值优化: 后处理进度 {i+1}/{total_samples}...")
+            
+            # 输出诊断信息
+            if empty_mask_count > 0:
+                empty_mask_avg_dice = empty_mask_dice_sum / empty_mask_count
+                print(f">>> [GWO诊断] 空mask样本: {empty_mask_count}/{total_samples} ({100*empty_mask_count/total_samples:.1f}%)")
+                print(f">>> [GWO诊断] 空mask平均Dice: {empty_mask_avg_dice:.4f}")
+                if empty_mask_avg_dice < 0.9:
+                    print(f">>> [GWO警告] 空mask Dice偏低，可能是后处理未能完全过滤假阳性")
+            if non_empty_mask_count > 0:
+                non_empty_mask_avg_dice = non_empty_mask_dice_sum / non_empty_mask_count
+                print(f">>> [GWO诊断] 有前景样本: {non_empty_mask_count}/{total_samples} ({100*non_empty_mask_count/total_samples:.1f}%)")
+                print(f">>> [GWO诊断] 有前景样本平均Dice: {non_empty_mask_avg_dice:.4f}")
+            
+            # 【关键修复】使用Mean Dice（每个样本分别计算再平均，与验证阶段一致）
+            # 验证阶段使用 Mean Dice，所以GWO也应该使用 Mean Dice 以保持一致
+            mean_dice_postprocessed = np.mean(dice_scores_per_sample) if dice_scores_per_sample else 0.0
+            
+            # 【内存优化】分批计算Global Dice用于对比，避免内存爆炸
+            # 不要一次性创建(N, H, W)的bool数组，而是分批累加TP/FP/FN
+            batch_size_for_global = 100  # 每批处理100个样本
+            tp_total, fp_total, fn_total, tn_total = 0, 0, 0, 0
+            
+            for batch_start in range(0, total_samples, batch_size_for_global):
+                batch_end = min(batch_start + batch_size_for_global, total_samples)
+                batch_preds = np.array(processed_preds_list[batch_start:batch_end])  # (B, H, W)
+                batch_masks = all_masks_for_postprocess[batch_start:batch_end]  # (B, H, W)
+                
+                # 确保形状一致
+                if batch_preds.shape != batch_masks.shape:
+                    # 如果形状不匹配，调整batch_masks
+                    if batch_masks.ndim == 3 and batch_preds.ndim == 3:
+                        # 确保都是(B, H, W)
+                        if batch_masks.shape[0] != batch_preds.shape[0]:
+                            batch_masks = batch_masks[:batch_preds.shape[0]]
+                        if batch_masks.shape[1:] != batch_preds.shape[1:]:
+                            # 使用插值调整大小（不应该发生，但安全起见）
+                            from scipy.ndimage import zoom
+                            zoom_factors = (1.0, batch_preds.shape[1]/batch_masks.shape[1], 
+                                          batch_preds.shape[2]/batch_masks.shape[2])
+                            batch_masks = zoom(batch_masks, zoom_factors, order=0)
+                
+                # 二值化并展平
+                pred_bool_batch = (batch_preds > 0.5).astype(np.float32)  # (B, H, W)
+                gt_bool_batch = (batch_masks > 0.5).astype(np.float32)  # (B, H, W)
+                
+                # 展平为(B*H*W,)
+                pred_flat_batch = pred_bool_batch.flatten()  # (B*H*W,)
+                gt_flat_batch = gt_bool_batch.flatten()  # (B*H*W,)
+                
+                # 计算混淆矩阵（逐元素，避免广播）
+                tp_batch = np.sum(pred_flat_batch * gt_flat_batch)
+                fp_batch = np.sum(pred_flat_batch * (1 - gt_flat_batch))
+                fn_batch = np.sum((1 - pred_flat_batch) * gt_flat_batch)
+                tn_batch = np.sum((1 - pred_flat_batch) * (1 - gt_flat_batch))
+                
+                tp_total += int(tp_batch)
+                fp_total += int(fp_batch)
+                fn_total += int(fn_batch)
+                tn_total += int(tn_batch)
+                
+                # 清理批次变量
+                del batch_preds, batch_masks, pred_bool_batch, gt_bool_batch
+                del pred_flat_batch, gt_flat_batch
+                if torch.cuda.is_available() and batch_end % 500 == 0:
+                    torch.cuda.empty_cache()
+            
+            # 计算Global Dice（用于对比）
+            dice_den_postprocessed = 2.0 * tp_total + fp_total + fn_total
+            global_dice_postprocessed = 1.0 if dice_den_postprocessed < 1e-7 else (2.0 * tp_total) / (dice_den_postprocessed + 1e-7)
+            
+            print(f">>> [GWO] 验证计算完成! 最佳阈值: {best_threshold:.4f}")
+            print(f">>> [GWO] GWO搜索时的Dice: {best_dice:.4f} (Mean+后处理)")
+            print(f">>> [GWO] 重新计算的Mean Dice: {mean_dice_postprocessed:.4f} (用于验证一致性)")
+            print(f">>> [GWO] Global Dice(后处理): {global_dice_postprocessed:.4f} (用于对比)")
+            
+            # 【关键修复】检查一致性
+            dice_diff = abs(best_dice - mean_dice_postprocessed)
+            if dice_diff > 0.01:
+                print(f">>> [GWO警告] Dice差异较大: {dice_diff:.4f}，可能存在计算不一致")
+            else:
+                print(f">>> [GWO] Dice一致性验证通过 (差异: {dice_diff:.4f})")
+            
+            # 【关键修复】使用重新计算的Mean Dice作为最终结果（确保与验证阶段完全一致）
+            best_dice = mean_dice_postprocessed
+            
+            # 为了兼容性，计算完整的指标字典（使用后处理后的结果）
+            # 使用已计算的混淆矩阵
+            tp = tp_total
+            fp = fp_total
+            fn = fn_total
+            tn = tn_total
             
             # 计算完整指标
             dice_den = 2.0 * tp + fp + fn
@@ -2673,31 +2859,33 @@ class TrainThread(QThread):
                 'precision': float(precision),
                 'recall': float(recall),
                 'specificity': float(specificity),
-                'score': float(best_dice)  # 使用 GWO 找到的最佳 Dice 作为综合评分
+                'score': float(best_dice)  # 使用后处理后的Mean Dice（与验证阶段一致）
             }
-            
-            print(f">>> [GWO] 搜索完成! 最佳阈值: {best_threshold:.4f}, 最佳 Dice: {best_dice:.4f}")
             
             # 【显存优化】删除拼接后的数组和中间变量
             # 注意：在CPU模式下，all_probs_tensor就是all_probs_np，所以只需要删除一次
             if use_gpu_for_gwo:
                 # GPU模式：删除tensor和numpy数组
                 del all_probs_tensor, all_masks_tensor
-                del all_probs_np, all_masks_np
-            else:
-                # CPU模式：all_probs_tensor就是all_probs_np，只删除一次
-                del all_probs_np, all_masks_np
-            
-            # 删除中间变量
-            del pred_bool, gt_bool
-            if 'all_probs_for_metrics' in locals():
-                del all_probs_for_metrics, all_masks_for_metrics
+            del all_probs_np, all_masks_np
+            del processed_preds_list, dice_scores_per_sample
+            if 'all_probs_for_postprocess' in locals():
+                del all_probs_for_postprocess, all_masks_for_postprocess
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             gc.collect()
 
+        # 【关键修复】确保total_samples正确显示
+        if 'total_samples' not in locals() or total_samples == 0:
+            # 如果total_samples未定义或为0，尝试从best_metrics或其他地方获取
+            if 'all_probs_for_postprocess' in locals() and all_probs_for_postprocess is not None:
+                total_samples = all_probs_for_postprocess.shape[0]
+            elif 'all_probs_np' in locals() and all_probs_np is not None:
+                total_samples = all_probs_np.shape[0]
+            else:
+                total_samples = num_samples if 'num_samples' in locals() else 0
+
         sample_info = "全部验证集" if use_all_samples else f"{num_samples}个批次"
-        total_samples = all_probs_np.shape[0] if 'all_probs_np' in locals() and all_probs_np is not None else 0
         score_val = best_metrics.get("score", 0.0) if isinstance(best_metrics, dict) else 0.0
         print(
             f"[阈值优化] 使用样本: {sample_info} ({total_samples}个样本) | "
@@ -5070,6 +5258,11 @@ class TrainThread(QThread):
                 val_non_empty_mask_count = 0  # 目标有前景的样本数
                 val_non_empty_mask_dice_sum = 0.0  # 有前景样本的Dice总和
                 
+                # 【修复】添加IoU/Precision/Recall累加器，基于全量样本计算
+                val_iou_sum = 0.0
+                val_precision_sum = 0.0
+                val_recall_sum = 0.0
+                
                 self.update_val_progress.emit(0, f"开始验证轮次 {epoch+1}...")
                 # 如果启用EMA且训练了足够轮次，使用EMA模型进行评估
                 eval_model_for_epoch = model
@@ -5265,32 +5458,38 @@ class TrainThread(QThread):
                             else:
                                 preds[i, 0] = torch.from_numpy(pred_mask_processed).float().to(preds.device)
                         
-                        # 使用与训练过程相同的calculate_batch_dice函数计算Dice
-                        batch_dice = self.calculate_batch_dice(preds.float(), masks)
-                        # 【关键修复】不再累加所有样本的Dice，而是只统计有前景mask的样本
-                        # val_dice 将在后面使用 val_non_empty_mask_dice_sum 计算（只统计前景类）
+                        # 【统一计算】使用统一的指标计算函数（单一真理来源）
+                        batch_metrics = self.calculate_batch_metrics(preds.float(), masks)
+                        batch_dice = batch_metrics['dice']
+                        batch_iou = batch_metrics['iou']
+                        batch_precision = batch_metrics['precision']
+                        batch_recall = batch_metrics['recall']
+                        batch_is_empty = batch_metrics['is_empty']
+                        
+                        batch_size = masks.shape[0]
+                        for i in range(batch_size):
+                            dice_i = batch_dice[i]
+                            iou_i = batch_iou[i]
+                            precision_i = batch_precision[i]
+                            recall_i = batch_recall[i]
+                            is_empty_i = batch_is_empty[i]
+                            
+                            # 累加所有样本的IoU/Precision/Recall（包括空mask和前景样本）
+                            val_iou_sum += iou_i
+                            val_precision_sum += precision_i
+                            val_recall_sum += recall_i
+                            
+                            if is_empty_i:
+                                val_empty_mask_count += 1
+                                val_empty_mask_dice_sum += dice_i
+                            else:
+                                val_non_empty_mask_count += 1
+                                val_non_empty_mask_dice_sum += dice_i
+                        
+                        # 统计像素信息（用于日志）
                         val_pred_fg_pixels += preds.sum().item()
                         val_gt_fg_pixels += masks.sum().item()
                         val_total_pixels += float(masks.numel())
-                        
-                        # 【性能优化】验证阶段只计算 Dice，不计算 IoU 等其他指标以节省时间
-                        batch_size = masks.shape[0]
-                        for i in range(batch_size):
-                            mask_i = masks[i, 0]
-                            mask_sum = mask_i.sum().item()
-                            
-                            # 判断是否为空mask（使用与 Dice 计算相同的阈值逻辑）
-                            total_pixels = mask_i.numel()
-                            avg_fg_ratio = val_gt_fg_pixels / max(1.0, val_total_pixels) if val_total_pixels > 0 else 0.0
-                            adaptive_empty_threshold = max(1e-7, avg_fg_ratio * 0.001)
-                            empty_threshold_pixels = adaptive_empty_threshold * total_pixels
-                            
-                            if mask_sum <= empty_threshold_pixels:
-                                val_empty_mask_count += 1
-                                val_empty_mask_dice_sum += batch_dice[i].item()
-                            else:
-                                val_non_empty_mask_count += 1
-                                val_non_empty_mask_dice_sum += batch_dice[i].item()
                         
                         # 更新验证进度
                         val_progress = int(100 * (val_idx + 1) / len(val_loader))
@@ -5379,30 +5578,31 @@ class TrainThread(QThread):
                 self.val_dice_pos_history.append(dice_pos)  # 保留用于诊断
                 self.val_dice_neg_history.append(dice_neg)  # 保留用于诊断
                 
-                # 【统一标准】日志输出显示所有样本的平均 Dice（用于最佳模型选择）
-                # 同时显示前景类和空mask类的分别统计（用于诊断）
-                # 注意：验证统计使用全部验证集 + 后处理，用于主要评估和早停判断
-                # 【性能优化】验证阶段只输出 Dice 和 Loss，不计算 IoU 等其他指标以节省时间
-                print(
-                    f"[验证统计] Epoch {epoch+1}: threshold={val_threshold:.3f}, "
-                    f"pred_fg_ratio={pred_fg_ratio:.4f}, gt_fg_ratio={gt_fg_ratio:.4f}, "
-                    f"Dice(所有样本)={val_dice:.4f}, Loss={avg_val_loss:.4f} "
-                    f"(基于全部验证集{val_samples}个样本，使用后处理)"
-                )
-                print(
-                    f"[详细分析] Dice(前景类)={dice_pos:.4f}, Dice(空mask)={dice_neg:.4f}"
-                )
-                print(
-                    f"[样本分布] "
-                    f"有前景样本: {val_non_empty_mask_count}/{val_samples} ({100*val_non_empty_mask_count/max(1,val_samples):.1f}%) | "
-                    f"空mask样本: {val_empty_mask_count}/{val_samples} ({100*val_empty_mask_count/max(1,val_samples):.1f}%)"
-                )
-                # 【诊断信息】背景类Dice仅用于诊断，明确标记
-                if val_empty_mask_count > 0:
-                    print(
-                        f"[诊断信息] 背景类Dice(仅诊断): {dice_neg:.4f} "
-                        f"| 注意：背景类指标不用于主要评估，仅用于诊断假阳性问题"
-                    )
+                # 【统一日志格式】重写验证报告输出
+                print(f"\n{'='*60}")
+                print(f"[验证报告] Epoch {epoch+1} | 最佳阈值: {val_threshold:.4f}")
+                print(f"{'-'*60}")
+                print(f"[整体表现] Mean Dice (全样): {val_dice:.4f}  <-- (用于 Best Model 判定)")
+                print(f"[分组详情]")
+                print(f"   - 空 Mask ({val_empty_mask_count}/{val_samples}): {dice_neg:.4f}  (反映背景抑制能力)")
+                print(f"   - 前景类 ({val_non_empty_mask_count}/{val_samples}): {dice_pos:.4f}  (反映病灶识别能力)")
+                
+                # 【诊断信息】检查阈值是否过高
+                if dice_neg > 0.9 and dice_pos < 0.5:
+                    print(f"[警告] 阈值过高，虽然抑制了背景，但严重损伤了前景识别")
+                
+                # 【修复】计算详细指标（IoU, Precision, Recall）- 基于全量样本的平均值
+                val_total_count = val_non_empty_mask_count + val_empty_mask_count
+                if val_total_count > 0:
+                    avg_iou = val_iou_sum / val_total_count
+                    avg_precision = val_precision_sum / val_total_count
+                    avg_recall = val_recall_sum / val_total_count
+                    print(f"[详细指标] IoU: {avg_iou:.4f} | Precision: {avg_precision:.4f} | Recall: {avg_recall:.4f}")
+                else:
+                    print(f"[详细指标] IoU: N/A | Precision: N/A | Recall: N/A  (无样本)")
+                
+                print(f"{'-'*60}")
+                print(f"Loss: {avg_val_loss:.4f} (基于全部验证集{val_samples}个样本，使用后处理)\n")
 
                 # 根据验证Dice或SWA阶段调整学习率（Poly策略下仅保留SWA调度）
                 swa_epoch_active = swa_enabled and epoch >= swa_start_epoch
@@ -5554,7 +5754,7 @@ class TrainThread(QThread):
                             
                             # 【关键修复】统计所有样本（包括空mask），与验证统计保持一致
                             # 空mask样本的Dice计算：如果GT为空且预测也为空，Dice=1.0；否则Dice=0.0
-                            empty_threshold_pixels = max(1.0, float(mask.numel()) * 0.001)  # 0.1%像素
+                            empty_threshold_pixels = max(1e-7, float(mask.numel()) * 0.001)  # 0.1%像素，统一阈值
                             
                             if mask_sum <= empty_threshold_pixels:
                                 # 空mask样本：GT为空
@@ -5585,16 +5785,16 @@ class TrainThread(QThread):
                                     recall = 0.0  # 有前景但预测为空，recall=0
                                 else:
                                     recall = tp / (tp + fn)
-                            
-                            f1 = dice  # 二分类下F1=Dice
-                            
+                                
+                                f1 = dice  # 二分类下F1=Dice
+                                
                             # 统计所有样本（包括空mask）
-                            epoch_metrics['dice'].append(float(dice))
-                            epoch_metrics['iou'].append(float(iou))
-                            epoch_metrics['precision'].append(float(precision))
-                            epoch_metrics['recall'].append(float(recall))
-                            epoch_metrics['sensitivity'].append(float(recall))
-                            epoch_metrics['f1'].append(float(f1))
+                                epoch_metrics['dice'].append(float(dice))
+                                epoch_metrics['iou'].append(float(iou))
+                                epoch_metrics['precision'].append(float(precision))
+                                epoch_metrics['recall'].append(float(recall))
+                                epoch_metrics['sensitivity'].append(float(recall))
+                                epoch_metrics['f1'].append(float(f1))
                             
                             eval_count += 1
                         
@@ -8082,10 +8282,132 @@ class TrainThread(QThread):
         # Case 3: 正常情况，使用标准 Dice 公式（只计算前景类）
         return (2. * intersection + smooth) / (pred_sum + target_sum + smooth)
 
+    @staticmethod
+    @staticmethod
+    def calculate_batch_metrics(pred, target, smooth=1e-7):
+        """
+        【单一真理来源】统一的指标计算函数
+        
+        所有阶段（GWO搜索、GWO最终评估、Epoch验证循环）必须调用此函数计算指标。
+        
+        Args:
+            pred: 预测mask (B, H, W) 或 (B, 1, H, W)，值域[0,1]
+            target: 真实mask (B, H, W) 或 (B, 1, H, W)，值域[0,1]
+            smooth: 平滑系数，默认1e-7
+            
+        Returns:
+            metrics_dict: {
+                'dice': [dice_0, dice_1, ..., dice_B-1],  # 每个样本的Dice
+                'iou': [iou_0, iou_1, ..., iou_B-1],
+                'precision': [prec_0, prec_1, ..., prec_B-1],
+                'recall': [recall_0, recall_1, ..., recall_B-1],
+                'is_empty': [bool_0, bool_1, ..., bool_B-1],  # True表示空mask样本
+            }
+        """
+        import torch
+        import torch.nn.functional as F
+        
+        # 统一维度处理
+        if pred.dim() == 3:
+            pred = pred.unsqueeze(1)
+        if target.dim() == 3:
+            target = target.unsqueeze(1)
+        
+        # 确保尺寸匹配
+        if pred.shape[2:] != target.shape[2:]:
+            pred = F.interpolate(pred, size=target.shape[2:], mode='bilinear', align_corners=False)
+        
+        pred_flat = pred.view(pred.size(0), -1).float()
+        target_flat = target.view(target.size(0), -1).float()
+        
+        batch_size = pred.size(0)
+        total_pixels = pred_flat.size(1)
+        # 【统一阈值】使用固定的0.1%像素阈值
+        empty_threshold = max(1.0, float(total_pixels) * 0.001)  # 0.1%像素
+        
+        dice_scores = []
+        iou_scores = []
+        precision_scores = []
+        recall_scores = []
+        is_empty_list = []
+        
+        for i in range(batch_size):
+            pred_i = pred_flat[i]
+            target_i = target_flat[i]
+            
+            intersection = (pred_i * target_i).sum()
+            pred_sum = pred_i.sum()
+            target_sum = target_i.sum()
+            
+            # 判断是否为空mask
+            is_empty = (target_sum <= empty_threshold)
+            is_empty_list.append(is_empty)
+            
+            if is_empty:
+                # 空mask样本：GT为空
+                if pred_sum <= smooth:
+                    # GT为空，预测也为空 → Dice=1.0
+                    dice = 1.0
+                    iou = 1.0
+                    precision = 1.0
+                    recall = 1.0
+                else:
+                    # GT为空，预测不为空（假阳性）→ Dice=0.0（严厉惩罚）
+                    dice = 0.0
+                    iou = 0.0
+                    precision = 0.0
+                    recall = 1.0  # GT为空，recall=1.0（没有漏检）
+            else:
+                # 前景样本：使用标准公式
+                tp = intersection
+                fp = pred_sum - intersection
+                fn = target_sum - intersection
+                
+                # Dice = 2*TP / (2*TP + FP + FN)
+                dice_den = 2.0 * tp + fp + fn
+                if dice_den < smooth:
+                    dice = 0.0
+                else:
+                    dice = (2.0 * tp) / dice_den
+                
+                # IoU = TP / (TP + FP + FN)
+                union = tp + fp + fn
+                if union < smooth:
+                    iou = 0.0
+                else:
+                    iou = tp / union
+                
+                # Precision = TP / (TP + FP)
+                if (tp + fp) < smooth:
+                    precision = 0.0
+                else:
+                    precision = tp / (tp + fp)
+                
+                # Recall = TP / (TP + FN)
+                if (tp + fn) < smooth:
+                    recall = 0.0
+                else:
+                    recall = tp / (tp + fn)
+            
+            dice_scores.append(float(dice))
+            iou_scores.append(float(iou))
+            precision_scores.append(float(precision))
+            recall_scores.append(float(recall))
+        
+        return {
+            'dice': dice_scores,
+            'iou': iou_scores,
+            'precision': precision_scores,
+            'recall': recall_scores,
+            'is_empty': is_empty_list,
+        }
+    
     def calculate_batch_dice(self, pred, target, smooth=1e-7):
         """
         计算一个批次中每个样本的Dice系数。
         对空mask情况进行特殊处理,避免过度惩罚少量误检。
+        
+        【注意】此函数保留用于向后兼容，新代码应使用 calculate_batch_metrics
         """
         # 确保 pred 和 target 的空间尺寸匹配
         if pred.shape[2:] != target.shape[2:]:
@@ -8102,10 +8424,9 @@ class TrainThread(QThread):
         
         batch_size = pred.size(0)
         total_pixels = pred_flat.size(1)
-        avg_fg_ratio = float(target_flat.sum() / max(1.0, batch_size * total_pixels))
-        # 【修复】降低空mask阈值，从0.015改为0.001，避免将少量前景像素误判为空mask
-        # 对于512x512图像，阈值从9.8像素降低到0.65像素，更严格
-        adaptive_empty_threshold = max(smooth, avg_fg_ratio * 0.001)
+        # 【统一阈值】使用固定的0.1%像素阈值，与验证阶段保持一致
+        # 对于512x512图像，阈值约为0.65像素
+        empty_threshold = max(1e-7, float(total_pixels) * 0.001)  # 0.1%像素，统一阈值
         dice_scores = []
         
         for i in range(batch_size):
@@ -8118,7 +8439,7 @@ class TrainThread(QThread):
             
             # 【关键修复】空掩码特判逻辑
             # Case 1: GT 为空（全黑样本）
-            if target_sum <= adaptive_empty_threshold:
+            if target_sum <= empty_threshold:
                 if pred_sum <= smooth:
                     # 场景 A: GT 为空，Pred 为空 → Dice = 1.0 (完美预测)
                     dice = 1.0
@@ -8979,13 +9300,38 @@ class TrainThread(QThread):
             pred_np = pred_mask.copy()
             is_tensor = False
         
-        if pred_np.sum() < 10:  # 几乎为空,直接返回
-            return pred_mask
+        # 【关键修复】对于几乎为空的预测，更严格地处理，避免后处理引入假阳性
+        pred_sum = pred_np.sum()
+        
+        # 【置信度预过滤】如果全图最大概率低于阈值，直接判定为全黑
+        # 这可以避免低置信度的噪声被形态学操作放大
+        if hasattr(pred_mask, 'max') or (isinstance(pred_mask, torch.Tensor) and pred_mask.numel() > 0):
+            # 获取原始概率图（如果可用）
+            # 注意：这里pred_mask已经是二值化的，我们需要从外部传入prob_map
+            # 但为了简化，我们使用pred_np的最大值作为代理
+            max_prob_proxy = pred_np.max() if pred_np.size > 0 else 0.0
+            if max_prob_proxy < 0.3:  # 如果最大概率很低，直接清空
+                if is_tensor:
+                    return torch.zeros_like(pred_mask)
+                else:
+                    return np.zeros_like(pred_np)
+        
+        # 如果预测像素数很少（< 100像素），可能是噪声，直接清空
+        # 【动态阈值】根据图像大小调整阈值
+        image_size = pred_np.size
+        dynamic_threshold = max(100, int(image_size * 0.0005))  # 至少100像素，或图像的0.05%
+        if pred_sum < dynamic_threshold:
+            # 对于几乎为空的预测，直接返回全空mask，避免后处理引入假阳性
+            if is_tensor:
+                return torch.zeros_like(pred_mask)
+            else:
+                return np.zeros_like(pred_np)
         
         pred_binary = (pred_np > 0.5).astype(np.uint8)
         
         # 1. 填充孔洞（Fill Holes）- 去除器官内部的假阴性空洞
-        if fill_holes:
+        # 【关键修复】fill_holes只在有较大预测块时启用，防止把背景底噪填成实心块
+        if fill_holes and pred_sum >= 1000:  # 只有预测块较大时才填充孔洞
             # 使用 scipy.ndimage.binary_fill_holes 填充内部孔洞
             pred_binary = ndimage.binary_fill_holes(pred_binary).astype(np.uint8)
         
@@ -9023,14 +9369,23 @@ class TrainThread(QThread):
                     pred_binary = (labeled == largest_label).astype(np.uint8)
         else:
             # 4. 连通域分析 - 移除小区域（如果不使用keep_largest）
+            # 【动态连通域过滤】根据图像大小和预测块大小动态调整min_size
             if min_size > 0:
                 labeled, num_features = ndimage.label(pred_binary)
                 if num_features > 0:
                     sizes = ndimage.sum(pred_binary, labeled, range(1, num_features + 1))
-                    mask_sizes = sizes >= min_size
+                    # 【关键修复】动态调整min_size：对于几乎为空的预测，使用更严格的阈值
+                    dynamic_min_size = max(min_size, int(image_size * 0.002))  # 至少min_size，或图像的0.2%
+                    if pred_sum < 1000:  # 如果总预测像素很少，使用更严格的阈值
+                        dynamic_min_size = max(dynamic_min_size, 1000)  # 至少1000像素
+                    mask_sizes = sizes >= dynamic_min_size
                     # 只保留大区域
                     keep_labels = np.where(mask_sizes)[0] + 1
-                    pred_binary = np.isin(labeled, keep_labels).astype(np.uint8)
+                    if len(keep_labels) == 0:
+                        # 如果没有区域满足条件，清空整个mask
+                        pred_binary = np.zeros_like(pred_binary)
+                    else:
+                        pred_binary = np.isin(labeled, keep_labels).astype(np.uint8)
         
         # 返回原始类型
         if is_tensor:
