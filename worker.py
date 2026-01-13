@@ -150,7 +150,7 @@ class ModelTestThread(QThread):
     # 阈值扫描结果（完整表格 + 推荐阈值信息），通过object传递，避免PyQt类型限制
     threshold_sweep_ready = pyqtSignal(object)
     
-    def __init__(self, model_paths, data_dir, model_type, use_tta=True, enable_matlab_plots=None, dataset_type="standard"):
+    def __init__(self, model_paths, data_dir, model_type, use_tta=True, enable_matlab_plots=None, dataset_type="standard", safe_mode=True):
         super().__init__()
         # 支持单模型（集成功能已删除）
         if isinstance(model_paths, str):
@@ -166,6 +166,7 @@ class ModelTestThread(QThread):
         self.use_tta = use_tta
         self.enable_matlab_plots = enable_matlab_plots  # 保存用户设置的MATLAB开关状态
         self.dataset_type = dataset_type  # 数据集类型：standard 或 2.5d
+        self.safe_mode = safe_mode  # 【测试模块卡死修复】安全模式标志
         self.stop_requested = False
         self.temp_dir = tempfile.mkdtemp(prefix="model_test_")
         
@@ -278,20 +279,45 @@ class ModelTestThread(QThread):
                 patient_ids, val_transform, split_name="test", 
                 return_classification=False, use_weighted_sampling=False
             )
-            # 【Windows 多进程优化】为测试线程也启用多进程数据加载
-            # Intel Core Ultra 9 285HX: 使用 8 个 worker 充分利用 P-Core
-            import platform
-            is_windows = platform.system() == 'Windows'
-            cpu_count = os.cpu_count() or 1
-            num_workers = 8 if is_windows else max(0, min(4, cpu_count - 1))
-            test_loader = DataLoader(
-                test_dataset, 
-                batch_size=4, 
-                shuffle=False, 
-                num_workers=num_workers,
-                pin_memory=True,  # 【优化】加速数据传输
-                persistent_workers=(num_workers > 0)  # 【关键】让子进程保持存活
-            )
+            # 【测试模块卡死修复】强制使用安全参数，避免内存峰值导致卡死
+            if self.safe_mode:
+                # 安全模式：最保守的参数
+                batch_size_test = 1
+                num_workers_test = 0
+                pin_memory_test = False
+                persistent_workers_test = False
+                prefetch_factor_test = None  # num_workers=0时不传此参数
+                print("[测试|安全模式] 使用安全参数: batch_size=1, num_workers=0, pin_memory=False")
+            else:
+                # 高级模式：允许用户自定义，但有上限保护
+                import platform
+                is_windows = platform.system() == 'Windows'
+                cpu_count = os.cpu_count() or 1
+                # 上限保护：batch_size <= 8, num_workers <= 4
+                batch_size_test = min(8, 4)  # 默认4，最大8
+                num_workers_test = min(4, max(0, cpu_count - 1)) if not is_windows else min(2, max(0, cpu_count - 1))
+                # 当batch_size > 4时，自动降低workers
+                if batch_size_test > 4:
+                    num_workers_test = min(2, num_workers_test)
+                    print(f"[测试|高级模式] batch_size={batch_size_test} > 4，自动降低num_workers到{num_workers_test}")
+                pin_memory_test = False  # Windows上先关闭pin_memory避免卡顿
+                persistent_workers_test = (num_workers_test > 0)
+                prefetch_factor_test = 1 if num_workers_test > 0 else None
+                print(f"[测试|高级模式] 使用参数: batch_size={batch_size_test}, num_workers={num_workers_test}, pin_memory={pin_memory_test}")
+            
+            # 创建DataLoader，使用测试专用的安全参数
+            loader_kwargs = {
+                'batch_size': batch_size_test,
+                'shuffle': False,
+                'num_workers': num_workers_test,
+                'pin_memory': pin_memory_test,
+            }
+            if num_workers_test > 0:
+                loader_kwargs['persistent_workers'] = persistent_workers_test
+                if prefetch_factor_test is not None:
+                    loader_kwargs['prefetch_factor'] = prefetch_factor_test
+            
+            test_loader = DataLoader(test_dataset, **loader_kwargs)
             
             # 评估模型（集成功能已删除，仅支持单模型）
             self.update_progress.emit(30, "正在评估模型性能...")
@@ -1182,6 +1208,16 @@ class ModelTestThread(QThread):
                     sweep_stats[thr]["fn"] += fn_total
                     sweep_stats[thr]["tn"] += tn_total
                     sweep_stats[thr]["fp_pix"] += fp_total
+                
+                # 【测试模块卡死修复】及时释放中间变量，避免内存堆积
+                del logits, probs, preds_bin_list, preds_bin, pred, gt
+                image_idx += len(images)
+                if image_idx % 50 == 0:  # 每50个样本清理一次
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    print(f"[测试|内存优化] 已处理 {image_idx} 个样本，执行内存清理")
 
         # 打印表格并选择最优阈值（使用自定义综合评分函数）
         sweep_rows = []
