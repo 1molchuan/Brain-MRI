@@ -1,3 +1,4 @@
+import utils.logging_setup
 import argparse
 import base64
 import copy
@@ -32,7 +33,13 @@ try:
     SKIMAGE_AVAILABLE = True
 except ImportError:
     SKIMAGE_AVAILABLE = False
-    print("[警告] skimage未安装，直方图匹配功能将不可用")
+    import logging, builtins
+    logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+    # Redirect built-in print to logging.info for this process
+    def _print_to_log(*args, **kwargs):
+        logging.info(' '.join(str(a) for a in args))
+    builtins.print = _print_to_log
+    logging.warning("[警告] skimage未安装，直方图匹配功能将不可用")
 from scipy.io import loadmat, savemat
 import matplotlib
 matplotlib.use('Agg')  # 使用非交互式后端，避免子线程启动GUI警告

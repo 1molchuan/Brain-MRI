@@ -2,6 +2,7 @@
 工具函数和数据处理类模块
 包含所有独立工具函数、数据处理类和模型加载函数
 """
+import utils.logging_setup
 import os
 # 注意把路径改成你实际的 MATLAB 安装路径
 matlab_bin_path = r"C:\Program Files\MATLAB\R2025b\bin\win64"

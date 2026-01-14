@@ -3,6 +3,7 @@ TCGA-LGG 数据集加载器
 支持 2.5D 输入(上一张、当前、下一张切片堆叠)
 """
 
+import utils.logging_setup
 import os
 import re
 import numpy as np

@@ -1,3 +1,4 @@
+import utils.logging_setup
 import os
 import torch
 import torch.nn as nn

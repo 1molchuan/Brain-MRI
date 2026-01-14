@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import utils.logging_setup
 """
 训练线程模块
 """

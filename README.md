@@ -1,4 +1,4 @@
-# 医学图像分割平台 — 项目说明
+# 🏥 医学图像分割系统 - AI智能分析平台
 
 <div align="center">
 
@@ -6,12 +6,16 @@
 ![PyTorch](https://img.shields.io/badge/PyTorch-1.9.0+-orange.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)
+[![GitHub stars](https://img.shields.io/github/stars/1molchuan/Brain-MRI?style=social)](https://github.com/1molchuan/Brain-MRI)
+[![许可证](https://img.shields.io/badge/许可证-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Python](https://img.shields.io/badge/Python-3.7%2B-blue)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-1.9%2B-red)](https://pytorch.org/)
 
 ## 概述
 
-一个面向医学图像分割的完整工具链，集成训练、评估、推理与可视化。提供友好的 GUI 与 REST API，支持多种领先的分割模型（如 TransUNet、SwinUNet、U-Net++、DeepLabV3+），并包含智能阈值优化（GWO）、测试时增强（TTA）与完善的后处理与评估指标。
+一个全面的医学图像分割系统，具有图形界面和API服务，支持多种先进的深度学习模型架构。该系统专为医学图像分割任务设计，特别针对脑肿瘤分割场景进行了优化。
 
-快速导航： [主要特性](#-主要特性) • [快速开始](#-快速开始) • [使用指南](#-使用指南) • [模型架构](#-支持的模型架构) • [常见问题](#-常见问题)
+[功能特性](#-主要特性) • [快速开始](#-快速开始) • [使用指南](#-使用指南) • [模型架构](#-支持的模型架构) • [常见问题](#-常见问题)
 
 </div>
 
@@ -138,41 +142,41 @@ python main.py --mode api --model path/to/model.pth --host 0.0.0.0 --port 8000
 ```
 medical-segmentation/
 ├── main.py                    # 主入口（GUI和应用程序）
-├── models.py                  # 所有模型架构定义
+├── models.py                  # 所有模型架构
 ├── dataset.py                 # 2.5D数据集加载器（TCGA2_5DDataset）
-├── config.py                 # 集中式模型配置
-├── requirements.txt          # 依赖列表
-├── README.md                 # 本文档
-├── LICENSE                   # 许可证文件
+├── config.py                  # 集中式模型配置
+├── requirements.txt           # 依赖列表
+├── README.md                  # 本文档
+├── LICENSE                    # 许可证文件
 │
-├── utils/                    # Utils模块（工具函数和数据处理）
-│   ├── __init__.py          # 向后兼容接口
-│   ├── common.py            # 公共导入和配置
-│   ├── helpers.py           # 基础工具函数（EarlyStopping等）
-│   ├── model_loader.py      # 模型加载函数
-│   ├── dataset.py           # 数据集类（MedicalImageDataset）
-│   ├── gwo_optimizer.py     # GWO优化器
-│   ├── threshold_scan.py    # 阈值扫描
-│   ├── standalone_funcs.py  # 独立函数（多进程）
-│   ├── data_processing.py   # 数据处理函数
-│   ├── postprocessing.py    # 后处理函数
-│   ├── matlab_bridge.py     # MATLAB相关类
-│   ├── visualization.py      # 可视化函数
-│   ├── image_augmentation.py # 图像增强类
-│   ├── window_ops.py         # 窗口操作函数
-│   ├── process_pool.py      # 进程池管理器
+├── utils/                     # 工具函数模块（模块化结构）
+│   ├── __init__.py            # 向后兼容接口
+│   ├── common.py              # 公共导入和配置
+│   ├── helpers.py             # 基础工具函数（EarlyStopping等）
+│   ├── window_ops.py           # 窗口操作函数
+│   ├── image_augmentation.py  # 图像增强类
+│   ├── model_loader.py        # 模型加载函数
+│   ├── data_processing.py    # 数据处理函数
+│   ├── standalone_funcs.py   # 独立函数（多进程）
+│   ├── process_pool.py        # 进程池管理器
 │   ├── multiprocess_helpers.py # 多进程辅助函数
-│   └── README.md            # Utils模块说明
+│   ├── gwo_optimizer.py       # GWO优化器
+│   ├── threshold_scan.py      # 阈值扫描
+│   ├── dataset.py             # 数据集类（MedicalImageDataset）
+│   ├── matlab_bridge.py       # MATLAB相关类
+│   ├── visualization.py       # 可视化函数
+│   └── README.md              # Utils模块说明
 │
-├── worker/                   # Worker模块（工作线程）
-│   ├── __init__.py          # 向后兼容接口
-│   ├── common.py            # 公共导入和配置
-│   ├── train_thread.py      # 训练线程（TrainThread）
-│   ├── test_thread.py       # 测试线程（ModelTestThread）
-│   ├── predict_thread.py    # 预测线程（PredictThread）
-│   └── README.md           # Worker模块说明
+├── worker/                    # 工作线程模块（模块化结构）
+│   ├── __init__.py            # 向后兼容接口
+│   ├── common.py              # 公共导入和配置
+│   ├── test_thread.py         # ModelTestThread（模型测试线程）
+│   ├── train_thread.py        # TrainThread（训练线程）
+│   ├── predict_thread.py      # PredictThread（预测线程）
+│   └── README.md              # Worker模块说明
 │
-└── data/                     # 数据目录（用户创建）
+├── matlab_reports/            # 生成的MATLAB报告
+└── data/                      # 数据目录（用户创建）
     ├── patient_id1/
     │   ├── image1.png
     │   ├── image1_mask.png
@@ -180,57 +184,25 @@ medical-segmentation/
     └── ...
 ```
 
-### 模块说明
-
-#### 核心模块
+### 文件说明
 
 - **main.py**: 主程序文件，包含 PyQt5 GUI 界面和应用程序入口，支持 MATLAB 引擎预热
-- **models.py**: 包含所有模型架构的定义（ImprovedUNet、ResNetUNet、TransUNet等）
-- **config.py**: 集中管理所有模型的配置参数
+- **models.py**: 包含所有模型架构的定义
+- **utils/**: 工具函数模块，包含数据处理、模型加载、MATLAB 可视化桥接、GWO 优化器等
+  - `helpers.py`: 基础工具函数（EarlyStopping、指标计算等）
+  - `gwo_optimizer.py`: 灰狼优化算法阈值优化器
+  - `model_loader.py`: 模型加载和参数推断
+  - `dataset.py`: 医学图像数据集类
+  - `standalone_funcs.py`: 后处理函数（LCC、孔洞填充等）
+  - `matlab_bridge.py`: MATLAB 引擎会话和可视化桥接
+  - 更多模块详见 `utils/README.md`
+- **worker/**: 工作线程模块，包含训练、测试和预测的业务逻辑
+  - `train_thread.py`: 训练线程（TrainThread）
+  - `test_thread.py`: 测试线程（ModelTestThread）
+  - `predict_thread.py`: 预测线程（PredictThread）
+  - 更多详情详见 `worker/README.md`
 - **dataset.py**: 2.5D 数据集加载器，支持 TCGA-LGG 格式的三通道堆叠输入
-
-#### Utils 模块 (`utils/`)
-
-工具函数和数据处理模块，包含：
-
-- **common.py**: 公共导入和配置（numpy, torch, cv2等）
-- **helpers.py**: 基础工具函数（EarlyStopping、指标计算等）
-- **model_loader.py**: 模型加载函数（load_model_compatible、参数推断等）
-- **dataset.py**: 数据集类（MedicalImageDataset）
-- **gwo_optimizer.py**: GWO灰狼优化算法（GreyWolfThresholdOptimizer）
-- **threshold_scan.py**: 阈值扫描功能
-- **standalone_funcs.py**: 独立函数（多进程并行处理、后处理等）
-- **data_processing.py**: 数据处理函数（归一化、模态解析等）
-- **matlab_bridge.py**: MATLAB相关类（MatlabEngineSession、MatlabVisualizationBridge等）
-- **visualization.py**: 可视化函数（render_quick_preview_matplotlib等）
-- **image_augmentation.py**: 图像增强类（MedicalImageAugmentation）
-- **window_ops.py**: 窗口操作函数（window_partition、window_reverse）
-- **process_pool.py**: 进程池管理器（ProcessPoolManager）
-- **multiprocess_helpers.py**: 多进程辅助函数
-
-#### Worker 模块 (`worker/`)
-
-工作线程模块，包含：
-
-- **common.py**: 公共导入和配置
-- **train_thread.py**: 训练线程类（TrainThread），包含训练逻辑、Grad-CAM、TTA等
-- **test_thread.py**: 测试线程类（ModelTestThread），包含测试逻辑、评估指标等
-- **predict_thread.py**: 预测线程类（PredictThread），包含预测逻辑、后处理等
-
-### 向后兼容性
-
-项目采用模块化设计，但保持完全向后兼容：
-
-```python
-# 原有导入方式仍然有效
-from utils import *
-from worker import TrainThread, ModelTestThread, PredictThread
-
-# 也可以按需导入特定模块
-from utils.helpers import EarlyStopping
-from utils.gwo_optimizer import GreyWolfThresholdOptimizer
-from worker.test_thread import ModelTestThread
-```
+- **config.py**: 集中管理所有模型的配置参数
 
 ---
 
@@ -430,6 +402,8 @@ data_dir/
 - SwinUNet/DS-TransUNet/NN-Former 的超参数优化
 - 阈值优化（替代线性扫描）
 
+**实现位置**: `utils/gwo_optimizer.py`
+
 ### 测试时增强 (TTA)
 - 多尺度推理（0.8x, 1.0x, 1.2x）
 - 8 种几何变换（翻转、旋转等）
@@ -444,6 +418,8 @@ data_dir/
 - **形态学操作**: 开运算、闭运算，去除毛刺和填充缝隙
 - **动态面积阈值**: 根据概率图平均值动态调整过滤阈值
 - **高置信度小病灶保护**: 智能保留高置信度（>0.9）的微小病灶
+
+**实现位置**: `utils/standalone_funcs.py` - `ensemble_post_process_global()` 和 `refine_segmentation_mask()`
 
 ### Grad‑CAM可视化
 - 支持没有原生注意力图的模型（如DeepLabV3+）
@@ -465,6 +441,8 @@ data_dir/
 - 优化布局（为X轴标签预留空间）
 - 持久保存到 `matlab_reports/` 目录。
 
+**实现位置**: `utils/matlab_bridge.py`
+
 ### 性能优化
 - **CuDNN Benchmark**: 自动寻找最适合的卷积算法
 - **DataLoader 优化**:
@@ -474,7 +452,7 @@ data_dir/
   - `prefetch_factor`: 增加预取因子，提升数据流水线效率
 - **内存优化**: 测试阶段仅收集前 5 个样本用于可视化，其余立即释放
 - **梯度优化**: 验证阶段仅对前 5 个 batch 启用梯度计算（Grad-CAM），其余使用 `torch.no_grad()`
-- **多进程优化**: 后处理和指标计算支持多进程并行，提升测试速度
+- **多进程后处理**: 使用 `ProcessPoolExecutor` 并行化 CPU 密集型任务
 
 ---
 
@@ -561,39 +539,77 @@ pip install grad-cam
 项目采用**模块化设计**，将功能拆分为多个主要模块：
 
 #### 核心模块
+
 - **main.py**: GUI 界面和应用程序主入口，包含 MATLAB 引擎预热逻辑
 - **models.py**: 所有模型架构的定义
 - **config.py**: 模型配置中心
-- **dataset.py**: 2.5D 数据集加载器
+- **dataset.py**: 2.5D 数据集加载器（TCGA2_5DDataset）
 
 #### Utils 模块 (`utils/`)
-工具函数和数据处理模块，包含：
-- 基础工具函数（EarlyStopping、指标计算等）
-- 模型加载函数（兼容性加载、参数推断等）
-- 数据集类（MedicalImageDataset）
-- GWO优化器（GreyWolfThresholdOptimizer）
-- 后处理函数（ensemble_post_process_global、refine_segmentation_mask等）
-- MATLAB桥接（MatlabEngineSession、MatlabVisualizationBridge等）
-- 可视化函数
-- 图像增强类
-- 多进程支持（ProcessPoolManager等）
+
+工具函数模块，包含14个子模块：
+
+- **common.py**: 公共导入和配置
+- **helpers.py**: 基础工具函数（EarlyStopping、指标计算等）
+- **gwo_optimizer.py**: 灰狼优化算法阈值优化器
+- **model_loader.py**: 模型加载和参数推断
+- **dataset.py**: 医学图像数据集类（MedicalImageDataset）
+- **standalone_funcs.py**: 后处理函数（LCC、孔洞填充、边缘平滑等）
+- **matlab_bridge.py**: MATLAB 引擎会话和可视化桥接
+- **threshold_scan.py**: 阈值扫描功能
+- **visualization.py**: 可视化函数
+- 更多模块详见 `utils/README.md`
+
+**向后兼容**: 所有原有导入方式仍然有效
+```python
+from utils import *  # 仍然有效
+from utils import EarlyStopping, GreyWolfThresholdOptimizer  # 仍然有效
+```
 
 #### Worker 模块 (`worker/`)
-工作线程模块，包含：
-- **TrainThread**: 训练线程，包含训练逻辑、Grad-CAM、TTA等
-- **ModelTestThread**: 测试线程，包含测试逻辑、评估指标、多进程优化等
-- **PredictThread**: 预测线程，包含预测逻辑、后处理等
+
+工作线程模块，包含训练、测试和预测的业务逻辑：
+
+- **train_thread.py**: 训练线程（TrainThread）- 约8650行
+- **test_thread.py**: 测试线程（ModelTestThread）- 约2000行
+- **predict_thread.py**: 预测线程（PredictThread）- 约200行
+- **common.py**: 公共导入和配置
+
+**向后兼容**: 所有原有导入方式仍然有效
+```python
+from worker import TrainThread, ModelTestThread, PredictThread  # 仍然有效
+```
+
+更多详情详见 `worker/README.md`
 
 ### 关键设计决策
 
-1. **模块化设计**: 将大型文件（`utils.py` 4548行、`worker.py` 11013行）拆分为模块化结构，提高可维护性
-2. **向后兼容**: 保持原有导入方式不变，`from utils import *` 和 `from worker import ...` 仍然有效
+1. **模块化结构**: 将大型文件（`utils.py` 4548行、`worker.py` 11013行）拆分为模块化结构，提高可维护性
+2. **向后兼容**: 保持所有原有导入方式不变，无需修改现有代码
 3. **通道自适应**: DeepLabV3+ 和 U-Net++ 支持 1/3 通道输入自适应，通过数据加载器自动转换
 4. **空 Mask 优化**: 实现了完善的空 Mask 处理逻辑，确保指标计算的准确性
 5. **性能优化**: DataLoader 多进程、CuDNN Benchmark、内存优化、多进程后处理等
 6. **可视化优化**: Grad-CAM 采样策略、MATLAB 报告优化等
 7. **损失函数简化**: 采用 50% BCE + 50% Dice 的黄金标准组合
 8. **GWO 优化**: 智能阈值搜索，提升验证效率
+
+### 模块依赖关系
+
+```
+main.py
+├── models.py
+├── utils/ (通过 __init__.py 统一导出)
+│   ├── common.py (公共导入)
+│   ├── helpers.py
+│   ├── gwo_optimizer.py
+│   ├── model_loader.py
+│   └── ... (其他模块)
+└── worker/ (通过 __init__.py 统一导出)
+    ├── common.py (公共导入)
+    ├── train_thread.py
+    ├── test_thread.py
+    └── predict_thread.py
+```
 
 ---
 
@@ -645,11 +661,12 @@ pip install grad-cam
 
 ## 📈 更新日志
 
-### v3.0 (最新)
-- ✅ **模块化重构** - 将 `utils.py` 和 `worker.py` 拆分为模块化结构
-- ✅ **提升可维护性** - 代码组织更清晰，易于维护和扩展
+### v2.2 (最新)
+- ✅ **模块化重构** - 将 `utils.py` (4548行) 拆分为 `utils/` 目录（14个模块）
+- ✅ **模块化重构** - 将 `worker.py` (11013行) 拆分为 `worker/` 目录（4个模块）
 - ✅ **向后兼容** - 保持所有原有导入方式不变
-- ✅ **多进程优化** - 后处理和指标计算支持多进程并行
+- ✅ **性能优化** - 多进程后处理和指标计算
+- ✅ **代码组织** - 提高可维护性和协作友好性
 
 ### v2.1
 - ✅ **新增 GWO 灰狼优化算法** - 智能阈值搜索，替代线性扫描

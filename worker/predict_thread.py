@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import utils.logging_setup
 """
 预测线程模块
 """
