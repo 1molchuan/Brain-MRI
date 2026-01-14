@@ -59,6 +59,17 @@ def _warmup_matlab_engine():
 # 其他库必须在此之后导入
 # ============================================================================
 
+# ============================================================================
+# NumExpr 线程数配置（避免警告信息）
+# ============================================================================
+# 设置 NumExpr 最大线程数，避免 "NUMEXPR_MAX_THREADS not set" 警告
+# NumExpr 是 pandas/numpy 使用的表达式求值库
+if 'NUMEXPR_MAX_THREADS' not in os.environ:
+    import multiprocessing
+    # 设置为 CPU 核心数，但不超过 24（避免过度占用）
+    max_threads = min(multiprocessing.cpu_count(), 24)
+    os.environ['NUMEXPR_MAX_THREADS'] = str(max_threads)
+
 import argparse
 import random
 import shutil   # 文件操作可能用到
@@ -2269,12 +2280,13 @@ class MedicalSegmentationApp(QMainWindow):
         sweep_layout = QVBoxLayout()
         sweep_layout.setContentsMargins(10, 10, 10, 10)
 
-        sweep_title = QLabel("🔎 阈值扫描详情（Threshold | Dice | Precision | Recall | FP Count）")
+        sweep_title = QLabel("🔎 阈值扫描详情（Threshold | Dice | Precision | Recall | FP Count | Score）")
         sweep_title.setStyleSheet("font-weight: 700; color: #334155;")
         sweep_layout.addWidget(sweep_title)
 
-        self.test_sweep_table = QTableWidget(0, 5)
-        self.test_sweep_table.setHorizontalHeaderLabels(["阈值", "Global Dice", "Precision", "Recall", "FP Count"])
+        # 增加一列显示综合评分 Score，便于观察 GWO 搜索的目标函数
+        self.test_sweep_table = QTableWidget(0, 6)
+        self.test_sweep_table.setHorizontalHeaderLabels(["阈值", "Global Dice", "Precision", "Recall", "FP Count", "Score"])
         self.test_sweep_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.test_sweep_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.test_sweep_table.setSelectionMode(QTableWidget.SingleSelection)
@@ -2792,12 +2804,16 @@ class MedicalSegmentationApp(QMainWindow):
         recall_floor = float(payload.get("recall_floor", 0.90))
         fallback_used = bool(payload.get("fallback_used", False))
 
-        # 更新推荐阈值展示
+        # 更新推荐阈值展示（显示来自 GWO 的最佳阈值 + 关键指标）
         try:
             thr = float(best.get("threshold", 0.0))
             rec = float(best.get("recall", 0.0))
+            dice = float(best.get("dice", 0.0))
+            score = float(best.get("score", 0.0))
             warn = "（回退）" if fallback_used else ""
-            self.test_recommended_threshold_label.setText(f"推荐阈值: {thr:.2f} (Recall: {rec*100:.1f}%) {warn}")
+            self.test_recommended_threshold_label.setText(
+                f"推荐阈值(GWO): {thr:.2f} | Dice: {dice:.4f} | Recall: {rec*100:.1f}% | Score: {score:.4f} {warn}"
+            )
             # Recall 低于阈值时加红提示
             if rec < recall_floor:
                 self.test_recommended_threshold_label.setStyleSheet("""
@@ -2828,6 +2844,7 @@ class MedicalSegmentationApp(QMainWindow):
             prec = float(r.get("precision", 0.0))
             rec = float(r.get("recall", 0.0))
             fp = int(r.get("fp_count", 0))
+            score = float(r.get("score", 0.0))
 
             items = [
                 QTableWidgetItem(f"{thr:.2f}"),
@@ -2835,14 +2852,15 @@ class MedicalSegmentationApp(QMainWindow):
                 QTableWidgetItem(f"{prec:.4f}"),
                 QTableWidgetItem(f"{rec:.4f}"),
                 QTableWidgetItem(f"{fp:,}"),
+                QTableWidgetItem(f"{score:.4f}"),
             ]
             for c, it in enumerate(items):
                 it.setTextAlignment(Qt.AlignCenter)
                 table.setItem(r_idx, c, it)
 
-            # 高亮最佳阈值行
+            # 高亮最佳阈值行（包括Score列）
             if abs(thr - best_thr) < 1e-6:
-                for c in range(5):
+                for c in range(table.columnCount()):
                     cell = table.item(r_idx, c)
                     if cell:
                         cell.setBackground(QColor("#dcfce7"))

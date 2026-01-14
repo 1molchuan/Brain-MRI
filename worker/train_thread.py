@@ -6200,6 +6200,7 @@ class TrainThread(QThread):
         iou_scores = []
         precision_scores = []
         recall_scores = []
+        specificity_scores = []
         is_empty_list = []
         
         for i in range(batch_size):
@@ -6222,17 +6223,26 @@ class TrainThread(QThread):
                     iou = 1.0
                     precision = 1.0
                     recall = 1.0
+                    specificity = 1.0
                 else:
                     # GT为空，预测不为空（假阳性）→ Dice=0.0（严厉惩罚）
                     dice = 0.0
                     iou = 0.0
                     precision = 0.0
                     recall = 1.0  # GT为空，recall=1.0（没有漏检）
+                    # 仍然可以计算 specificity：TN/(TN+FP)
+                    # TP=0, FN=0, FP=pred_sum, TN=total_pixels - FP
+                    fp = pred_sum
+                    tn = float(total_pixels) - float(fp)
+                    spec_den = tn + fp
+                    specificity = 1.0 if spec_den < smooth else float(tn / (spec_den + smooth))
             else:
                 # 前景样本：使用标准公式
                 tp = intersection
                 fp = pred_sum - intersection
                 fn = target_sum - intersection
+                # TN = total_pixels - TP - FP - FN = total_pixels - pred_sum - target_sum + intersection
+                tn = float(total_pixels) - float(pred_sum) - float(target_sum) + float(intersection)
                 
                 # Dice = 2*TP / (2*TP + FP + FN)
                 dice_den = 2.0 * tp + fp + fn
@@ -6259,17 +6269,26 @@ class TrainThread(QThread):
                     recall = 0.0
                 else:
                     recall = tp / (tp + fn)
+
+                # Specificity = TN / (TN + FP)
+                spec_den = tn + float(fp)
+                if spec_den < smooth:
+                    specificity = 1.0
+                else:
+                    specificity = float(tn / (spec_den + smooth))
             
             dice_scores.append(float(dice))
             iou_scores.append(float(iou))
             precision_scores.append(float(precision))
             recall_scores.append(float(recall))
+            specificity_scores.append(float(specificity))
         
         return {
             'dice': dice_scores,
             'iou': iou_scores,
             'precision': precision_scores,
             'recall': recall_scores,
+            'specificity': specificity_scores,
             'is_empty': is_empty_list,
         }
 

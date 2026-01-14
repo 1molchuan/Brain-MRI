@@ -4,6 +4,18 @@
 """
 import utils.logging_setup
 import os
+
+# ============================================================================
+# NumExpr 线程数配置（避免警告信息）
+# ============================================================================
+# 设置 NumExpr 最大线程数，避免 "NUMEXPR_MAX_THREADS not set" 警告
+# NumExpr 是 pandas/numpy 使用的表达式求值库
+if 'NUMEXPR_MAX_THREADS' not in os.environ:
+    import multiprocessing
+    # 设置为 CPU 核心数，但不超过 24（避免过度占用）
+    max_threads = min(multiprocessing.cpu_count(), 24)
+    os.environ['NUMEXPR_MAX_THREADS'] = str(max_threads)
+
 # 注意把路径改成你实际的 MATLAB 安装路径
 matlab_bin_path = r"C:\Program Files\MATLAB\R2025b\bin\win64"
 if matlab_bin_path not in os.environ['PATH']:
