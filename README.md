@@ -97,7 +97,7 @@
 ### 1. 克隆仓库
 
 ```bash
-git clone https://github.com/1molchuan/medical-segmentation.git
+git clone https://github.com/yourusername/medical-segmentation.git
 cd medical-segmentation
 ```
 
