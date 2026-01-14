@@ -1,4 +1,4 @@
-# 🏥 医学图像分割系统 - AI智能分析平台
+# 医学图像分割平台 — 项目说明
 
 <div align="center">
 
@@ -9,9 +9,9 @@
 
 ## 概述
 
-一个全面的医学图像分割系统，具有图形界面和API服务，支持多种先进的深度学习模型架构。该系统专为医学图像分割任务设计，特别针对脑肿瘤分割场景进行了优化。
+一个面向医学图像分割的完整工具链，集成训练、评估、推理与可视化。提供友好的 GUI 与 REST API，支持多种领先的分割模型（如 TransUNet、SwinUNet、U-Net++、DeepLabV3+），并包含智能阈值优化（GWO）、测试时增强（TTA）与完善的后处理与评估指标。
 
-[功能特性](#-主要特性) • [快速开始](#-快速开始) • [使用指南](#-使用指南) • [模型架构](#-支持的模型架构) • [常见问题](#-常见问题)
+快速导航： [主要特性](#-主要特性) • [快速开始](#-快速开始) • [使用指南](#-使用指南) • [模型架构](#-支持的模型架构) • [常见问题](#-常见问题)
 
 </div>
 
@@ -97,7 +97,7 @@
 ### 1. 克隆仓库
 
 ```bash
-git clone https://github.com/yourusername/medical-segmentation.git
+git clone https://github.com/1molchuan/medical-segmentation.git
 cd medical-segmentation
 ```
 
