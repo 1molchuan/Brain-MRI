@@ -6,7 +6,7 @@
 ![PyTorch](https://img.shields.io/badge/PyTorch-1.9.0+-orange.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)
-[![GitHub stars](https://img.shields.io/github/stars/yourusername/medical-segmentation?style=social)](https://github.com/yourusername/medical-segmentation)
+[![GitHub stars](https://img.shields.io/github/stars/1molchuan/Brain-MRI?style=social)](https://github.com/1molchuan/Brain-MRI)
 [![许可证](https://img.shields.io/badge/许可证-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python](https://img.shields.io/badge/Python-3.7%2B-blue)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.9%2B-red)](https://pytorch.org/)
@@ -18,6 +18,23 @@
 [功能特性](#-主要特性) • [快速开始](#-快速开始) • [使用指南](#-使用指南) • [模型架构](#-支持的模型架构) • [常见问题](#-常见问题)
 
 </div>
+
+---
+
+## 🆕 最新更新
+
+- **架构重构（Architectural Refactoring）**  
+  - 将原本超大、单文件的 `worker.py`（约 1.1 万行）和 `utils.py`（约 4.5 千行），重构为模块化包结构 `worker/` 与 `utils/`。  
+  - 通过 `__init__.py` 保持向后兼容，原有 `from worker import ...` 和 `from utils import *` 写法仍然可用。  
+  - 重构显著提升了代码的 **可维护性**（按职责拆分）、**可执行性**（更快加载、更少循环依赖），并解决了单文件在 IDE/代码审查中带来的性能瓶颈。  
+
+- **基于 HD-BET 的数据优化与模型增强**  
+  - 在 LGG-MRI 原始数据集上，引入 **HD-BET 深度学习颅骨剥离（Skull Stripping）** 流水线：自动移除颅骨、脂肪、皮肤等颅外组织，只保留颅内脑组织。  
+  - 通过清理强背景噪声，使模型的注意力更集中于 **颅内肿瘤前景**，减少无意义的高亮区域。  
+  - 在经过 HD-BET 预处理的高质量数据集上重新训练 DeepLabV3+，显著提升了：  
+    - **收敛速度**（更稳定、更少震荡）  
+    - **对肿瘤前景的分割鲁棒性**（边界更平滑、小病灶保留更好）  
+  - 该高质量 DeepLabV3+ 模型也作为后续实验与集成的 **基础强模型（strong baseline）** 使用。  
 
 ---
 
@@ -141,22 +158,42 @@ python main.py --mode api --model path/to/model.pth --host 0.0.0.0 --port 8000
 
 ```
 medical-segmentation/
-├── main.py              # 主入口（GUI和应用程序）
-├── models.py            # 所有模型架构
-├── worker.py            # 工作线程（训练、测试、预测）
-├── utils.py             # 工具函数和数据预处理
-├── dataset.py           # 2.5D数据集加载器（TCGA2_5DDataset）
-├── config.py            # 集中式模型配置
-├── README.md            # 本文档
-├── requirements.txt     # 依赖列表
-├── .gitignore           # Git忽略文件
-├── .autocoderignore     # Auto‑coder忽略文件
-├── 2.5D_DATASET_REVIEW.md  # 数据集审查报告
-├── main_data_postprocessing_summary.md  # 代码摘要
-├── debug_data_check.py  # 调试脚本
-├── actions/             # 动作定义（如有）
-├── matlab_reports/      # 生成的MATLAB报告
-└── data/                # 数据目录（用户创建）
+├── main.py                    # 主入口（GUI和应用程序）
+├── models.py                  # 所有模型架构
+├── dataset.py                 # 2.5D数据集加载器（TCGA2_5DDataset）
+├── config.py                  # 集中式模型配置
+├── requirements.txt           # 依赖列表
+├── README.md                  # 本文档
+├── LICENSE                    # 许可证文件
+│
+├── utils/                     # 工具函数模块（模块化结构）
+│   ├── __init__.py            # 向后兼容接口
+│   ├── common.py              # 公共导入和配置
+│   ├── helpers.py             # 基础工具函数（EarlyStopping等）
+│   ├── window_ops.py           # 窗口操作函数
+│   ├── image_augmentation.py  # 图像增强类
+│   ├── model_loader.py        # 模型加载函数
+│   ├── data_processing.py    # 数据处理函数
+│   ├── standalone_funcs.py   # 独立函数（多进程）
+│   ├── process_pool.py        # 进程池管理器
+│   ├── multiprocess_helpers.py # 多进程辅助函数
+│   ├── gwo_optimizer.py       # GWO优化器
+│   ├── threshold_scan.py      # 阈值扫描
+│   ├── dataset.py             # 数据集类（MedicalImageDataset）
+│   ├── matlab_bridge.py       # MATLAB相关类
+│   ├── visualization.py       # 可视化函数
+│   └── README.md              # Utils模块说明
+│
+├── worker/                    # 工作线程模块（模块化结构）
+│   ├── __init__.py            # 向后兼容接口
+│   ├── common.py              # 公共导入和配置
+│   ├── test_thread.py         # ModelTestThread（模型测试线程）
+│   ├── train_thread.py        # TrainThread（训练线程）
+│   ├── predict_thread.py      # PredictThread（预测线程）
+│   └── README.md              # Worker模块说明
+│
+├── matlab_reports/            # 生成的MATLAB报告
+└── data/                      # 数据目录（用户创建）
     ├── patient_id1/
     │   ├── image1.png
     │   ├── image1_mask.png
@@ -168,8 +205,19 @@ medical-segmentation/
 
 - **main.py**: 主程序文件，包含 PyQt5 GUI 界面和应用程序入口，支持 MATLAB 引擎预热
 - **models.py**: 包含所有模型架构的定义
-- **worker.py**: 包含训练、测试和预测的工作线程类，集成 Grad-CAM、TTA、后处理等功能
-- **utils.py**: 包含工具函数、数据处理类、数据集类、模型加载函数、MATLAB 可视化桥接、GWO 优化器等
+- **utils/**: 工具函数模块，包含数据处理、模型加载、MATLAB 可视化桥接、GWO 优化器等
+  - `helpers.py`: 基础工具函数（EarlyStopping、指标计算等）
+  - `gwo_optimizer.py`: 灰狼优化算法阈值优化器
+  - `model_loader.py`: 模型加载和参数推断
+  - `dataset.py`: 医学图像数据集类
+  - `standalone_funcs.py`: 后处理函数（LCC、孔洞填充等）
+  - `matlab_bridge.py`: MATLAB 引擎会话和可视化桥接
+  - 更多模块详见 `utils/README.md`
+- **worker/**: 工作线程模块，包含训练、测试和预测的业务逻辑
+  - `train_thread.py`: 训练线程（TrainThread）
+  - `test_thread.py`: 测试线程（ModelTestThread）
+  - `predict_thread.py`: 预测线程（PredictThread）
+  - 更多详情详见 `worker/README.md`
 - **dataset.py**: 2.5D 数据集加载器，支持 TCGA-LGG 格式的三通道堆叠输入
 - **config.py**: 集中管理所有模型的配置参数
 
@@ -347,7 +395,7 @@ data_dir/
 - **单空（GT 为空但 Pred 不为空）**: Dice=0.0, IoU=0.0（误报）
 - **单空（GT 不为空但 Pred 为空）**: Dice=0.0, IoU=0.0（漏报）
 
-后处理函数 `post_process_mask` 实现了"绝对最小面积限制"，确保微小噪点（面积 < min_size）被清空，从而触发"双空=1.0"的满分指标。
+后处理函数实现了"绝对最小面积限制"，确保微小噪点（面积 < min_size）被清空，从而触发"双空=1.0"的满分指标。
 
 ---
 
@@ -365,11 +413,13 @@ data_dir/
 **使用方法**:
 - 在验证阶段自动启用
 - 默认参数：`num_wolves=10`, `max_iter=15`
-- 搜索空间：[0.1, 0.9]
+- 搜索空间：[0.05, 0.95]
 
 **适用场景**:
 - SwinUNet/DS-TransUNet/NN-Former 的超参数优化
 - 阈值优化（替代线性扫描）
+
+**实现位置**: `utils/gwo_optimizer.py`
 
 ### 测试时增强 (TTA)
 - 多尺度推理（0.8x, 1.0x, 1.2x）
@@ -385,6 +435,8 @@ data_dir/
 - **形态学操作**: 开运算、闭运算，去除毛刺和填充缝隙
 - **动态面积阈值**: 根据概率图平均值动态调整过滤阈值
 - **高置信度小病灶保护**: 智能保留高置信度（>0.9）的微小病灶
+
+**实现位置**: `utils/standalone_funcs.py` - `ensemble_post_process_global()` 和 `refine_segmentation_mask()`
 
 ### Grad‑CAM可视化
 - 支持没有原生注意力图的模型（如DeepLabV3+）
@@ -406,6 +458,8 @@ data_dir/
 - 优化布局（为X轴标签预留空间）
 - 持久保存到 `matlab_reports/` 目录。
 
+**实现位置**: `utils/matlab_bridge.py`
+
 ### 性能优化
 - **CuDNN Benchmark**: 自动寻找最适合的卷积算法
 - **DataLoader 优化**:
@@ -415,6 +469,7 @@ data_dir/
   - `prefetch_factor`: 增加预取因子，提升数据流水线效率
 - **内存优化**: 测试阶段仅收集前 5 个样本用于可视化，其余立即释放
 - **梯度优化**: 验证阶段仅对前 5 个 batch 启用梯度计算（Grad-CAM），其余使用 `torch.no_grad()`
+- **多进程后处理**: 使用 `ProcessPoolExecutor` 并行化 CPU 密集型任务
 
 ---
 
@@ -438,14 +493,7 @@ data_dir/
 
 ---
 
-系统使用以下指标评估分割质量：
-
-- **Dice系数**：衡量重叠度（仅前景类，空掩码特殊处理）。
-- **IoU（Jaccard指数）**：交集除以并集（仅前景类，空掩码特殊处理）。
-- **精确率**：真正例占预测正例的比例。
-- **召回率**：真正例占实际正例的比例。
-- **特异性**：真负例占实际负例的比例。
-- **HD95**：95% Hausdorff距离，衡量边界准确性。
+## ❓ 常见问题
 
 ### Q: 如何选择最适合的模型架构？
 **A**: 
@@ -453,8 +501,6 @@ data_dir/
 - **中等数据集**: 推荐 TransUNet、U-Net++ 或 DeepLabV3+
 - **大数据集**: 推荐 SwinUNet（支持 GWO 优化）
 - **需要高精度**: 推荐 DeepLabV3+（训练稳定，性能优秀）
-
-后处理函数 `post_process_mask` 实现了**绝对最小面积限制**，确保微小噪声（面积 < `min_size`）被清除，从而触发“两者皆空 = 1.0”的完美评分。
 
 ### Q: 如何提高模型性能？
 **A**: 
@@ -467,33 +513,26 @@ data_dir/
 7. 使用智能后处理（LCC、孔洞填充等）
 8. **使用 GWO 优化阈值**（推荐）
 
-### 问：训练时CUDA内存不足？
-**答**：尝试减小批次大小、降低图像分辨率、禁用混合精度训练、使用CPU训练或启用梯度累积。
+### Q: 训练时CUDA内存不足？
+**A**: 尝试减小批次大小、降低图像分辨率、禁用混合精度训练、使用CPU训练或启用梯度累积。
 
-### 问：如何选择最佳模型架构？
-**答**：
-- **小数据集**：ImprovedUNet或ResNetUNet。
-- **中等数据集**：TransUNet、U‑Net++或DeepLabV3+。
-- **大数据集**：SwinUNet（带GWO优化）。
-- **最高准确率**：DeepLabV3+（训练稳定，性能优异）。
+### Q: TTA会显著增加推理时间吗？
+**A**: 是的，TTA会使推理时间增加约24倍，但可将Dice提升1‑3%。建议仅用于最终评估。
 
-### 问：TTA会显著增加推理时间吗？
-**答**：是的，TTA会使推理时间增加约24倍，但可将Dice提升1‑3%。建议仅用于最终评估。
-
-### 问：如何处理空掩码（无病灶）？
-**答**：系统具有全面的空掩码处理机制：
+### Q: 如何处理空掩码（无病灶）？
+**A**: 系统具有全面的空掩码处理机制：
 - 指标计算：两者皆空返回1.0，单边空返回0.0。
 - 后处理：微小噪声（面积 < `min_size`）自动清除。
 - 确保在空GT场景下，小假阳性不影响Dice分数。
 
-### 问：如何为DeepLabV3+生成注意力热图？
-**答**：DeepLabV3+不支持原生注意力图；系统使用Grad‑CAM。安装 `pytorch-grad-cam`：
+### Q: 如何为DeepLabV3+生成注意力热图？
+**A**: DeepLabV3+不支持原生注意力图；系统使用Grad‑CAM。安装 `pytorch-grad-cam`：
 ```bash
 pip install grad-cam
 ```
 
-### 问：MATLAB报告生成失败？
-**答**：
+### Q: MATLAB报告生成失败？
+**A**:
 1. 确保已安装MATLAB R2020b+。
 2. 安装MATLAB Engine for Python：
    ```bash
@@ -513,25 +552,81 @@ pip install grad-cam
 ## 📝 开发说明
 
 ### 代码架构
-项目采用模块化设计，将功能拆分为几个核心模块：
 
-项目采用模块化设计，将功能拆分为多个主要模块：
+项目采用**模块化设计**，将功能拆分为多个主要模块：
+
+#### 核心模块
 
 - **main.py**: GUI 界面和应用程序主入口，包含 MATLAB 引擎预热逻辑
 - **models.py**: 所有模型架构的定义
-- **worker.py**: 训练、测试、预测的业务逻辑，包含 Grad-CAM、TTA、后处理、GWO 等
-- **utils.py**: 工具函数、数据处理、模型加载、MATLAB 可视化桥接、GWO 优化器等辅助功能
-- **dataset.py**: 2.5D 数据集加载器
 - **config.py**: 模型配置中心
+- **dataset.py**: 2.5D 数据集加载器（TCGA2_5DDataset）
+
+#### Utils 模块 (`utils/`)
+
+工具函数模块，包含14个子模块：
+
+- **common.py**: 公共导入和配置
+- **helpers.py**: 基础工具函数（EarlyStopping、指标计算等）
+- **gwo_optimizer.py**: 灰狼优化算法阈值优化器
+- **model_loader.py**: 模型加载和参数推断
+- **dataset.py**: 医学图像数据集类（MedicalImageDataset）
+- **standalone_funcs.py**: 后处理函数（LCC、孔洞填充、边缘平滑等）
+- **matlab_bridge.py**: MATLAB 引擎会话和可视化桥接
+- **threshold_scan.py**: 阈值扫描功能
+- **visualization.py**: 可视化函数
+- 更多模块详见 `utils/README.md`
+
+**向后兼容**: 所有原有导入方式仍然有效
+```python
+from utils import *  # 仍然有效
+from utils import EarlyStopping, GreyWolfThresholdOptimizer  # 仍然有效
+```
+
+#### Worker 模块 (`worker/`)
+
+工作线程模块，包含训练、测试和预测的业务逻辑：
+
+- **train_thread.py**: 训练线程（TrainThread）- 约8650行
+- **test_thread.py**: 测试线程（ModelTestThread）- 约2000行
+- **predict_thread.py**: 预测线程（PredictThread）- 约200行
+- **common.py**: 公共导入和配置
+
+**向后兼容**: 所有原有导入方式仍然有效
+```python
+from worker import TrainThread, ModelTestThread, PredictThread  # 仍然有效
+```
+
+更多详情详见 `worker/README.md`
 
 ### 关键设计决策
 
-1. **通道自适应**: DeepLabV3+ 和 U-Net++ 支持 1/3 通道输入自适应，通过数据加载器自动转换
-2. **空 Mask 优化**: 实现了完善的空 Mask 处理逻辑，确保指标计算的准确性
-3. **性能优化**: DataLoader 多进程、CuDNN Benchmark、内存优化等
-4. **可视化优化**: Grad-CAM 采样策略、MATLAB 报告优化等
-5. **损失函数简化**: 采用 50% BCE + 50% Dice 的黄金标准组合
-6. **GWO 优化**: 智能阈值搜索，提升验证效率
+1. **模块化结构**: 将大型文件（`utils.py` 4548行、`worker.py` 11013行）拆分为模块化结构，提高可维护性
+2. **向后兼容**: 保持所有原有导入方式不变，无需修改现有代码
+3. **通道自适应**: DeepLabV3+ 和 U-Net++ 支持 1/3 通道输入自适应，通过数据加载器自动转换
+4. **空 Mask 优化**: 实现了完善的空 Mask 处理逻辑，确保指标计算的准确性
+5. **性能优化**: DataLoader 多进程、CuDNN Benchmark、内存优化、多进程后处理等
+6. **可视化优化**: Grad-CAM 采样策略、MATLAB 报告优化等
+7. **损失函数简化**: 采用 50% BCE + 50% Dice 的黄金标准组合
+8. **GWO 优化**: 智能阈值搜索，提升验证效率
+
+### 模块依赖关系
+
+```
+main.py
+├── models.py
+├── utils/ (通过 __init__.py 统一导出)
+│   ├── common.py (公共导入)
+│   ├── helpers.py
+│   ├── gwo_optimizer.py
+│   ├── model_loader.py
+│   └── ... (其他模块)
+└── worker/ (通过 __init__.py 统一导出)
+    ├── common.py (公共导入)
+    ├── train_thread.py
+    ├── test_thread.py
+    └── predict_thread.py
+```
 
 ---
 
@@ -583,7 +678,20 @@ pip install grad-cam
 
 ## 📈 更新日志
 
-### v2.1 (最新)
+### v2.3 (最新)
+- ✅ **HD-BET 深度学习颅骨剥离**：在 LGG-MRI 原始数据上引入 HD-BET 预处理流程，自动移除颅外组织（颅骨、脂肪、皮肤），构建高质量脑实质掩膜。  
+- ✅ **数据质量与注意力提升**：在 Skull Stripping 后的数据集上训练，使模型注意力更专注于颅内病灶区域，显著减少背景伪激活。  
+- ✅ **DeepLabV3+ 模型增强**：在优化后的数据上重新训练 DeepLabV3+，加快收敛速度并提升对肿瘤前景的分割鲁棒性，形成更强的基础模型。  
+- ✅ **与现有流水线集成**：HD-BET 预处理与现有 DataLoader、后处理和 GWO 阈值优化无缝结合，可作为统一的高质量输入源。  
+
+### v2.2
+- ✅ **模块化重构** - 将 `utils.py` (4548行) 拆分为 `utils/` 目录（14个模块）
+- ✅ **模块化重构** - 将 `worker.py` (11013行) 拆分为 `worker/` 目录（4个模块）
+- ✅ **向后兼容** - 保持所有原有导入方式不变
+- ✅ **性能优化** - 多进程后处理和指标计算
+- ✅ **代码组织** - 提高可维护性和协作友好性
+
+### v2.1
 - ✅ **新增 GWO 灰狼优化算法** - 智能阈值搜索，替代线性扫描
 - ✅ **简化损失函数配置** - 回归 50% BCE + 50% Dice 的黄金标准
 - ✅ **优化学习率配置** - Encoder/Decoder 使用相同学习率
