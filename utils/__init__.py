@@ -58,6 +58,9 @@ from utils.standalone_funcs import (
     calculate_official_total_score_global,
     find_optimal_ensemble_weights_global,
 )
+from utils.smart_postprocessing import (
+    find_optimal_postprocessing_strategy,
+)
 
 # 7. 进程池管理器
 from utils.process_pool import (
@@ -134,6 +137,7 @@ __all__ = [
     'refine_segmentation_mask',
     'calculate_official_total_score_global',
     'find_optimal_ensemble_weights_global',
+    'find_optimal_postprocessing_strategy',
     # 进程池管理器
     'ProcessPoolManager',
     # 多进程辅助函数

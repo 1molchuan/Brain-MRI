@@ -43,6 +43,21 @@ class PredictThread(QThread):
             self.use_skull_stripper = False
         # nnFormer 配置
         self.use_nnformer = False
+        # 智能后处理配置
+        self.smart_post_cfg = None
+        try:
+            if self.model_path:
+                import json as _json
+                model_dir = os.path.dirname(self.model_path)
+                cfg_path = os.path.join(model_dir, "best_postprocessing_config.json")
+                if os.path.exists(cfg_path):
+                    with open(cfg_path, "r", encoding="utf-8") as f:
+                        self.smart_post_cfg = _json.load(f)
+                    print(f"[SmartPost][Predict] 加载最佳后处理配置: {cfg_path} -> {self.smart_post_cfg}")
+                else:
+                    print("[SmartPost][Predict] 未找到 best_postprocessing_config.json，将使用默认后处理逻辑。")
+        except Exception as e:
+            print(f"[SmartPost][Predict] 加载最佳后处理配置失败，将使用默认后处理逻辑: {e}")
     
     def _predict_with_tta(self, model, image, use_tta=True):
         import torch.nn.functional as F
@@ -71,6 +86,7 @@ class PredictThread(QThread):
         return torch.stack(preds, dim=0).mean(dim=0)
     
     def _post_process(self, prob_tensor):
+        # 先执行默认后处理
         processed = TrainThread.post_process_mask(
             prob_tensor.squeeze(0), 
             min_size=150, 
@@ -79,6 +95,17 @@ class PredictThread(QThread):
             fill_holes=True,     # 填充孔洞，去除假阴性空洞
             prob_map=prob_tensor.squeeze(0)
         )
+        # 然后根据智能策略进一步调整
+        if self.smart_post_cfg:
+            try:
+                from utils.smart_postprocessing import _apply_strategy  # type: ignore
+                mtd = self.smart_post_cfg.get("method", "baseline")
+                pms = self.smart_post_cfg.get("params", {})
+                processed_np = processed.detach().cpu().numpy() if isinstance(processed, torch.Tensor) else np.asarray(processed, dtype=np.float32)
+                processed_np = _apply_strategy(processed_np, mtd, pms)
+                processed = torch.from_numpy(processed_np).float()
+            except Exception as e:
+                print(f"[SmartPost][Predict] 应用智能策略失败，回退默认后处理: {e}")
         if isinstance(processed, torch.Tensor):
             return processed.unsqueeze(0).unsqueeze(0)
         processed = torch.from_numpy(processed).float()

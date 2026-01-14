@@ -36,6 +36,11 @@
     - **对肿瘤前景的分割鲁棒性**（边界更平滑、小病灶保留更好）  
   - 该高质量 DeepLabV3+ 模型也作为后续实验与集成的 **基础强模型（strong baseline）** 使用。  
 
+- **数据驱动自适应后处理 + 一键生成配置**  
+  - 引入 `utils/smart_postprocessing.py`：基于验证集自动搜索 Baseline / LCC / Remove-Small (10/30/100/300) 的最优策略。  
+  - 新增脚本 `generate_smart_postprocessing_config.py`，对**已有模型**无需重训即可生成 `best_postprocessing_config.json`，测试/推理自动加载。  
+  - 测试阶段阈值搜索已简化为 **仅 GWO**，使用全量样本、综合评分（Dice/IoU/Recall/Specificity）作为目标。  
+
 ---
 
 ## ✨ 主要特性
@@ -67,7 +72,7 @@
 
 ### 📊 智能阈值优化
 - **GWO（灰狼优化算法）** - 智能搜索最佳分割阈值，替代传统线性扫描
-- 自动寻找最优 Dice 系数对应的阈值
+- 测试阶段仅使用 **GWO 全量样本搜索**，优化目标为综合得分（Dice/IoU/Recall/Specificity 加权）
 - 更快的搜索速度和更优的结果
 
 ### 📈 丰富的评估指标
@@ -87,6 +92,7 @@
 - **形态学操作** - 开运算、闭运算，去除毛刺和填充缝隙
 - **动态面积阈值** - 根据概率图平均值动态调整过滤阈值
 - **高置信度小病灶保护** - 智能保留高置信度的微小病灶
+- **数据驱动自适应后处理** - 基于验证集自动搜索 Baseline/LCC/Remove-Small 策略并保存为 `best_postprocessing_config.json`
 
 ### 📐 数据集支持
 - **标准数据集** - 单通道医学图像
@@ -140,6 +146,19 @@ pip install -r requirements.txt
 python main.py
 ```
 
+### 4. 为“已有模型”生成智能后处理配置（无需重训）
+
+```bash
+# 示例（Windows，路径含空格请加引号）
+python generate_smart_postprocessing_config.py ^
+  --model_path "C:\\path\\to\\best_model.pth" ^
+  --data_dir "C:\\path\\to\\dataset" ^
+  --model_type deeplabv3plus ^
+  --use_tta
+```
+
+生成后的 `best_postprocessing_config.json` 会放在模型同目录，测试与推理会自动加载该配置并应用数据驱动自适应后处理。
+
 ---
 
 ## 📁 项目结构
@@ -151,6 +170,7 @@ medical-segmentation/
 ├── dataset.py                 # 2.5D数据集加载器（TCGA2_5DDataset）
 ├── config.py                  # 集中式模型配置
 ├── requirements.txt           # 依赖列表
+├── generate_smart_postprocessing_config.py  # 为已有模型生成智能后处理配置
 ├── README.md                  # 本文档
 ├── LICENSE                    # 许可证文件
 │
@@ -168,6 +188,7 @@ medical-segmentation/
 │   ├── gwo_optimizer.py       # GWO优化器
 │   ├── threshold_scan.py      # 阈值扫描
 │   ├── dataset.py             # 数据集类（MedicalImageDataset）
+│   ├── smart_postprocessing.py # 数据驱动自适应后处理策略搜索
 │   ├── matlab_bridge.py       # MATLAB相关类
 │   ├── visualization.py       # 可视化函数
 │   └── README.md              # Utils模块说明

@@ -81,7 +81,16 @@ class TrainThread(QThread):
         os.makedirs(self.persistent_report_dir, exist_ok=True)
         print(f"[MATLAB] 报表将保存到持久化目录: {self.persistent_report_dir}")
         
-        self.best_model_cache_dir = os.path.join(self.data_dir, "_best_model_cache")
+        # Best model 持久化目录：只保留一个不断覆盖更新的权重文件 + 一个 JSON 配置文件
+        # 目录结构：
+        #   <data_dir>/best_model/
+        #     - best_model.pth
+        #     - best_postprocessing_config.json
+        self.best_model_dir = os.path.join(self.data_dir, "best_model")
+        # 兼容旧字段名：不再使用“cache”生成多文件，而是指向 best_model_dir
+        self.best_model_cache_dir = self.best_model_dir
+        # 固定的最佳模型文件名（训练过程中随时覆盖更新）
+        self.best_model_filename = "best_model.pth"
         self.enable_matlab_cache = False
         self.matlab_cache_manager = None
         self.matlab_metrics_bridge = None
@@ -2438,13 +2447,20 @@ class TrainThread(QThread):
                 if base_name.startswith("last_model"):
                     parent = os.path.dirname(self.model_path)
                     try:
-                        cand = sorted(
-                            [p for p in os.listdir(parent) if p.startswith("best_model_dice_") and p.endswith(".pth")],
-                            reverse=True,
-                        )
-                        if cand:
-                            model_path_to_use = os.path.join(parent, cand[0])
+                        # 新结构优先：<parent>/best_model/best_model.pth
+                        new_best = os.path.join(parent, "best_model", "best_model.pth")
+                        if os.path.exists(new_best):
+                            model_path_to_use = new_best
                             print(f"[提示] 检测到 last_model.pth，自动切换为最佳模型权重: {os.path.basename(model_path_to_use)}")
+                        else:
+                            # 兼容旧结构：best_model_dice_*.pth（从高到低）
+                            cand = sorted(
+                                [p for p in os.listdir(parent) if p.startswith("best_model_dice_") and p.endswith(".pth")],
+                                reverse=True,
+                            )
+                            if cand:
+                                model_path_to_use = os.path.join(parent, cand[0])
+                                print(f"[提示] 检测到 last_model.pth，自动切换为最佳模型权重: {os.path.basename(model_path_to_use)}")
                     except Exception:
                         pass
 
@@ -2507,12 +2523,18 @@ class TrainThread(QThread):
                 if base_name.startswith("last_model"):
                     parent = os.path.dirname(self.model_path)
                     try:
-                        cand = sorted(
-                            [p for p in os.listdir(parent) if p.startswith("best_model_dice_") and p.endswith(".pth")],
-                            reverse=True,
-                        )
-                        if cand:
-                            model_path_to_use = os.path.join(parent, cand[0])
+                        # 新结构优先：<parent>/best_model/best_model.pth
+                        new_best = os.path.join(parent, "best_model", "best_model.pth")
+                        if os.path.exists(new_best):
+                            model_path_to_use = new_best
+                        else:
+                            # 兼容旧结构：best_model_dice_*.pth（从高到低）
+                            cand = sorted(
+                                [p for p in os.listdir(parent) if p.startswith("best_model_dice_") and p.endswith(".pth")],
+                                reverse=True,
+                            )
+                            if cand:
+                                model_path_to_use = os.path.join(parent, cand[0])
                     except Exception:
                         pass
 
@@ -2683,6 +2705,8 @@ class TrainThread(QThread):
             for epoch in range(self.epochs):
                 if self.stop_requested:
                     self.update_progress.emit(0, "训练已由用户停止")
+                    # 重命名 best_model 目录，避免影响下一次训练
+                    self._rename_best_model_dir_on_completion()
                     # 【修复】用户停止时也要发送完成信号，确保UI正确更新
                     self.training_finished.emit("训练已被用户停止", self.best_model_path if self.save_best else None)
                     return
@@ -2754,6 +2778,8 @@ class TrainThread(QThread):
                 
                 for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f'训练轮次 {epoch+1}/{self.epochs}')):
                     if self.stop_requested:
+                        # 重命名 best_model 目录，避免影响下一次训练
+                        self._rename_best_model_dir_on_completion()
                         # 【修复】用户停止时也要发送完成信号，确保UI正确更新
                         self.training_finished.emit("训练已被用户停止", self.best_model_path if self.save_best else None)
                         return
@@ -3195,6 +3221,8 @@ class TrainThread(QThread):
                 with torch.no_grad():
                     for val_idx, val_batch in enumerate(val_loader):
                         if self.stop_requested:
+                            # 重命名 best_model 目录，避免影响下一次训练
+                            self._rename_best_model_dir_on_completion()
                             # 【修复】用户停止时也要发送完成信号，确保UI正确更新
                             self.training_finished.emit("训练已被用户停止", self.best_model_path if self.save_best else None)
                             return
@@ -3904,12 +3932,13 @@ class TrainThread(QThread):
                 if dice_for_best_model > self.best_dice:
                     self.best_dice = dice_for_best_model
                     if self.save_best:
-                        os.makedirs(self.best_model_cache_dir, exist_ok=True)
-                        self.best_model_path = os.path.join(
-                            self.best_model_cache_dir, f"best_model_dice_{dice_for_best_model:.4f}.pth"
-                        )
+                        os.makedirs(self.best_model_dir, exist_ok=True)
+                        # 固定路径：训练过程中始终覆盖同一个文件（避免大量 best_model_dice_*.pth）
+                        self.best_model_path = os.path.join(self.best_model_dir, self.best_model_filename)
                         self._save_checkpoint(eval_model_for_epoch, self.best_model_path)
-                        self.model_saved.emit(f"已保存最佳模型 (Dice: {dice_for_best_model:.4f}, 基于全验证集GWO优化)")
+                        self.model_saved.emit(
+                            f"已更新最佳模型: {self.best_model_filename} (Dice: {dice_for_best_model:.4f}, 基于全验证集GWO优化)"
+                        )
 
                 # 恢复EMA模型为train模式（如果使用了EMA）
                 if self.use_ema and ema_model is not None and epoch >= self.ema_eval_start_epoch:
@@ -3958,6 +3987,44 @@ class TrainThread(QThread):
             self.update_progress.emit(92, "计算性能指标（单阶段分割模型，使用TTA）...")
             detailed_metrics, metrics_path = self.evaluate_model(eval_model, val_loader, device, use_tta=True, adaptive_threshold=True)
             self.metrics_ready.emit(detailed_metrics)
+
+            # =============================
+            # 智能后处理策略搜索（数据驱动）
+            # =============================
+            try:
+                from utils import find_optimal_postprocessing_strategy
+                self.update_progress.emit(93, "正在搜索最佳后处理策略（Data-Driven Adaptive Post-processing）...")
+                print("\n[SmartPost] 开始在验证集上搜索最佳后处理策略...")
+
+                # 为搜索构造一个较小的 DataLoader 以节省时间
+                search_loader = val_loader
+
+                best_cfg = find_optimal_postprocessing_strategy(
+                    search_loader,
+                    eval_model,
+                    device,
+                    use_tta=True,
+                )
+                method = best_cfg.get("method", "baseline")
+                avg_dice = best_cfg.get("avg_dice", 0.0)
+                params = best_cfg.get("params", {})
+                print(f"[SmartPost] 策略搜索完成！最佳策略: {method}, 平均Dice: {avg_dice:.4f}, 参数: {params}")
+
+                # 保存配置到与最佳模型相同目录
+                try:
+                    if self.best_model_path:
+                        import json as _json
+                        cfg_dir = os.path.dirname(self.best_model_path)
+                        cfg_path = os.path.join(cfg_dir, "best_postprocessing_config.json")
+                        with open(cfg_path, "w", encoding="utf-8") as f:
+                            _json.dump(best_cfg, f, ensure_ascii=False, indent=2)
+                        print(f"[SmartPost] 已保存最佳后处理配置到: {cfg_path}")
+                except Exception as e_cfg:
+                    print(f"[SmartPost] 保存最佳后处理配置失败: {e_cfg}")
+
+            except Exception as e:
+                # 搜索失败不影响主流程
+                print(f"[SmartPost] 后处理策略搜索失败，已忽略: {e}")
             
             # 保存单阶段评估结果用于对比
             single_stage_results = {
@@ -4161,12 +4228,18 @@ class TrainThread(QThread):
                 finish_msg = f"训练提前结束（早停），最佳Dice分数: {final_best:.4f}"
             else:
                 finish_msg = f"训练完成！最佳Dice分数: {final_best:.4f}"
+            
+            # 重命名 best_model 目录，避免影响下一次训练
+            self._rename_best_model_dir_on_completion()
+            
             self.update_progress.emit(100, finish_msg)
             self.training_finished.emit(finish_msg, self.best_model_path if self.save_best else None)
             
         except KeyboardInterrupt:
             # 用户手动中断训练（Ctrl+C）
             print("\n[用户中断] 训练已被用户手动停止")
+            # 重命名 best_model 目录，避免影响下一次训练
+            self._rename_best_model_dir_on_completion()
             self.update_progress.emit(0, "训练已被用户中断")
             self.training_finished.emit("训练已被用户中断", None)
         except Exception as e:
@@ -4179,6 +4252,8 @@ class TrainThread(QThread):
             print(f"{'='*60}")
             print(error_trace)
             print(f"{'='*60}\n")
+            # 重命名 best_model 目录，避免影响下一次训练（即使训练出错，也可能有部分结果）
+            self._rename_best_model_dir_on_completion()
             self.update_progress.emit(0, error_msg)
             self.training_finished.emit(error_msg, None)
         finally:
@@ -5187,6 +5262,58 @@ class TrainThread(QThread):
         state_dict = actual.state_dict()
         config = self._extract_model_config(model)
         torch.save({"state_dict": state_dict, "config": config}, path)
+    
+    def _rename_best_model_dir_on_completion(self):
+        """
+        训练完成后重命名 best_model/ 目录，避免影响下一次训练。
+        重命名格式：best_model_YYYYMMDD_HHMMSS_dice0.XXXX（如果存在best_dice）
+                    或 best_model_YYYYMMDD_HHMMSS（如果没有best_dice）
+        """
+        if not self.save_best or not self.best_model_dir:
+            return
+        
+        if not os.path.exists(self.best_model_dir):
+            return
+        
+        try:
+            import time
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            
+            # 构建新目录名：包含时间戳和最佳Dice分数（如果有）
+            if self.best_dice >= 0:
+                new_dir_name = f"best_model_{timestamp}_dice{self.best_dice:.4f}"
+            else:
+                new_dir_name = f"best_model_{timestamp}"
+            
+            new_dir_path = os.path.join(self.data_dir, new_dir_name)
+            
+            # 如果目标目录已存在（极小概率），添加序号
+            counter = 1
+            original_new_dir_path = new_dir_path
+            while os.path.exists(new_dir_path):
+                new_dir_path = f"{original_new_dir_path}_{counter}"
+                counter += 1
+            
+            # 重命名目录
+            os.rename(self.best_model_dir, new_dir_path)
+            print(f"[训练完成] 已重命名 best_model 目录: {os.path.basename(self.best_model_dir)} -> {os.path.basename(new_dir_path)}")
+            
+            # 更新 best_model_path（如果存在），指向新路径
+            if self.best_model_path and os.path.exists(self.best_model_path):
+                old_path = self.best_model_path
+                self.best_model_path = os.path.join(new_dir_path, self.best_model_filename)
+                if os.path.exists(old_path):
+                    # 文件应该已经随目录一起移动了，但为了保险，检查一下
+                    if not os.path.exists(self.best_model_path):
+                        # 如果文件没有随目录移动（不应该发生），尝试手动移动
+                        import shutil
+                        shutil.move(old_path, self.best_model_path)
+            
+        except Exception as e:
+            # 重命名失败不影响训练完成，只打印警告
+            print(f"[警告] 重命名 best_model 目录失败（不影响训练结果）: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _gwo_optimize_swin_params(self, train_loader, val_loader, device, n_wolves=10, max_iter=5):
         """
