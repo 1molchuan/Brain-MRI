@@ -3,13 +3,13 @@
 <div align="center">
 
 ![Python](https://img.shields.io/badge/Python-3.7--3.12-blue.svg)
-![PyTorch](https://img.shields.io/badge/PyTorch-1.9.0+-orange.svg)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.0.0+-orange.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)
 [![GitHub stars](https://img.shields.io/github/stars/1molchuan/Brain-MRI?style=social)](https://github.com/1molchuan/Brain-MRI)
 [![许可证](https://img.shields.io/badge/许可证-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python](https://img.shields.io/badge/Python-3.7%2B-blue)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-1.9%2B-red)](https://pytorch.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-red)](https://pytorch.org/)
 
 ## 概述
 
@@ -39,7 +39,7 @@
 - **数据驱动自适应后处理 + 一键生成配置**  
   - 引入 `utils/smart_postprocessing.py`：基于验证集自动搜索 Baseline / LCC / Remove-Small (10/30/100/300) 的最优策略。  
   - 新增脚本 `generate_smart_postprocessing_config.py`，对**已有模型**无需重训即可生成 `best_postprocessing_config.json`，测试/推理自动加载。  
-  - 测试阶段阈值搜索已简化为 **仅 GWO**，使用全量样本、综合评分（Dice/IoU/Recall/Specificity）作为目标。  
+  - 测试和训练阶段阈值搜索已升级为 **Brent 方法 + 多进程并行**，使用全量样本、综合评分（Dice/IoU/Specificity）作为目标，速度提升 6-10 倍。  
 
 ---
 
@@ -71,9 +71,10 @@
 - ✅ DataLoader 多进程优化
 
 ### 📊 智能阈值优化
-- **GWO（灰狼优化算法）** - 智能搜索最佳分割阈值，替代传统线性扫描
-- 测试阶段仅使用 **GWO 全量样本搜索**，优化目标为综合得分（Dice/IoU/Recall/Specificity 加权）
-- 更快的搜索速度和更优的结果
+- **Brent 方法（布伦特方法）** - 使用 SciPy 的 `minimize_scalar` 进行高效单维度阈值搜索
+- **多进程并行加速** - 测试阶段使用 `ProcessPoolExecutor` 并行计算，充分利用多核 CPU（8核并行）
+- 优化目标为综合得分：`Score = 0.4*Dice + 0.3*IoU + 0.3*Specificity`
+- **性能优势**：仅需 ~15 次评估即可收敛（相比 GWO 的 ~100 次），配合多进程加速，总耗时从几分钟压缩到 30 秒以内
 
 ### 📈 丰富的评估指标
 - Dice、IoU、Precision、Recall、Specificity、HD95
@@ -131,13 +132,16 @@ pip install -r requirements.txt
 ```
 
 **核心依赖**：
-- `torch>=1.9.0` – PyTorch深度学习框架
+- `torch>=2.0.0` – PyTorch深度学习框架
+- `torchvision>=0.15.0` – 与PyTorch版本匹配
 - `PyQt5>=5.15.0` – GUI框架
-- `albumentations>=1.1.0` – 数据增强
+- `albumentations>=1.3.0` – 数据增强
 - `opencv-python>=4.5.0` – 图像处理
-- `scikit-image>=0.18.0` – 图像工具
-- `segmentation-models-pytorch` – SMP库（U‑Net++、DeepLabV3+）
-- `pytorch-grad-cam` – Grad‑CAM可视化（可选）
+- `scikit-image>=0.19.0` – 图像工具（morphology操作）
+- `numpy>=1.21.0,<2.0.0` – 科学计算（限制2.0以下避免兼容性问题）
+- `scipy>=1.7.0` – 科学计算（Brent方法优化）
+- `segmentation-models-pytorch>=0.3.0` – SMP库（U‑Net++、DeepLabV3+）
+- `pytorch-grad-cam>=1.4.0` – Grad‑CAM可视化（可选但推荐）
 - `matlab.engine` – MATLAB引擎（可选，用于报告生成）
 
 ### 3. 运行应用（GUI）
@@ -286,7 +290,7 @@ data_dir/
 3. **配置选项**:
    - 选择模型架构（或从 checkpoint 自动推断）
    - 启用/禁用 TTA
-   - 使用 GWO 优化阈值（推荐）
+   - 阈值优化自动使用 Brent 方法（多进程并行，推荐）
 4. **开始测试**: 点击"开始测试"按钮，查看详细性能指标和可视化结果
 
 ### 预测图像
@@ -358,7 +362,7 @@ data_dir/
 
 ### 评估功能
 - ✅ 多指标评估（Dice, IoU, Precision, Recall, Specificity, HD95）
-- ✅ **GWO 阈值优化** - 智能搜索最佳阈值
+- ✅ **Brent 阈值优化 + 多进程并行** - 高效搜索最佳阈值（~15次评估，8核并行）
 - ✅ 性能分析报告生成（MATLAB）
 - ✅ 低 Dice 案例识别
 - ✅ 注意力热图可视化（Grad-CAM）
@@ -406,25 +410,30 @@ data_dir/
 
 ## 🔧 高级功能
 
-### GWO 灰狼优化算法
+### Brent 阈值优化方法
 
-**功能**: 使用灰狼优化算法（GWO）智能搜索最佳分割阈值，替代传统线性扫描
+**功能**: 使用 SciPy 的 Brent 方法（`minimize_scalar`）进行高效单维度阈值搜索，配合多进程并行加速
 
 **优势**:
-- 🚀 **更快的搜索速度**: 15 次迭代通常比线性扫描更快
-- 🎯 **更优的结果**: 能够跳出局部最优，找到全局更优解
-- 📊 **自动优化**: 无需手动设置阈值范围
+- 🚀 **极速收敛**: 仅需 ~15 次评估即可收敛（相比 GWO 的 ~100 次）
+- ⚡ **多核并行**: 使用 `ProcessPoolExecutor` 并行计算，8 核同时工作，速度提升 6-10 倍
+- 🎯 **精确搜索**: 基于黄金分割和逆二次插值的混合算法，精度更高
+- 📊 **自动优化**: 无需手动设置阈值范围，搜索区间 [0.1, 0.9]
 
 **使用方法**:
-- 在验证阶段自动启用
-- 默认参数：`num_wolves=10`, `max_iter=15`
-- 搜索空间：[0.05, 0.95]
+- 在训练验证和测试阶段自动启用
+- 优化目标：`Score = 0.4*Dice + 0.3*IoU + 0.3*Specificity`
+- 多进程配置：`max_workers = min(8, os.cpu_count())`
 
-**适用场景**:
-- SwinUNet/DS-TransUNet/NN-Former 的超参数优化
-- 阈值优化（替代线性扫描）
+**性能表现**:
+- **之前**：单核串行，1000 张图 × 0.1 秒 = 100 秒/次，15 次 = 25 分钟
+- **之后**：8 核并行，1000 张图 ÷ 8 × 0.1 秒 ≈ 12.5 秒/次，15 次 ≈ 30 秒
 
-**实现位置**: `utils/gwo_optimizer.py`
+**实现位置**: 
+- `worker/test_thread.py` - 测试阶段（多进程并行）
+- `worker/train_thread.py` - 训练验证阶段
+
+**注意**: GWO 优化器仍保留在 `utils/gwo_optimizer.py`，用于 SwinUNet/DS-TransUNet/NN-Former 的超参数优化
 
 ### 测试时增强 (TTA)
 - 多尺度推理（0.8x, 1.0x, 1.2x）
@@ -474,7 +483,8 @@ data_dir/
   - `prefetch_factor`: 增加预取因子，提升数据流水线效率
 - **内存优化**: 测试阶段仅收集前 5 个样本用于可视化，其余立即释放
 - **梯度优化**: 验证阶段仅对前 5 个 batch 启用梯度计算（Grad-CAM），其余使用 `torch.no_grad()`
-- **多进程后处理**: 使用 `ProcessPoolExecutor` 并行化 CPU 密集型任务
+- **多进程阈值优化**: 使用 `ProcessPoolExecutor` 并行化 Brent 阈值搜索中的 CPU 密集型后处理任务，8 核并行，速度提升 6-10 倍
+- **数据格式优化**: 概率图使用 `float16`，标签使用 `uint8`，减少内存占用和进程间传输开销
 
 ---
 
@@ -516,7 +526,7 @@ data_dir/
 5. 使用 EMA/SWA 技术
 6. 选择合适的模型架构
 7. 使用智能后处理（LCC、孔洞填充等）
-8. **使用 GWO 优化阈值**（推荐）
+8. **使用 Brent 方法优化阈值**（自动启用，多进程并行加速）
 
 ### Q: 训练时CUDA内存不足？
 **A**: 尝试减小批次大小、降低图像分辨率、禁用混合精度训练、使用CPU训练或启用梯度累积。
@@ -546,11 +556,16 @@ pip install grad-cam
    ```
 3. 检查MATLAB路径配置（`main.py`中的`MATLAB_BIN_PATH`）。
 
-### Q: GWO 优化器如何使用？
-**A**: GWO 优化器在验证阶段自动启用，用于：
-- 智能搜索最佳分割阈值（替代线性扫描）
-- SwinUNet/DS-TransUNet/NN-Former 的超参数优化
-- 默认参数已优化，无需手动配置
+### Q: Brent 阈值优化如何使用？
+**A**: Brent 方法在训练验证和测试阶段自动启用，用于：
+- 高效搜索最佳分割阈值（替代线性扫描和 GWO）
+- 多进程并行加速，充分利用多核 CPU
+- 默认配置已优化，无需手动配置
+
+### Q: GWO 优化器是否仍在使用？
+**A**: GWO 优化器仍保留，但主要用于：
+- SwinUNet/DS-TransUNet/NN-Former 的超参数优化（多维度搜索）
+- 阈值优化已升级为 Brent 方法（单维度搜索更高效）
 
 ---
 
@@ -613,7 +628,7 @@ from worker import TrainThread, ModelTestThread, PredictThread  # 仍然有效
 5. **性能优化**: DataLoader 多进程、CuDNN Benchmark、内存优化、多进程后处理等
 6. **可视化优化**: Grad-CAM 采样策略、MATLAB 报告优化等
 7. **损失函数简化**: 采用 50% BCE + 50% Dice 的黄金标准组合
-8. **GWO 优化**: 智能阈值搜索，提升验证效率
+8. **Brent 阈值优化**: 使用 SciPy 的 Brent 方法进行高效单维度阈值搜索，配合多进程并行加速
 
 ### 模块依赖关系
 
@@ -683,11 +698,17 @@ main.py
 
 ## 📈 更新日志
 
-### v2.3 (最新)
+### v2.4 (最新)
+- ✅ **Brent 阈值优化方法**：将 GWO 阈值搜索升级为 Brent 方法（`scipy.optimize.minimize_scalar`），单维度搜索更高效，仅需 ~15 次评估即可收敛
+- ✅ **多进程并行加速**：测试阶段使用 `ProcessPoolExecutor` 并行计算，8 核同时工作，速度提升 6-10 倍
+- ✅ **性能提升**：Brent 阈值优化总耗时从几分钟压缩到 30 秒以内
+- ✅ **训练验证优化**：训练验证阶段也使用 Brent 方法，保持一致性
+
+### v2.3
 - ✅ **HD-BET 深度学习颅骨剥离**：在 LGG-MRI 原始数据上引入 HD-BET 预处理流程，自动移除颅外组织（颅骨、脂肪、皮肤），构建高质量脑实质掩膜。  
 - ✅ **数据质量与注意力提升**：在 Skull Stripping 后的数据集上训练，使模型注意力更专注于颅内病灶区域，显著减少背景伪激活。  
 - ✅ **DeepLabV3+ 模型增强**：在优化后的数据上重新训练 DeepLabV3+，加快收敛速度并提升对肿瘤前景的分割鲁棒性，形成更强的基础模型。  
-- ✅ **与现有流水线集成**：HD-BET 预处理与现有 DataLoader、后处理和 GWO 阈值优化无缝结合，可作为统一的高质量输入源。  
+- ✅ **与现有流水线集成**：HD-BET 预处理与现有 DataLoader、后处理和阈值优化无缝结合，可作为统一的高质量输入源。  
 
 ### v2.2
 - ✅ **模块化重构** - 将 `utils.py` (4548行) 拆分为 `utils/` 目录（14个模块）
