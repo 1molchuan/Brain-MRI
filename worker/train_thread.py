@@ -2370,7 +2370,7 @@ class TrainThread(QThread):
             # 如果遇到 "resource already mapped" 错误，可以尝试减少 num_workers 或使用单 GPU
             use_pin_memory = (device.type == 'cuda')  # CUDA 设备启用 pin_memory
             
-            self.update_progress.emit(6, f"数据加载器配置: num_workers={num_workers}, persistent_workers={use_persistent_workers}, pin_memory={use_pin_memory}, prefetch_factor=4")
+            self.update_progress.emit(6, f"数据加载器配置: num_workers={num_workers}, persistent_workers={use_persistent_workers}, pin_memory={use_pin_memory}, prefetch_factor=2 (内存优化)")
             
             # 2.5D数据集使用索引，标准数据集使用patient_ids
             if self.dataset_type == "2.5d":
@@ -2402,7 +2402,8 @@ class TrainThread(QThread):
                 num_workers=num_workers,  # 【性能优化】使用多进程加速数据加载
                 pin_memory=use_pin_memory,  # 【性能优化】锁页内存，加速 CPU->GPU 传输
                 persistent_workers=use_persistent_workers,  # 【性能优化】保持子进程存活，避免重复创建
-                prefetch_factor=4 if num_workers > 0 else None  # 【性能优化】增加预取因子，提升数据流水线效率
+                prefetch_factor=2 if num_workers > 0 else None,  # 【内存优化】降低预取因子从4到2，减少内存占用
+                drop_last=True  # 【BatchNorm修复】丢弃最后一个不完整的batch，避免batch_size=1导致BatchNorm错误
             )
             
             self.update_progress.emit(10, "正在加载分割验证数据...")
@@ -2429,7 +2430,8 @@ class TrainThread(QThread):
                 num_workers=num_workers,  # 【性能优化】使用多进程加速数据加载
                 pin_memory=use_pin_memory,  # 【性能优化】锁页内存，加速 CPU->GPU 传输
                 persistent_workers=use_persistent_workers,  # 【性能优化】保持子进程存活，避免重复创建
-                prefetch_factor=4 if num_workers > 0 else None  # 【性能优化】增加预取因子，提升数据流水线效率
+                prefetch_factor=2 if num_workers > 0 else None,  # 【内存优化】降低预取因子从4到2，减少内存占用
+                drop_last=True  # 【BatchNorm修复】丢弃最后一个不完整的batch，避免batch_size=1导致BatchNorm错误
             )
             
             train_pos_weight = self.pos_weight_cache.get('train')
@@ -2809,6 +2811,11 @@ class TrainThread(QThread):
                     
                     batch_size = images.size(0)
                     
+                    # 【BatchNorm修复】如果batch_size=1，跳过该batch（BatchNorm在训练模式下需要至少2个样本）
+                    if batch_size == 1:
+                        print(f"[警告] Epoch {epoch+1}, Batch {batch_idx+1}: batch_size=1，跳过此批次（BatchNorm需要至少2个样本）")
+                        continue
+                    
                     # MixUp 数据增强（小数据集增强泛化能力，防止对特定纹理过拟合）
                     # 从第3个epoch开始，50%概率使用MixUp
                     use_mixup = (epoch >= 3) and (np.random.rand() < 0.5) and (batch_size > 1)
@@ -3131,6 +3138,15 @@ class TrainThread(QThread):
                         del mixed_masks
                     if 'indices' in locals():
                         del indices
+                    if 'logits' in locals():
+                        del logits
+                    if 'loss' in locals():
+                        del loss
+                    
+                    # 【内存优化】每10个batch强制清理一次Python垃圾回收
+                    if batch_idx % 10 == 0:
+                        import gc
+                        gc.collect()
                     
                     # 更新训练进度
                     train_progress = 20 + int(50 * (batch_idx + 1) / len(train_loader))
@@ -3223,12 +3239,19 @@ class TrainThread(QThread):
                         if self.stop_requested:
                             # 重命名 best_model 目录，避免影响下一次训练
                             self._rename_best_model_dir_on_completion()
-                            # 【修复】用户停止时也要发送完成信号，确保UI正确更新
-                            self.training_finished.emit("训练已被用户停止", self.best_model_path if self.save_best else None)
-                            return
                         
                         # 处理数据
-                        images, masks = val_batch
+                        if len(val_batch) == 3:
+                            images, masks, _ = val_batch
+                        else:
+                            images, masks = val_batch
+                        
+                        # 【BatchNorm修复】如果batch_size=1，跳过该batch（BatchNorm在训练模式下需要至少2个样本）
+                        batch_size = images.size(0)
+                        if batch_size == 1:
+                            print(f"[警告] Epoch {epoch+1}, Val Batch {val_idx+1}: batch_size=1，跳过此批次（BatchNorm需要至少2个样本）")
+                            continue
+                        
                         images = images.to(device)
                         masks = masks.float().to(device)
                         
@@ -3243,8 +3266,6 @@ class TrainThread(QThread):
                                 images = images.repeat(1, 3, 1, 1)  # [B, 1, H, W] -> [B, 3, H, W]
                             else:
                                 raise ValueError(f"验证阶段: 意外的通道数 {images.shape[1]}，期望3通道")
-                            
-                        batch_size = images.size(0)
                         brain_mask = None
                         if self.use_skull_stripper:
                             images, brain_mask = self._apply_skull_strip(images)
@@ -3418,9 +3439,18 @@ class TrainThread(QThread):
                             del prob_map_tensor
                         if 'pred_mask_processed' in locals():
                             del pred_mask_processed
-                        # 每10个批次清理一次GPU缓存
-                        if val_idx % 10 == 0 and torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                        # 每10个批次清理一次GPU缓存和Python垃圾回收
+                        if val_idx % 10 == 0:
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            import gc
+                            gc.collect()
+                
+                # 【内存优化】验证阶段结束后强制清理内存
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                import gc
+                gc.collect()
                 
                 # 计算平均值（确保没有NaN/Inf）
                 avg_train_loss = epoch_loss / max(1, train_samples)
@@ -3521,7 +3551,11 @@ class TrainThread(QThread):
                 # 发送轮次完成信号
                 self.epoch_completed.emit(epoch + 1, avg_train_loss, avg_val_loss, val_dice)
                 
-                # 每个epoch结束后清理GPU缓存
+                # 【内存优化】每个epoch结束后强制清理GPU缓存和Python垃圾回收
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                import gc
+                gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
