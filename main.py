@@ -2804,7 +2804,7 @@ class MedicalSegmentationApp(QMainWindow):
         recall_floor = float(payload.get("recall_floor", 0.90))
         fallback_used = bool(payload.get("fallback_used", False))
 
-        # 更新推荐阈值展示（显示来自 GWO 的最佳阈值 + 关键指标）
+        # 更新推荐阈值展示（显示来自 Brent 搜索的最佳阈值 + 关键指标）
         try:
             thr = float(best.get("threshold", 0.0))
             rec = float(best.get("recall", 0.0))
@@ -2812,7 +2812,7 @@ class MedicalSegmentationApp(QMainWindow):
             score = float(best.get("score", 0.0))
             warn = "（回退）" if fallback_used else ""
             self.test_recommended_threshold_label.setText(
-                f"推荐阈值(GWO): {thr:.2f} | Dice: {dice:.4f} | Recall: {rec*100:.1f}% | Score: {score:.4f} {warn}"
+                f"推荐阈值(Brent): {thr:.2f} | Dice: {dice:.4f} | Recall: {rec*100:.1f}% | Score: {score:.4f} {warn}"
             )
             # Recall 低于阈值时加红提示
             if rec < recall_floor:

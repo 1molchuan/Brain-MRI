@@ -418,115 +418,213 @@ class TrainThread(QThread):
             if not all_probs:
                 return (0.5, 0.0)  # 返回默认阈值和0.0 Dice
             
-            # 数据收集完成，开始GWO优化
-            self.update_progress.emit(45, "阈值优化: 数据收集完成，开始GWO优化...")
+            # 数据收集完成，开始Brent优化
+            self.update_progress.emit(45, "阈值优化: 数据收集完成，开始Brent优化...")
             
-            # 【显存优化】先拼接numpy数组，再决定是否移到GPU
-            # 这样可以避免在GPU上拼接时占用过多显存
-            all_probs_np = np.concatenate(all_probs, axis=0)
-            all_masks_np = np.concatenate(all_masks, axis=0)
+            # 【显存优化】先拼接numpy数组，保持在CPU上
+            all_probs_np = np.concatenate(all_probs, axis=0).astype(np.float32)
+            all_masks_np = np.concatenate(all_masks, axis=0).astype(np.uint8)
             
             # 【显存优化】删除原始列表，释放内存
             del all_probs, all_masks
             import gc
             gc.collect()
-
-            # 检查数据大小，决定是否使用GPU
-            data_size_mb = all_probs_np.nbytes / (1024 * 1024) * 2  # preds + masks
-            use_gpu_for_gwo = False
-            
-            if torch.cuda.is_available():
-                try:
-                    # 检查可用显存
-                    free_memory_mb = (torch.cuda.get_device_properties(device).total_memory - 
-                                    torch.cuda.memory_allocated(device)) / (1024 * 1024)
-                    # 如果数据大小小于可用显存的20%，使用GPU
-                    if data_size_mb < free_memory_mb * 0.2:
-                        use_gpu_for_gwo = True
-                        print(f">>> [GWO] 数据大小: {data_size_mb:.1f}MB, 可用显存: {free_memory_mb:.1f}MB，使用GPU加速")
-                    else:
-                        print(f">>> [GWO] 数据大小: {data_size_mb:.1f}MB, 可用显存: {free_memory_mb:.1f}MB，使用CPU模式（节省显存）")
-                except Exception as e:
-                    print(f">>> [GWO] 显存检查失败: {e}，使用CPU模式")
             
             # 【关键修复】保存样本数量（在删除前）
             total_samples = all_probs_np.shape[0]
-            print(f">>> [GWO] 参与计算的样本数: {total_samples}")
+            print(f">>> [Brent] 参与计算的样本数: {total_samples}")
             
-            # 【GWO优化】使用灰狼优化算法替代线性扫描，更智能地寻找最佳阈值
-            # 【关键修复】传递后处理函数，使GWO在搜索过程中也应用后处理
-            def postprocess_func(pred_mask, prob_map):
-                """后处理函数，用于GWO的Fitness Function"""
-                # 先执行智能后处理
-                pred_mask_processed = self.smart_post_processing(pred_mask, prob_map)
-                # 再执行传统形态学后处理（与验证阶段参数一致）
-                pred_mask_final = self.post_process_mask(
-                    pred_mask_processed,
-                    min_size=150,
-                    use_morphology=True,
-                    keep_largest=False,
-                    fill_holes=True,
-                    prob_map=prob_map
-                )
-                return pred_mask_final
+            # 导入Brent优化器
+            from scipy.optimize import minimize_scalar
             
-            if use_gpu_for_gwo:
-                print(">>> [GWO] 灰狼群正在搜索最佳阈值（GPU加速，使用Mean Dice+后处理）...")
-                # 转换为tensor并移到GPU（在GWO内部会处理OOM）
-                all_probs_tensor = torch.from_numpy(all_probs_np).to(device)
-                all_masks_tensor = torch.from_numpy(all_masks_np).to(device)
-            else:
-                print(">>> [GWO] 灰狼群正在搜索最佳阈值（CPU模式，使用Mean Dice+后处理）...")
-                # 保持在CPU上
-                all_probs_tensor = all_probs_np
-                all_masks_tensor = all_masks_np
+            # 【Brent优化】使用Brent方法进行快速阈值搜索（CPU + NumPy）
+            # 预展开通道维度: (N,1,H,W) -> (N,H,W)
+            probs_2d = all_probs_np[:, 0]   # (N,H,W)
+            masks_2d = all_masks_np[:, 0]   # (N,H,W)
+            gt_bin = (masks_2d > 0.5).astype(np.uint8)
+            num_samples = probs_2d.shape[0]
+            eps = 1e-7
             
-            # 定义进度回调函数
-            def gwo_progress_callback(iteration, max_iter, best_score, best_threshold):
-                # GWO优化进度（45-90%）
-                gwo_progress = 45 + int(45 * iteration / max_iter)
-                device_str = "GPU" if use_gpu_for_gwo else "CPU"
-                self.update_progress.emit(
-                    gwo_progress,
-                    f"阈值优化: GWO迭代 {iteration}/{max_iter} | 最佳阈值: {best_threshold:.4f} | 最佳Dice(Mean+后处理): {best_score:.4f} ({device_str})"
-                )
-            
-            gwo = GreyWolfThresholdOptimizer(
-                num_wolves=10, 
-                max_iter=8,  # 【效率优化】缩减迭代次数到8次
-                progress_callback=gwo_progress_callback,
-                use_mean_dice=True,  # 使用Mean Dice
-                postprocess_func=postprocess_func,  # 传递后处理函数
-                sample_ratio=0.2,  # 【效率优化】在迭代过程中只使用20%的样本计算Fitness
-                metrics_func=self.calculate_batch_metrics  # 统一指标计算入口
-            )
-            
-            # 执行优化（带错误处理和自动回退）
-            try:
-                best_threshold, best_dice = gwo.optimize(all_probs_tensor, all_masks_tensor, device=device if use_gpu_for_gwo else None)
-            except RuntimeError as e:
-                if "out of memory" in str(e) or "CUDA" in str(e):
-                    print(f">>> [GWO] GPU显存不足，自动回退到CPU模式")
-                    # 清理GPU显存
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    # 回退到CPU（确保使用numpy数组）
-                    if use_gpu_for_gwo:
-                        # 如果之前用的是GPU tensor，需要重新获取numpy数组
-                        # 但此时all_probs_np和all_masks_np应该还在
-                        best_threshold, best_dice = gwo.optimize(all_probs_np, all_masks_np, device=None)
+            def postprocess_func_cpu(pred_mask, prob_map):
+                """CPU后处理函数 - 完全在CPU上执行，避免CPU-GPU数据传输"""
+                try:
+                    # 确保输入是numpy数组
+                    if isinstance(pred_mask, torch.Tensor):
+                        pred_mask = pred_mask.cpu().numpy()
                     else:
-                        best_threshold, best_dice = gwo.optimize(all_probs_tensor, all_masks_tensor, device=None)
-                else:
-                    raise
+                        pred_mask = np.asarray(pred_mask, dtype=np.float32)
+                        
+                    if isinstance(prob_map, torch.Tensor):
+                        prob_map = prob_map.cpu().numpy()
+                    else:
+                        prob_map = np.asarray(prob_map, dtype=np.float32)
+                    
+                    # 确保是2D数组
+                    if pred_mask.ndim > 2:
+                        pred_mask = pred_mask.squeeze()
+                    if prob_map.ndim > 2:
+                        prob_map = prob_map.squeeze()
+                    
+                    # 使用CPU版本的后处理
+                    pred_mask_tensor = torch.from_numpy(pred_mask).float()
+                    prob_map_tensor = torch.from_numpy(prob_map).float()
+                    
+                    # 先执行智能后处理
+                    pred_mask_processed = self.smart_post_processing(pred_mask_tensor, prob_map_tensor)
+                    
+                    # 再执行传统形态学后处理（与验证阶段参数一致）
+                    result = self.post_process_mask(
+                        pred_mask_processed,
+                        min_size=150,
+                        use_morphology=True,
+                        keep_largest=False,
+                        fill_holes=True,
+                        prob_map=prob_map_tensor
+                    )
+                    result_np = result.detach().cpu().numpy() if isinstance(result, torch.Tensor) else np.asarray(result, dtype=np.float32)
+                    return result_np.astype(np.float32)
+                except Exception as e:
+                    print(f"[CPU PostProcess] 后处理失败，回退原始预测: {e}")
+                    return pred_mask if isinstance(pred_mask, np.ndarray) else np.asarray(pred_mask, dtype=np.float32)
             
-            # GWO优化完成（已使用Mean Dice+后处理）
-            print(f">>> [GWO] 搜索完成! 最佳阈值: {best_threshold:.4f}, 最佳Dice(Mean+后处理): {best_dice:.4f}")
-            self.update_progress.emit(90, f"阈值优化: GWO完成 | 最佳阈值: {best_threshold:.4f} | 最佳Dice(Mean+后处理): {best_dice:.4f}")
+            def _compute_metrics_for_threshold(threshold: float):
+                """
+                给定阈值，计算：
+                - mean_dice
+                - mean_iou
+                - mean_recall
+                - mean_precision
+                - mean_specificity
+                - total_fp（所有样本的假阳性像素总数）
+                """
+                # 二值化预测
+                pred_bin = (probs_2d >= threshold).astype(np.uint8)  # (N,H,W)
+                
+                dice_list = []
+                iou_list = []
+                spec_list = []
+                rec_list = []
+                prec_list = []
+                total_fp = 0
+                
+                for i in range(num_samples):
+                    prob_map = probs_2d[i]
+                    gt = gt_bin[i]
+                    
+                    # 先用简单二值结果做后处理输入
+                    pred_mask = pred_bin[i].astype(np.float32)
+                    pred_pp = postprocess_func_cpu(pred_mask, prob_map)
+                    pred_pp = (np.asarray(pred_pp) >= 0.5).astype(np.uint8)
+                    
+                    tp = int((pred_pp & gt).sum())
+                    fp = int((pred_pp & (1 - gt)).sum())
+                    fn = int(((1 - pred_pp) & gt).sum())
+                    tn = int(((1 - pred_pp) & (1 - gt)).sum())
+                    total_fp += fp
+                    
+                    gt_sum = int(gt.sum())
+                    pred_sum = int(pred_pp.sum())
+                    
+                    # Dice
+                    if gt_sum == 0 and pred_sum == 0:
+                        dice = 1.0
+                        iou = 1.0
+                    else:
+                        dice_den = 2 * tp + fp + fn
+                        dice = (2 * tp + eps) / (dice_den + eps)
+                        iou_den = tp + fp + fn
+                        iou = (tp + eps) / (iou_den + eps)
+                    
+                    # Specificity: TN / (TN + FP)
+                    spec_den = tn + fp
+                    specificity = (tn + eps) / (spec_den + eps)
+                    
+                    # Recall: TP / (TP + FN)
+                    rec_den = tp + fn
+                    recall = (tp + eps) / (rec_den + eps)
+                    
+                    # Precision: TP / (TP + FP)
+                    prec_den = tp + fp
+                    precision = (tp + eps) / (prec_den + eps)
+                    
+                    dice_list.append(dice)
+                    iou_list.append(iou)
+                    spec_list.append(specificity)
+                    rec_list.append(recall)
+                    prec_list.append(precision)
+                
+                mean_dice = float(np.mean(dice_list)) if dice_list else 0.0
+                mean_iou = float(np.mean(iou_list)) if iou_list else 0.0
+                mean_spec = float(np.mean(spec_list)) if spec_list else 0.0
+                mean_rec = float(np.mean(rec_list)) if rec_list else 0.0
+                mean_prec = float(np.mean(prec_list)) if prec_list else 0.0
+                
+                return mean_dice, mean_iou, mean_rec, mean_prec, mean_spec, int(total_fp)
             
-            # 【关键修复】GWO已经使用了Mean Dice+后处理，所以best_dice可以直接用于best_model判定
-            # 但为了兼容性和诊断，我们仍然重新计算一次以验证一致性
-            print(">>> [GWO] 验证计算一致性（重新计算一次）...")
+            def objective(threshold: float) -> float:
+                """
+                Brent 方法的目标函数：返回负的综合得分（0.4*Dice + 0.3*IoU + 0.3*Specificity）
+                """
+                mean_dice, mean_iou, _mean_rec, _mean_prec, mean_spec, _total_fp = _compute_metrics_for_threshold(threshold)
+                score = 0.4 * mean_dice + 0.3 * mean_iou + 0.3 * mean_spec
+                return -score  # minimize_scalar 最小化目标
+            
+            # 开始 Brent 搜索
+            try:
+                try:
+                    self.update_progress.emit(45, "🚀 Brent 阈值优化已开始（CPU模式），正在搜索最佳阈值...")
+                except Exception:
+                    pass
+                
+                print("\n[训练验证] ========================================")
+                print("[训练验证] Brent 阈值优化已开始（CPU模式）")
+                print(f"[训练验证] 样本数: {total_samples}")
+                print("[训练验证] 搜索区间: [0.1, 0.9]")
+                print("[训练验证] ========================================")
+                
+                result = minimize_scalar(
+                    objective,
+                    bounds=(0.1, 0.9),
+                    method="bounded",
+                    options={"xatol": 1e-3},
+                )
+                
+                optimal_threshold = float(result.x)
+                best_score = float(-result.fun)
+                n_evals = int(getattr(result, "nfev", 0))
+                
+                # 【进度更新】阈值优化完成
+                try:
+                    self.update_progress.emit(
+                        90,
+                        f"✅ Brent 阈值优化完成！最佳阈值: {optimal_threshold:.4f}, Score: {best_score:.4f}, 评估次数: {n_evals}",
+                    )
+                except Exception:
+                    pass
+                
+                print(
+                    f"\n[训练验证] Brent 阈值优化完成！最佳阈值: {optimal_threshold:.4f}, "
+                    f"Score: {best_score:.4f}, 评估次数: {n_evals}"
+                )
+                
+                best_threshold = optimal_threshold
+                best_dice, best_iou, best_recall, best_prec, best_spec, best_fp = _compute_metrics_for_threshold(optimal_threshold)
+                # 使用综合得分作为best_dice（与测试阶段保持一致）
+                best_dice = best_score
+                
+            except Exception as e:
+                import traceback
+                error_trace = traceback.format_exc()
+                print(f"[训练验证][Brent] 阈值优化失败，使用默认阈值0.5: {e}")
+                print(f"[训练验证][Brent] 错误详情:\n{error_trace}")
+                best_threshold, best_dice = 0.5, 0.0
+                try:
+                    self.update_progress.emit(90, f"Brent 优化失败，使用默认阈值0.5: {str(e)}")
+                except Exception:
+                    pass
+            
+            # 【关键修复】重新计算一次以验证一致性
+            print(">>> [Brent] 验证计算一致性（重新计算一次）...")
             self.update_progress.emit(92, "阈值优化: 验证计算一致性...")
             
             # 【关键修复】确保total_samples在删除前已保存（修复日志显示0个样本的问题）
@@ -539,15 +637,9 @@ class TrainThread(QThread):
                 else:
                     total_samples = 0
             
-            # 统一处理：无论GPU还是CPU模式，都转换为numpy数组
-            if isinstance(all_probs_tensor, torch.Tensor):
-                # 如果是tensor，转换回numpy
-                all_probs_for_postprocess = all_probs_tensor.cpu().numpy()
-                all_masks_for_postprocess = all_masks_tensor.cpu().numpy()
-            else:
-                # 如果已经是numpy数组，直接使用（CPU模式）
-                all_probs_for_postprocess = all_probs_np.copy()
-                all_masks_for_postprocess = all_masks_np.copy()
+            # 统一处理：保持在CPU上（Brent方法始终使用CPU）
+            all_probs_for_postprocess = all_probs_np.copy()
+            all_masks_for_postprocess = all_masks_np.copy()
             
             # 再次确认total_samples
             if total_samples == 0:
@@ -622,17 +714,17 @@ class TrainThread(QThread):
             # 输出诊断信息
             if empty_mask_count > 0:
                 empty_mask_avg_dice = empty_mask_dice_sum / empty_mask_count
-                print(f">>> [GWO诊断] 空mask样本: {empty_mask_count}/{total_samples} ({100*empty_mask_count/total_samples:.1f}%)")
-                print(f">>> [GWO诊断] 空mask平均Dice: {empty_mask_avg_dice:.4f}")
+                print(f">>> [Brent诊断] 空mask样本: {empty_mask_count}/{total_samples} ({100*empty_mask_count/total_samples:.1f}%)")
+                print(f">>> [Brent诊断] 空mask平均Dice: {empty_mask_avg_dice:.4f}")
                 if empty_mask_avg_dice < 0.9:
-                    print(f">>> [GWO警告] 空mask Dice偏低，可能是后处理未能完全过滤假阳性")
+                    print(f">>> [Brent警告] 空mask Dice偏低，可能是后处理未能完全过滤假阳性")
             if non_empty_mask_count > 0:
                 non_empty_mask_avg_dice = non_empty_mask_dice_sum / non_empty_mask_count
-                print(f">>> [GWO诊断] 有前景样本: {non_empty_mask_count}/{total_samples} ({100*non_empty_mask_count/total_samples:.1f}%)")
-                print(f">>> [GWO诊断] 有前景样本平均Dice: {non_empty_mask_avg_dice:.4f}")
+                print(f">>> [Brent诊断] 有前景样本: {non_empty_mask_count}/{total_samples} ({100*non_empty_mask_count/total_samples:.1f}%)")
+                print(f">>> [Brent诊断] 有前景样本平均Dice: {non_empty_mask_avg_dice:.4f}")
             
             # 【关键修复】使用Mean Dice（每个样本分别计算再平均，与验证阶段一致）
-            # 验证阶段使用 Mean Dice，所以GWO也应该使用 Mean Dice 以保持一致
+            # 验证阶段使用 Mean Dice，所以Brent也应该使用 Mean Dice 以保持一致
             mean_dice_postprocessed = np.mean(dice_scores_per_sample) if dice_scores_per_sample else 0.0
             
             # 【内存优化】分批计算Global Dice用于对比，避免内存爆炸
@@ -688,17 +780,14 @@ class TrainThread(QThread):
             dice_den_postprocessed = 2.0 * tp_total + fp_total + fn_total
             global_dice_postprocessed = 1.0 if dice_den_postprocessed < 1e-7 else (2.0 * tp_total) / (dice_den_postprocessed + 1e-7)
             
-            print(f">>> [GWO] 验证计算完成! 最佳阈值: {best_threshold:.4f}")
-            print(f">>> [GWO] GWO搜索时的Dice: {best_dice:.4f} (Mean+后处理)")
-            print(f">>> [GWO] 重新计算的Mean Dice: {mean_dice_postprocessed:.4f} (用于验证一致性)")
-            print(f">>> [GWO] Global Dice(后处理): {global_dice_postprocessed:.4f} (用于对比)")
+            print(f">>> [Brent] 验证计算完成! 最佳阈值: {best_threshold:.4f}")
+            print(f">>> [Brent] Brent搜索时的Score: {best_dice:.4f} (综合得分)")
+            print(f">>> [Brent] 重新计算的Mean Dice: {mean_dice_postprocessed:.4f} (用于验证一致性)")
+            print(f">>> [Brent] Global Dice(后处理): {global_dice_postprocessed:.4f} (用于对比)")
             
-            # 【关键修复】检查一致性
-            dice_diff = abs(best_dice - mean_dice_postprocessed)
-            if dice_diff > 0.01:
-                print(f">>> [GWO警告] Dice差异较大: {dice_diff:.4f}，可能存在计算不一致")
-            else:
-                print(f">>> [GWO] Dice一致性验证通过 (差异: {dice_diff:.4f})")
+            # 【关键修复】检查一致性（使用Mean Dice作为最终结果）
+            # best_dice现在是综合得分，mean_dice_postprocessed是Mean Dice，两者可能不同
+            # 我们使用mean_dice_postprocessed作为最终结果，与验证阶段保持一致
             
             # 【关键修复】使用重新计算的Mean Dice作为最终结果（确保与验证阶段完全一致）
             best_dice = mean_dice_postprocessed
@@ -732,10 +821,6 @@ class TrainThread(QThread):
             }
             
             # 【显存优化】删除拼接后的数组和中间变量
-            # 注意：在CPU模式下，all_probs_tensor就是all_probs_np，所以只需要删除一次
-            if use_gpu_for_gwo:
-                # GPU模式：删除tensor和numpy数组
-                del all_probs_tensor, all_masks_tensor
             del all_probs_np, all_masks_np
             del processed_preds_list, dice_scores_per_sample
             if 'all_probs_for_postprocess' in locals():
@@ -762,7 +847,7 @@ class TrainThread(QThread):
             f"Dice: {best_metrics.get('dice', float('nan')):.4f}, "
             f"IoU: {best_metrics.get('iou', float('nan')):.4f}"
         )
-        # 返回最佳阈值和最佳Dice（基于全验证集GWO优化）
+        # 返回最佳阈值和最佳Dice（基于全验证集Brent优化）
         return (float(best_threshold), float(best_dice))
     
     def evaluate_model(self, model, dataloader, device, use_tta=True, adaptive_threshold=True):
@@ -778,8 +863,8 @@ class TrainThread(QThread):
             threshold_result = self.find_optimal_threshold(model, dataloader, device)
             # 处理返回值：可能是元组(threshold, dice)或单个值（向后兼容）
             if isinstance(threshold_result, tuple):
-                optimal_thresh, gwo_dice = threshold_result
-                self.gwo_best_dice = float(gwo_dice)
+                optimal_thresh, brent_dice = threshold_result
+                self.gwo_best_dice = float(brent_dice)  # 保持变量名兼容性
             else:
                 optimal_thresh = threshold_result
                 self.gwo_best_dice = None
@@ -3213,9 +3298,9 @@ class TrainThread(QThread):
                         # 处理返回值：可能是元组(threshold, dice)或单个值（向后兼容）
                         if isinstance(threshold_result, tuple):
                             val_threshold, gwo_best_dice = threshold_result
-                            # 【关键修复】保存GWO找到的全验证集最佳Dice，用于best_model判定
-                            self.gwo_best_dice = float(gwo_best_dice)
-                            print(f">>> [GWO] 全验证集最佳Dice已保存: {self.gwo_best_dice:.4f} (将用于best_model判定)")
+                            # 【关键修复】保存Brent找到的全验证集最佳Dice，用于best_model判定
+                            self.gwo_best_dice = float(gwo_best_dice)  # 保持变量名兼容性
+                            print(f">>> [Brent] 全验证集最佳Dice已保存: {self.gwo_best_dice:.4f} (将用于best_model判定)")
                         else:
                             # 向后兼容：如果返回单个值
                             val_threshold = float(threshold_result)
@@ -3953,15 +4038,15 @@ class TrainThread(QThread):
                 self.epoch_analysis_ready.emit(epoch + 1, test_viz_path, avg_epoch_metrics)
                 
                 # Save best model
-                # 【关键修复】优先使用GWO找到的全验证集最佳Dice作为判定依据
-                # 如果GWO未运行或失败，则回退到验证循环计算的val_dice
-                dice_for_best_model = getattr(self, 'gwo_best_dice', None)
+                # 【关键修复】优先使用Brent找到的全验证集最佳Dice作为判定依据
+                # 如果Brent未运行或失败，则回退到验证循环计算的val_dice
+                dice_for_best_model = getattr(self, 'gwo_best_dice', None)  # 保持变量名兼容性
                 if dice_for_best_model is None:
                     # 回退到验证循环计算的val_dice（基于全部验证集+后处理）
                     dice_for_best_model = val_dice
-                    print(f">>> [Best Model] 使用验证循环Dice: {dice_for_best_model:.4f} (GWO未运行)")
+                    print(f">>> [Best Model] 使用验证循环Dice: {dice_for_best_model:.4f} (Brent未运行)")
                 else:
-                    print(f">>> [Best Model] 使用GWO全验证集最佳Dice: {dice_for_best_model:.4f}")
+                    print(f">>> [Best Model] 使用Brent全验证集最佳Dice: {dice_for_best_model:.4f}")
                 
                 if dice_for_best_model > self.best_dice:
                     self.best_dice = dice_for_best_model
@@ -3971,7 +4056,7 @@ class TrainThread(QThread):
                         self.best_model_path = os.path.join(self.best_model_dir, self.best_model_filename)
                         self._save_checkpoint(eval_model_for_epoch, self.best_model_path)
                         self.model_saved.emit(
-                            f"已更新最佳模型: {self.best_model_filename} (Dice: {dice_for_best_model:.4f}, 基于全验证集GWO优化)"
+                            f"已更新最佳模型: {self.best_model_filename} (Dice: {dice_for_best_model:.4f}, 基于全验证集Brent优化)"
                         )
 
                 # 恢复EMA模型为train模式（如果使用了EMA）
