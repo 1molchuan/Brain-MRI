@@ -30,6 +30,12 @@ segmentation-models-pytorch>=0.3.0
 # Grad-CAM可视化（可选但推荐）
 pytorch-grad-cam>=1.4.0
 
+# Web应用框架（Streamlit App）
+streamlit>=1.28.0
+
+# 医学图像格式支持
+nibabel>=3.2.0
+
 # 可选依赖（用于高级功能）
 # tensorboard>=2.7.0  # 训练可视化（可选）
 

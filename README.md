@@ -23,6 +23,21 @@
 
 ## 🆕 最新更新
 
+- **🌐 Streamlit Web App (`app.py`)**  
+  - 全新的 Web 界面，支持浏览器访问，无需安装 GUI 依赖
+  - **批量图像上传**：支持批量上传 TIF 格式的 2D 图像序列，自动配对原图和 Mask
+  - **智能模型检测**：自动检测模型模式（2D/2.5D），自适应输入通道数
+  - **实时阈值调节**：支持手动调节阈值，实时查看预测结果变化
+  - **智能后处理集成**：支持上传 `best_postprocessing_config.json`，自动应用最优后处理策略
+  - **三列对比展示**：原图、Ground Truth、预测结果并排显示
+  - **深度调试面板**：概率分布直方图、阈值效果预览、详细统计信息
+  - **概率热力图**：可选显示原始概率图，便于调试和分析
+
+- **🔧 阈值调节功能优化**  
+  - 修复了智能后处理中阈值硬编码问题（`_apply_strategy` 内部 0.5 阈值）
+  - 确保用户手动调节的阈值能够正确应用到预测结果
+  - 支持在 Web App 中实时调节阈值，立即查看效果
+
 - **架构重构（Architectural Refactoring）**  
   - 将原本超大、单文件的 `worker.py`（约 1.1 万行）和 `utils.py`（约 4.5 千行），重构为模块化包结构 `worker/` 与 `utils/`。  
   - 通过 `__init__.py` 保持向后兼容，原有 `from worker import ...` 和 `from utils import *` 写法仍然可用。  
@@ -56,9 +71,16 @@
 - **NN-Former** - 基于 Transformer 的医学图像分割模型
 
 ### 🖥️ 友好的图形界面
-- 基于 PyQt5 构建的现代化 GUI
-- 实时训练监控和可视化
-- 直观的操作流程
+- **PyQt5 GUI** - 基于 PyQt5 构建的现代化桌面应用
+  - 实时训练监控和可视化
+  - 直观的操作流程
+  - 支持 MATLAB 报告生成
+- **🌐 Streamlit Web App** - 全新的 Web 界面（`app.py`）
+  - 浏览器访问，无需安装 GUI 依赖
+  - 批量图像上传和处理
+  - 实时阈值调节和可视化
+  - 智能后处理集成
+  - 深度调试面板
 
 ### 🚀 高性能训练
 - ✅ 混合精度训练（AMP）
@@ -134,21 +156,39 @@ pip install -r requirements.txt
 **核心依赖**：
 - `torch>=2.0.0` – PyTorch深度学习框架
 - `torchvision>=0.15.0` – 与PyTorch版本匹配
-- `PyQt5>=5.15.0` – GUI框架
+- `PyQt5>=5.15.0` – GUI框架（桌面应用）
+- `streamlit>=1.28.0` – Web框架（Web应用）
 - `albumentations>=1.3.0` – 数据增强
 - `opencv-python>=4.5.0` – 图像处理
 - `scikit-image>=0.19.0` – 图像工具（morphology操作）
 - `numpy>=1.21.0,<2.0.0` – 科学计算（限制2.0以下避免兼容性问题）
-- `scipy>=1.7.0` – 科学计算（Brent方法优化）
+- `scipy>=1.7.0` – 科学计算（Brent方法优化、连通域分析）
 - `segmentation-models-pytorch>=0.3.0` – SMP库（U‑Net++、DeepLabV3+）
 - `pytorch-grad-cam>=1.4.0` – Grad‑CAM可视化（可选但推荐）
 - `matlab.engine` – MATLAB引擎（可选，用于报告生成）
 
-### 3. 运行应用（GUI）
+### 3. 运行应用
 
+**方式一：PyQt5 GUI（桌面应用）**
 ```bash
 python main.py
 ```
+
+**方式二：Streamlit Web App（Web 界面）**
+```bash
+streamlit run app.py
+```
+
+然后在浏览器中打开显示的 URL（通常是 `http://localhost:8501`）
+
+**Web App 功能特点**：
+- 📁 **批量上传**：支持批量上传 TIF 格式的 2D 图像序列
+- 🔍 **智能配对**：自动识别并配对原图和对应的 `_mask.tif` 文件
+- 🎚️ **实时阈值调节**：通过滑块实时调节阈值，立即查看预测结果变化
+- 🔧 **智能后处理**：支持上传 `best_postprocessing_config.json`，自动应用最优后处理策略
+- 📊 **三列对比**：原图、Ground Truth、预测结果并排显示
+- 🎨 **概率热力图**：可选显示原始概率图，便于调试和分析
+- 📈 **深度调试面板**：概率分布直方图、阈值效果预览、详细统计信息
 
 ### 4. 为“已有模型”生成智能后处理配置（无需重训）
 
@@ -169,7 +209,8 @@ python generate_smart_postprocessing_config.py ^
 
 ```
 medical-segmentation/
-├── main.py                    # 主入口（GUI和应用程序）
+├── main.py                    # 主入口（PyQt5 GUI和应用程序）
+├── app.py                     # Streamlit Web App（Web界面）
 ├── models.py                  # 所有模型架构
 ├── dataset.py                 # 2.5D数据集加载器（TCGA2_5DDataset）
 ├── config.py                  # 集中式模型配置
@@ -295,10 +336,26 @@ data_dir/
 
 ### 预测图像
 
+#### 方式一：PyQt5 GUI
 1. **加载模型**: 选择训练好的模型文件
 2. **选择图像**: 支持单张或批量图像预测
-3. **设置阈值**: 调整二值化阈值（默认 0.5，或使用 GWO 优化结果）
+3. **设置阈值**: 调整二值化阈值（默认 0.5，或使用 Brent 优化结果）
 4. **开始预测**: 点击"开始预测"按钮，查看预测结果
+
+#### 方式二：Streamlit Web App
+1. **启动应用**: 运行 `streamlit run app.py`
+2. **上传模型**: 在侧边栏上传训练好的模型文件（`.pth`）
+3. **上传图像**: 批量上传 TIF 格式的 2D 图像序列
+   - 系统会自动识别并配对原图和对应的 `_mask.tif` 文件
+   - 例如：`image1.tif` 和 `image1_mask.tif` 会自动配对
+4. **配置后处理**（可选）:
+   - 上传 `best_postprocessing_config.json` 以启用智能后处理
+   - 或使用手动阈值调节
+5. **浏览结果**: 
+   - 使用切片浏览器选择要查看的图像
+   - 实时调节阈值，立即查看预测结果变化
+   - 查看三列对比（原图、Ground Truth、预测结果）
+   - 使用深度调试面板分析概率分布和阈值效果
 
 ---
 
@@ -567,6 +624,18 @@ pip install grad-cam
 - SwinUNet/DS-TransUNet/NN-Former 的超参数优化（多维度搜索）
 - 阈值优化已升级为 Brent 方法（单维度搜索更高效）
 
+### Q: Streamlit Web App 和 PyQt5 GUI 有什么区别？
+**A**: 
+- **PyQt5 GUI** (`main.py`): 桌面应用，功能完整，支持训练、测试、预测，适合本地开发和完整工作流
+- **Streamlit Web App** (`app.py`): Web 界面，专注于推理和可视化，支持批量图像处理，适合快速测试和演示
+- 两者共享相同的模型和后处理逻辑，确保结果一致性
+
+### Q: Web App 中阈值调节不生效？
+**A**: 已修复！现在确保：
+1. 手动调节的阈值会正确应用到预测结果
+2. 智能后处理也会使用用户设定的阈值（而非硬编码的 0.5）
+3. 如果仍有问题，请检查是否启用了智能后处理，并确认配置文件中是否有阈值设置
+
 ---
 
 ## 📝 开发说明
@@ -698,7 +767,16 @@ main.py
 
 ## 📈 更新日志
 
-### v2.4 (最新)
+### v2.5 (最新)
+- ✅ **Streamlit Web App**：全新的 Web 界面（`app.py`），支持浏览器访问
+  - 批量图像上传和处理
+  - 实时阈值调节和可视化
+  - 智能后处理集成
+  - 深度调试面板（概率分布直方图、阈值效果预览）
+- ✅ **阈值调节功能优化**：修复智能后处理中阈值硬编码问题，确保用户手动调节的阈值能够正确应用
+- ✅ **智能模型检测**：Web App 自动检测模型模式（2D/2.5D），自适应输入通道数
+
+### v2.4
 - ✅ **Brent 阈值优化方法**：将 GWO 阈值搜索升级为 Brent 方法（`scipy.optimize.minimize_scalar`），单维度搜索更高效，仅需 ~15 次评估即可收敛
 - ✅ **多进程并行加速**：测试阶段使用 `ProcessPoolExecutor` 并行计算，8 核同时工作，速度提升 6-10 倍
 - ✅ **性能提升**：Brent 阈值优化总耗时从几分钟压缩到 30 秒以内
