@@ -15,6 +15,14 @@ from PIL import Image
 import cv2
 import re
 from scipy import ndimage
+import requests
+import io
+
+# === Matplotlib 中文显示配置 ===
+# 尝试设置中文字体，按优先级尝试 Windows/Linux 常见中文字体
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'SimSun', 'Arial Unicode MS']
+# 解决负号显示为方块的问题
+plt.rcParams['axes.unicode_minus'] = False
 
 # 导入项目模块
 from models import instantiate_model
@@ -182,43 +190,77 @@ def load_image_file(file) -> Tuple[np.ndarray, Dict]:
 
 def preprocess_image_for_2d(image: np.ndarray) -> torch.Tensor:
     """
-    2D 模式：单张图像预处理
-    【关键修复】处理RGB和灰度图像，确保输入在 [0, 1] 范围，正确转换为 PyTorch 需要的 (B, C, H, W) 格式
+    2D 模式：智能通道适配 - 优先保留 RGB 信息
+    - RGB 图像：保留原样，归一化后转换为 (1, 3, H, W)
+    - 灰度图像：归一化后复制3份转换为 (1, 3, H, W)
     """
     # 确保是 float32 类型
     img_float = image.astype(np.float32)
     
-    # 处理RGB图像：转换为灰度（取平均值）
+    # 处理RGB图像：如果已经是RGB，直接使用
     if len(img_float.shape) == 3 and img_float.shape[2] == 3:
-        # RGB图像：转换为灰度 (H, W, 3) -> (H, W)
-        img_float = np.mean(img_float, axis=2)
-    elif len(img_float.shape) == 3 and img_float.shape[2] == 4:
-        # RGBA图像：转换为灰度（只取RGB通道，忽略Alpha）
-        img_float = np.mean(img_float[:, :, :3], axis=2)
-    
-    # 再次检查并强制归一化（双重保险）
-    img_max = img_float.max()
-    
-    if img_max > 1.0:
-        img_float = img_float / img_max
-    else:
-        img_min = img_float.min()
-        if img_max > img_min:
-            img_float = (img_float - img_min) / (img_max - img_min)
+        # RGB图像：保留原样，归一化到 [0, 1]
+        if img_float.max() > 1.0:
+            img_normalized = img_float / 255.0
         else:
-            img_float = np.zeros_like(img_float)
+            # 如果已经在 [0, 1] 范围，使用 Min-Max 归一化确保完全在 [0, 1]
+            img_min = img_float.min()
+            img_max = img_float.max()
+            if img_max > img_min:
+                img_normalized = (img_float - img_min) / (img_max - img_min)
+            else:
+                img_normalized = np.zeros_like(img_float)
+        
+        img_normalized = np.clip(img_normalized, 0.0, 1.0)
+        
+        # 转换为 (3, H, W) 格式: (H, W, 3) -> (3, H, W)
+        stacked = np.transpose(img_normalized, (2, 0, 1))
+    elif len(img_float.shape) == 3 and img_float.shape[2] == 4:
+        # RGBA图像：只取RGB通道，忽略Alpha
+        img_rgb = img_float[:, :, :3]
+        if img_rgb.max() > 1.0:
+            img_normalized = img_rgb / 255.0
+        else:
+            img_min = img_rgb.min()
+            img_max = img_rgb.max()
+            if img_max > img_min:
+                img_normalized = (img_rgb - img_min) / (img_max - img_min)
+            else:
+                img_normalized = np.zeros_like(img_rgb)
+        
+        img_normalized = np.clip(img_normalized, 0.0, 1.0)
+        stacked = np.transpose(img_normalized, (2, 0, 1))
+    else:
+        # 灰度图像：归一化后复制3份
+        # 确保是 (H, W) 形状
+        if len(img_float.shape) == 3:
+            # 如果是 (H, W, 1)，降维
+            if img_float.shape[2] == 1:
+                img_float = img_float.squeeze(2)
+            else:
+                # 其他情况：转换为灰度（取平均值）
+                img_float = np.mean(img_float, axis=2)
+        elif len(img_float.shape) != 2:
+            raise ValueError(f"Expected 2D or 3D image, got shape {img_float.shape}")
+        
+        # 归一化
+        img_max = img_float.max()
+        if img_max > 1.0:
+            img_normalized = img_float / img_max
+        else:
+            img_min = img_float.min()
+            if img_max > img_min:
+                img_normalized = (img_float - img_min) / (img_max - img_min)
+            else:
+                img_normalized = np.zeros_like(img_float)
+        
+        img_normalized = np.clip(img_normalized, 0.0, 1.0)
+        
+        # 复制3份：stack = [img, img, img]
+        stacked = np.stack([img_normalized, img_normalized, img_normalized], axis=0)  # (3, H, W)
     
-    img_float = np.clip(img_float, 0.0, 1.0)
-    
-    # 确保是 (H, W) 形状
-    if len(img_float.shape) != 2:
-        raise ValueError(f"Expected 2D image after processing, got shape {img_float.shape}")
-    
-    # 【关键修复】正确转换为 PyTorch Tensor 格式: (B, C, H, W)
-    # 步骤：1. (H, W) -> 2. (1, H, W) -> 3. (1, 1, H, W)
-    tensor = torch.from_numpy(img_float).float()  # (H, W)
-    tensor = tensor.unsqueeze(0)  # (1, H, W) - 添加通道维度
-    tensor = tensor.unsqueeze(0)  # (1, 1, H, W) - 添加批次维度
+    # 转换为 Tensor: (1, 3, H, W)
+    tensor = torch.from_numpy(stacked).float().unsqueeze(0)
     
     # 【Debug】打印 Tensor shape
     print(f"[Debug] preprocess_image_for_2d: Input Tensor Shape = {tensor.shape}")
@@ -228,53 +270,59 @@ def preprocess_image_for_2d(image: np.ndarray) -> torch.Tensor:
 
 def preprocess_image_for_2_5d(image: np.ndarray) -> torch.Tensor:
     """
-    2.5D 模式：将单张图像复制3份堆叠（伪3D）
-    为了代码健壮性，不根据文件名寻找相邻切片，统一使用复制堆叠
-    【关键修复】处理RGB和灰度图像，确保输入在 [0, 1] 范围
+    2.5D 模式：智能通道适配 - 优先保留 RGB 信息
+    - RGB 图像：保留原样，归一化后转换为 (1, 3, H, W)
+    - 灰度图像：归一化后复制3份转换为 (1, 3, H, W)
     """
     # 确保是 float32 类型
     img_float = image.astype(np.float32)
     
-    # 处理RGB图像：如果已经是RGB，直接使用；否则转换为灰度后复制3份
+    # 处理RGB图像：如果已经是RGB，直接使用
     if len(img_float.shape) == 3 and img_float.shape[2] == 3:
-        # RGB图像：直接使用RGB通道 (H, W, 3)
-        # 归一化每个通道
-        for c in range(3):
-            channel = img_float[:, :, c]
-            ch_max = channel.max()
-            if ch_max > 1.0:
-                img_float[:, :, c] = channel / ch_max
+        # RGB图像：保留原样，归一化到 [0, 1]
+        if img_float.max() > 1.0:
+            img_normalized = img_float / 255.0
+        else:
+            # 如果已经在 [0, 1] 范围，使用 Min-Max 归一化确保完全在 [0, 1]
+            img_min = img_float.min()
+            img_max = img_float.max()
+            if img_max > img_min:
+                img_normalized = (img_float - img_min) / (img_max - img_min)
             else:
-                ch_min = channel.min()
-                if ch_max > ch_min:
-                    img_float[:, :, c] = (channel - ch_min) / (ch_max - ch_min)
-                else:
-                    img_float[:, :, c] = np.zeros_like(channel)
+                img_normalized = np.zeros_like(img_float)
         
-        img_float = np.clip(img_float, 0.0, 1.0)
-        # 转换为 (3, H, W) 格式
-        stacked = np.transpose(img_float, (2, 0, 1))  # (H, W, 3) -> (3, H, W)
+        img_normalized = np.clip(img_normalized, 0.0, 1.0)
+        
+        # 转换为 (3, H, W) 格式: (H, W, 3) -> (3, H, W)
+        stacked = np.transpose(img_normalized, (2, 0, 1))
     else:
         # 灰度图像：归一化后复制3份
-        img_max = img_float.max()
+        # 确保是 (H, W) 形状
+        if len(img_float.shape) == 3:
+            # 如果是 (H, W, 1)，降维
+            if img_float.shape[2] == 1:
+                img_float = img_float.squeeze(2)
+            else:
+                # 其他情况：转换为灰度（取平均值）
+                img_float = np.mean(img_float, axis=2)
+        elif len(img_float.shape) != 2:
+            raise ValueError(f"Expected 2D or 3D image, got shape {img_float.shape}")
         
+        # 归一化
+        img_max = img_float.max()
         if img_max > 1.0:
-            img_float = img_float / img_max
+            img_normalized = img_float / img_max
         else:
             img_min = img_float.min()
             if img_max > img_min:
-                img_float = (img_float - img_min) / (img_max - img_min)
+                img_normalized = (img_float - img_min) / (img_max - img_min)
             else:
-                img_float = np.zeros_like(img_float)
+                img_normalized = np.zeros_like(img_float)
         
-        img_float = np.clip(img_float, 0.0, 1.0)
-        
-        # 确保是 (H, W) 形状
-        if len(img_float.shape) != 2:
-            raise ValueError(f"Expected 2D image, got shape {img_float.shape}")
+        img_normalized = np.clip(img_normalized, 0.0, 1.0)
         
         # 复制3份：stack = [img, img, img]
-        stacked = np.stack([img_float, img_float, img_float], axis=0)  # (3, H, W)
+        stacked = np.stack([img_normalized, img_normalized, img_normalized], axis=0)  # (3, H, W)
     
     # 转换为 Tensor: (1, 3, H, W)
     tensor = torch.from_numpy(stacked).float().unsqueeze(0)
@@ -393,6 +441,189 @@ def load_model(model_path: str, device: str):
         return None, None, None
 
 
+# ==================== 推理函数（提取为独立函数） ====================
+
+def predict_local(
+    model, 
+    original_image: np.ndarray, 
+    mode: str, 
+    device: str,
+    threshold: float,
+    use_smart_post: bool,
+    smart_post_cfg: Optional[Dict]
+) -> Tuple[np.ndarray, np.ndarray, Dict]:
+    """
+    本地推理函数
+    
+    Returns:
+        prob_map: 概率图 (H, W)
+        binary_mask: 二值化 Mask (H, W) uint8
+        metadata: 包含统计信息的字典
+    """
+    with torch.no_grad():
+        # 根据模式预处理
+        if mode == "2.5D":
+            input_tensor = preprocess_image_for_2_5d(original_image)
+        else:
+            input_tensor = preprocess_image_for_2d(original_image)
+        
+        # 获取输入 Tensor 的统计信息
+        input_tensor_min = input_tensor.min().item()
+        input_tensor_max = input_tensor.max().item()
+        input_tensor_mean = input_tensor.mean().item()
+        
+        # 移动到设备
+        input_tensor = input_tensor.to(device)
+        
+        # 推理
+        output = model(input_tensor)
+        if isinstance(output, tuple):
+            output = output[0]
+        
+        # Sigmoid 激活
+        prob_map = torch.sigmoid(output[0, 0]).cpu().numpy()  # (H, W)
+    
+    # 后处理
+    actual_threshold = threshold
+    
+    if use_smart_post and smart_post_cfg is not None:
+        method = smart_post_cfg.get('method', 'baseline')
+        params = smart_post_cfg.get('params', {})
+        
+        if 'threshold' in smart_post_cfg and smart_post_cfg['threshold'] is not None:
+            actual_threshold = smart_post_cfg.get('threshold', 0.5)
+        else:
+            actual_threshold = threshold
+        
+        binary_mask_pre = (prob_map > actual_threshold).astype(np.uint8)
+        
+        if method == "baseline":
+            binary_mask = binary_mask_pre
+        elif method == "lcc":
+            labeled, num_features = ndimage.label(binary_mask_pre)
+            if num_features > 0:
+                sizes = ndimage.sum(binary_mask_pre, labeled, range(1, num_features + 1))
+                largest_label = int(np.argmax(sizes)) + 1
+                binary_mask = (labeled == largest_label).astype(np.uint8)
+            else:
+                binary_mask = binary_mask_pre
+        elif method == "remove_small":
+            min_size = int(params.get("min_size", 0))
+            if min_size > 0:
+                labeled, num_features = ndimage.label(binary_mask_pre)
+                if num_features > 0:
+                    sizes = ndimage.sum(binary_mask_pre, labeled, range(1, num_features + 1))
+                    mask_filtered = np.zeros_like(binary_mask_pre, dtype=np.uint8)
+                    for i, size in enumerate(sizes, start=1):
+                        if size >= min_size:
+                            mask_filtered[labeled == i] = 1
+                    binary_mask = mask_filtered
+                else:
+                    binary_mask = binary_mask_pre
+            else:
+                binary_mask = binary_mask_pre
+        else:
+            binary_mask = binary_mask_pre
+    else:
+        actual_threshold = threshold
+        binary_mask = (prob_map > actual_threshold).astype(np.uint8)
+    
+    # 【关键修复】确保 binary_mask 是 0-255 范围（用于显示）
+    # 如果 binary_mask 是 0/1 范围，乘以 255
+    if binary_mask.max() <= 1.0:
+        binary_mask = (binary_mask * 255).astype(np.uint8)
+    else:
+        # 如果已经是 0-255 范围，确保是 uint8
+        binary_mask = np.clip(binary_mask, 0, 255).astype(np.uint8)
+    
+    metadata = {
+        'input_tensor_min': input_tensor_min,
+        'input_tensor_max': input_tensor_max,
+        'input_tensor_mean': input_tensor_mean,
+        'actual_threshold': actual_threshold
+    }
+    
+    return prob_map, binary_mask, metadata
+
+
+def predict_api(image_bytes: bytes, api_url: str = "http://127.0.0.1:8000/predict", return_prob_map: bool = True) -> tuple:
+    """
+    API 推理函数
+    
+    Args:
+        image_bytes: 图像文件的二进制数据
+        api_url: API 服务地址
+        return_prob_map: 是否返回概率图（用于调试）
+    
+    Returns:
+        (prob_map, binary_mask, metadata): 
+        - prob_map: 概率图 (H, W) float32 [0, 1]，如果失败返回 None
+        - binary_mask: 二值化 Mask (H, W) uint8，如果失败返回 None
+        - metadata: 包含阈值等信息的字典
+    """
+    try:
+        files = {"file": ("image.tif", image_bytes, "image/tiff")}
+        params = {"return_prob_map": return_prob_map}
+        response = requests.post(api_url, files=files, params=params, timeout=30)
+        
+        if response.status_code == 200:
+            if return_prob_map:
+                # 解析 JSON 响应
+                import base64
+                # 检查响应内容类型
+                content_type = response.headers.get('content-type', '')
+                if 'application/json' not in content_type:
+                    # 如果返回的不是 JSON，可能是服务器不支持 return_prob_map 参数
+                    st.warning("⚠️ 服务器不支持返回概率图，降级为仅返回 mask")
+                    mask_image = Image.open(io.BytesIO(response.content))
+                    binary_mask = np.array(mask_image, dtype=np.uint8)
+                    return None, binary_mask, {'mode': 'api', 'actual_threshold': 0.5}
+                
+                try:
+                    data = response.json()
+                except ValueError as e:
+                    st.error(f"❌ JSON 解析失败: {e}")
+                    st.error(f"响应内容: {response.text[:200]}")  # 显示前200个字符
+                    return None, None, {}
+                
+                # 解码概率图
+                prob_map_b64 = data.get("prob_map_data")
+                prob_map_shape = tuple(data.get("prob_map_shape"))
+                prob_map_bytes = base64.b64decode(prob_map_b64)
+                prob_map = np.frombuffer(prob_map_bytes, dtype=np.float32).reshape(prob_map_shape)
+                
+                # 解码二值化 mask
+                mask_b64 = data.get("binary_mask")
+                mask_bytes = base64.b64decode(mask_b64)
+                mask_image = Image.open(io.BytesIO(mask_bytes))
+                binary_mask = np.array(mask_image, dtype=np.uint8)
+                
+                # 提取元数据
+                metadata = {
+                    'mode': 'api',
+                    'actual_threshold': data.get('threshold', 0.5),
+                    'prob_map_min': data.get('prob_map_min', 0.0),
+                    'prob_map_max': data.get('prob_map_max', 1.0),
+                    'prob_map_mean': data.get('prob_map_mean', 0.0)
+                }
+                
+                return prob_map, binary_mask, metadata
+            else:
+                # 向后兼容：只返回 PNG 图像
+                mask_image = Image.open(io.BytesIO(response.content))
+                binary_mask = np.array(mask_image, dtype=np.uint8)
+                return None, binary_mask, {'mode': 'api', 'actual_threshold': 0.5}
+        else:
+            st.error(f"❌ API 请求失败: {response.status_code} - {response.text}")
+            return None, None, {}
+    except requests.exceptions.ConnectionError:
+        st.error("❌ 无法连接到 API 服务，请确保 `server.py` 正在运行")
+        return None, None, {}
+    except Exception as e:
+        st.error(f"❌ API 调用失败: {e}")
+        return None, None, {}
+
+
 # ==================== 主应用 ====================
 
 def main():
@@ -403,42 +634,77 @@ def main():
     with st.sidebar:
         st.header("📋 配置")
         
-        # 模型文件上传
-        model_file = st.file_uploader(
-            "上传模型文件 (.pth)",
-            type=['pth'],
-            help="请上传训练好的模型权重文件"
+        # 【新增】推理模式选择器
+        inference_mode = st.radio(
+            "推理模式 (Inference Mode)",
+            options=["API 服务 (推荐)", "本地调试 (Local)"],
+            index=0,  # 默认选择 API 服务
+            help="API 服务：使用 FastAPI 后端（快速，无需加载模型）\n本地调试：在本地加载模型（适合测试不同权重）"
         )
+        
+        st.markdown("---")
+        
+        # 模型文件上传（仅在本地模式下显示）
+        model_file = None
+        if inference_mode == "本地调试 (Local)":
+            model_file = st.file_uploader(
+                "上传模型文件 (.pth)",
+                type=['pth'],
+                help="请上传训练好的模型权重文件"
+            )
+        else:
+            # API 模式：显示提示信息
+            st.info("🌐 **API 模式**：使用后端服务，无需上传模型")
+            st.caption("确保 `server.py` 正在运行（`python server.py`）")
+        
+        # 设备选择（仅在本地模式下使用）
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if inference_mode == "本地调试 (Local)" and device == "cpu":
+            st.warning("⚠️ 未检测到 GPU，将使用 CPU 推理（速度较慢）")
         
         # 设备选择
         device = "cuda" if torch.cuda.is_available() else "cpu"
         if device == "cpu":
             st.warning("⚠️ 未检测到 GPU，将使用 CPU 推理（速度较慢）")
         
-        # 加载模型
+        # 加载模型（仅在本地模式下）
         model = None
         model_type = None
         mode = None
         
-        if model_file is not None:
-            # 保存上传的文件到临时目录
-            temp_dir = Path("temp_uploads")
-            temp_dir.mkdir(exist_ok=True)
-            model_path = temp_dir / model_file.name
-            
-            with open(model_path, "wb") as f:
-                f.write(model_file.getbuffer())
-            
-            with st.spinner("🔄 正在加载模型..."):
-                model, model_type, mode = load_model(str(model_path), device)
-            
-            if model is not None:
-                st.success("✅ 模型加载成功")
-                st.info(f"**模型类型**: {model_type}")
-                st.info(f"**当前模式**: {mode}")
+        if inference_mode == "本地调试 (Local)":
+            if model_file is not None:
+                # 保存上传的文件到临时目录
+                temp_dir = Path("temp_uploads")
+                temp_dir.mkdir(exist_ok=True)
+                model_path = temp_dir / model_file.name
+                
+                with open(model_path, "wb") as f:
+                    f.write(model_file.getbuffer())
+                
+                with st.spinner("🔄 正在加载模型..."):
+                    model, model_type, mode = load_model(str(model_path), device)
+                
+                if model is not None:
+                    st.success("✅ 模型加载成功")
+                    st.info(f"**模型类型**: {model_type}")
+                    st.info(f"**当前模式**: {mode}")
+                else:
+                    st.error("❌ 模型加载失败")
+                    return
             else:
-                st.error("❌ 模型加载失败")
+                st.warning("⚠️ 请上传模型文件以开始")
                 return
+        else:
+            # API 模式：检查服务状态
+            try:
+                response = requests.get("http://127.0.0.1:8000/health", timeout=2)
+                if response.status_code == 200:
+                    st.success("✅ API 服务连接正常")
+                else:
+                    st.error("❌ API 服务异常")
+            except:
+                st.error("❌ 无法连接到 API 服务，请运行 `python server.py`")
         
         st.markdown("---")
         
@@ -553,9 +819,20 @@ def main():
     
     # ==================== Main Area ====================
     
-    if model is None:
+    # 检查模式状态
+    if inference_mode == "本地调试 (Local)" and model is None:
         st.info("👈 请在左侧上传模型文件以开始")
         return
+    elif inference_mode == "API 服务 (推荐)":
+        # API 模式：检查服务状态
+        try:
+            response = requests.get("http://127.0.0.1:8000/health", timeout=2)
+            if response.status_code != 200:
+                st.error("❌ API 服务异常，请检查 `server.py` 是否正常运行")
+                return
+        except:
+            st.error("❌ 无法连接到 API 服务，请运行 `python server.py`")
+            return
     
     # 批量图像文件上传
     st.subheader("📁 数据上传")
@@ -704,96 +981,152 @@ def main():
             if gt_image is None:
                 st.warning(f"⚠️ 加载 Mask 失败: {current_pair['mask'].name}")
     
-    # 推理
-    with st.spinner("🔄 正在推理..."):
-        with torch.no_grad():
-            # 根据模式预处理
-            if mode == "2.5D":
-                input_tensor = preprocess_image_for_2_5d(original_image)
-            else:
-                input_tensor = preprocess_image_for_2d(original_image)
-            
-            # 获取输入 Tensor 的统计信息（用于调试）
-            input_tensor_min = input_tensor.min().item()
-            input_tensor_max = input_tensor.max().item()
-            input_tensor_mean = input_tensor.mean().item()
-            
-            # 移动到设备
-            input_tensor = input_tensor.to(device)
-            
-            # 推理
-            output = model(input_tensor)
-            if isinstance(output, tuple):
-                output = output[0]
-            
-            # Sigmoid 激活
-            prob_map = torch.sigmoid(output[0, 0]).cpu().numpy()  # (H, W)
+    # 推理（根据模式选择）
+    prob_map = None
+    binary_mask = None
+    inference_metadata = {}
     
-    # 后处理
-    # 【关键修复】确定实际使用的阈值（优先使用手动选择的阈值进行调试）
-    actual_threshold = threshold  # 默认使用手动选择的阈值
-    
-    if use_smart_post and smart_post_cfg is not None:
-        method = smart_post_cfg.get('method', 'baseline')
-        params = smart_post_cfg.get('params', {})
-        # 如果配置中有阈值，使用配置的阈值；否则使用用户手动选择的阈值
-        if 'threshold' in smart_post_cfg and smart_post_cfg['threshold'] is not None:
-            actual_threshold = smart_post_cfg.get('threshold', 0.5)
-            st.info(f"🔧 **当前生效阈值**: {actual_threshold:.4f} (来自配置文件)")
-        else:
-            actual_threshold = threshold  # 使用用户手动选择的阈值
-            st.info(f"🔧 **当前生效阈值**: {actual_threshold:.4f} (手动选择)")
-        
-        # 【关键修复】_apply_strategy 内部硬编码了 0.5 阈值，所以我们需要绕过它
-        # 解决方案：先手动应用用户设定的阈值，然后对二值化结果直接应用后处理逻辑
-        binary_mask_pre = (prob_map > actual_threshold).astype(np.uint8)
-        
-        if method == "baseline":
-            # baseline方法：直接使用二值化结果
-            binary_mask = binary_mask_pre
-        elif method == "lcc":
-            # LCC方法：保留最大连通域
-            labeled, num_features = ndimage.label(binary_mask_pre)
-            if num_features > 0:
-                sizes = ndimage.sum(binary_mask_pre, labeled, range(1, num_features + 1))
-                largest_label = int(np.argmax(sizes)) + 1
-                binary_mask = (labeled == largest_label).astype(np.uint8)
-            else:
-                binary_mask = binary_mask_pre
-        elif method == "remove_small":
-            # remove_small方法：移除小区域
-            min_size = int(params.get("min_size", 0))
-            if min_size > 0:
-                labeled, num_features = ndimage.label(binary_mask_pre)
-                if num_features > 0:
-                    sizes = ndimage.sum(binary_mask_pre, labeled, range(1, num_features + 1))
-                    mask_filtered = np.zeros_like(binary_mask_pre, dtype=np.uint8)
-                    for i, size in enumerate(sizes, start=1):
-                        if size >= min_size:
-                            mask_filtered[labeled == i] = 1
-                    binary_mask = mask_filtered
+    if inference_mode == "API 服务 (推荐)":
+        # API 模式：调用后端服务
+        with st.spinner("🔄 正在调用 API 服务..."):
+            # 【关键修复】智能通道适配：优先保留 RGB 信息
+            # 1. 如果是 RGB 图像 (H, W, 3)，保留原样
+            if original_image.ndim == 3 and original_image.shape[2] == 3:
+                # RGB 图像：确保值在 [0, 255] 范围
+                if original_image.max() <= 1.0:
+                    img_for_api = (original_image * 255).astype(np.uint8)
                 else:
-                    binary_mask = binary_mask_pre
+                    img_for_api = np.clip(original_image, 0, 255).astype(np.uint8)
+                # 转换为 PIL Image (RGB 模式)
+                img_pil = Image.fromarray(img_for_api, mode='RGB')
+            elif original_image.ndim == 3 and original_image.shape[2] == 4:
+                # RGBA 图像：只取 RGB 通道
+                img_rgb = original_image[:, :, :3]
+                if img_rgb.max() <= 1.0:
+                    img_for_api = (img_rgb * 255).astype(np.uint8)
+                else:
+                    img_for_api = np.clip(img_rgb, 0, 255).astype(np.uint8)
+                img_pil = Image.fromarray(img_for_api, mode='RGB')
             else:
-                binary_mask = binary_mask_pre
-        else:
-            # 未知方法，回退到baseline
-            binary_mask = binary_mask_pre
+                # 灰度图像：转换为灰度模式
+                if original_image.ndim == 3:
+                    # 如果是 (H, W, 1)，降维
+                    if original_image.shape[2] == 1:
+                        original_image = original_image.squeeze(2)
+                    else:
+                        # 其他情况：转换为灰度（取平均值）
+                        original_image = np.mean(original_image, axis=2)
+                
+                # 确保是 2D 数组
+                if original_image.ndim != 2:
+                    raise ValueError(f"Expected 2D array after dimension cleaning, got shape {original_image.shape}")
+                
+                # 归一化到 [0, 255]
+                if original_image.max() <= 1.0:
+                    img_for_api = (original_image * 255).astype(np.uint8)
+                else:
+                    img_for_api = np.clip(original_image, 0, 255).astype(np.uint8)
+                
+                # 转换为 PIL Image (灰度模式)
+                img_pil = Image.fromarray(img_for_api, mode='L')
+            
+            # 将图像转换为字节流
+            img_byte_arr = io.BytesIO()
+            img_pil.save(img_byte_arr, format='TIFF')
+            img_byte_arr.seek(0)
+            
+            # 【新增】API 模式支持返回概率图
+            prob_map, binary_mask, api_metadata = predict_api(img_byte_arr.getvalue(), return_prob_map=True)
+            
+            if binary_mask is None:
+                st.error("❌ API 推理失败")
+                return
+            
+            # 使用 API 返回的元数据
+            inference_metadata = api_metadata.copy()
+            if prob_map is not None:
+                inference_metadata['prob_map_available'] = True
+            else:
+                inference_metadata['prob_map_available'] = False
+            
+            st.success("✅ API 推理完成")
     else:
-        # 【关键修复】直接使用手动选择的阈值，确保变量正确传递
-        actual_threshold = threshold
-        st.info(f"🔧 **当前生效阈值**: {actual_threshold:.4f} (手动选择)")
-        binary_mask = (prob_map > actual_threshold).astype(np.uint8)
+        # 本地模式：使用本地模型
+        with st.spinner("🔄 正在推理..."):
+            prob_map, binary_mask, inference_metadata = predict_local(
+                model=model,
+                original_image=original_image,
+                mode=mode,
+                device=device,
+                threshold=threshold,
+                use_smart_post=use_smart_post,
+                smart_post_cfg=smart_post_cfg
+            )
+            
+            actual_threshold = inference_metadata.get('actual_threshold', threshold)
+            input_tensor_min = inference_metadata.get('input_tensor_min', 0)
+            input_tensor_max = inference_metadata.get('input_tensor_max', 1)
+            input_tensor_mean = inference_metadata.get('input_tensor_mean', 0)
+            
+            st.info(f"🔧 **当前生效阈值**: {actual_threshold:.4f}")
+            
+            # 【调试】验证阈值是否生效
+            positive_pixels = binary_mask.sum()
+            total_pixels = binary_mask.size
+            st.caption(f"📊 **阈值验证**: 正像素数 = {positive_pixels} / {total_pixels} ({positive_pixels/total_pixels*100:.2f}%)")
     
-    # 【调试】验证阈值是否生效
-    positive_pixels = binary_mask.sum()
-    total_pixels = binary_mask.size
-    st.caption(f"📊 **阈值验证**: 正像素数 = {positive_pixels} / {total_pixels} ({positive_pixels/total_pixels*100:.2f}%)")
+    # 【关键修复】使用动态阈值生成用于 Dice 计算的 mask
+    # 如果有概率图，使用用户选择的阈值重新生成 mask；否则使用服务器返回的 binary_mask
+    dice_mask = None
+    if prob_map is not None:
+        # 确定实际使用的阈值（考虑智能后处理配置）
+        if use_smart_post and smart_post_cfg is not None:
+            if 'threshold' in smart_post_cfg and smart_post_cfg['threshold'] is not None:
+                dice_threshold = smart_post_cfg.get('threshold', threshold)
+            else:
+                dice_threshold = threshold
+        else:
+            dice_threshold = threshold
+        
+        # 从概率图生成二值化 mask（使用用户选择的阈值）
+        dice_mask = (prob_map > dice_threshold).astype(np.uint8)
+        
+        # 如果启用了智能后处理，应用后处理逻辑
+        if use_smart_post and smart_post_cfg is not None:
+            method = smart_post_cfg.get('method', 'baseline')
+            params = smart_post_cfg.get('params', {})
+            
+            if method == "lcc":
+                # LCC方法：保留最大连通域
+                labeled, num_features = ndimage.label(dice_mask)
+                if num_features > 0:
+                    sizes = ndimage.sum(dice_mask, labeled, range(1, num_features + 1))
+                    largest_label = int(np.argmax(sizes)) + 1
+                    dice_mask = (labeled == largest_label).astype(np.uint8)
+            elif method == "remove_small":
+                # remove_small方法：移除小区域
+                min_size = int(params.get("min_size", 0))
+                if min_size > 0:
+                    labeled, num_features = ndimage.label(dice_mask)
+                    if num_features > 0:
+                        sizes = ndimage.sum(dice_mask, labeled, range(1, num_features + 1))
+                        mask_filtered = np.zeros_like(dice_mask, dtype=np.uint8)
+                        for i, size in enumerate(sizes, start=1):
+                            if size >= min_size:
+                                mask_filtered[labeled == i] = 1
+                        dice_mask = mask_filtered
+    else:
+        # 如果没有概率图，使用服务器返回的 binary_mask（降级方案）
+        # 需要转换为 0/1 格式用于 Dice 计算
+        if binary_mask.max() > 1.0:
+            dice_mask = (binary_mask > 127).astype(np.uint8)
+        else:
+            dice_mask = binary_mask.astype(np.uint8)
     
     # 计算 Dice（如果有 GT）
     dice_score = None
-    if gt_image is not None:
-        dice_score = calculate_dice(binary_mask, gt_image)
+    if gt_image is not None and dice_mask is not None:
+        dice_score = calculate_dice(dice_mask, gt_image)
         # 在 Sidebar 显示 Dice
         with st.sidebar:
             st.markdown("---")
@@ -823,20 +1156,25 @@ def main():
                       f"Raw Max: {orig_metadata.get('raw_max', 'N/A'):.2f} | "
                       f"Raw Mean: {orig_metadata.get('raw_mean', 'N/A'):.2f}")
         
-        # 显示输入 Tensor 的统计信息
-        st.caption(f"Input Tensor Min: {input_tensor_min:.6f} | "
-                  f"Max: {input_tensor_max:.6f} | "
-                  f"Mean: {input_tensor_mean:.6f}")
-        
-        # 检查是否在 [0, 1] 范围内
-        if input_tensor_min < 0.0 or input_tensor_max > 1.0:
-            st.warning("⚠️ **警告**: 输入 Tensor 不在 [0, 1] 范围内！")
-        elif input_tensor_min == 0.0 and input_tensor_max == 0.0:
-            st.error("❌ **错误**: 输入 Tensor 全为 0（全黑）！")
-        elif input_tensor_min == 1.0 and input_tensor_max == 1.0:
-            st.error("❌ **错误**: 输入 Tensor 全为 1（全白）！")
-        else:
-            st.success("✅ 输入 Tensor 范围正常 [0, 1]")
+        # 显示输入 Tensor 的统计信息（仅本地模式）
+        if inference_mode == "本地调试 (Local)":
+            input_tensor_min = inference_metadata.get('input_tensor_min', 0)
+            input_tensor_max = inference_metadata.get('input_tensor_max', 1)
+            input_tensor_mean = inference_metadata.get('input_tensor_mean', 0)
+            
+            st.caption(f"Input Tensor Min: {input_tensor_min:.6f} | "
+                      f"Max: {input_tensor_max:.6f} | "
+                      f"Mean: {input_tensor_mean:.6f}")
+            
+            # 检查是否在 [0, 1] 范围内
+            if input_tensor_min < 0.0 or input_tensor_max > 1.0:
+                st.warning("⚠️ **警告**: 输入 Tensor 不在 [0, 1] 范围内！")
+            elif input_tensor_min == 0.0 and input_tensor_max == 0.0:
+                st.error("❌ **错误**: 输入 Tensor 全为 0（全黑）！")
+            elif input_tensor_min == 1.0 and input_tensor_max == 1.0:
+                st.error("❌ **错误**: 输入 Tensor 全为 1（全白）！")
+            else:
+                st.success("✅ 输入 Tensor 范围正常 [0, 1]")
     
     with col2:
         st.markdown("**Ground Truth**")
@@ -868,36 +1206,103 @@ def main():
     
     with col3:
         if show_prob_map:
-            # 调试模式：显示概率热力图
-            st.markdown("**概率热力图 (调试模式)**")
-            fig3, ax3 = plt.subplots(figsize=(5, 5))
-            im = ax3.imshow(prob_map, cmap='plasma', vmin=0, vmax=1)
-            ax3.set_title("Probability Map", fontsize=10)
-            ax3.axis('off')
-            plt.colorbar(im, ax=ax3, fraction=0.046, pad=0.04)
-            st.pyplot(fig3)
-            plt.close(fig3)
-            
-            # 显示概率统计
-            st.caption(f"**概率统计**: Min={prob_map.min():.4f}, Max={prob_map.max():.4f}, Mean={prob_map.mean():.4f}")
-            st.caption(f"**正样本像素数** (>0.5): {(prob_map > 0.5).sum()} / {prob_map.size} ({(prob_map > 0.5).sum() / prob_map.size * 100:.2f}%)")
-            st.caption(f"**正样本像素数** (>{threshold:.2f}): {(prob_map > threshold).sum()} / {prob_map.size} ({(prob_map > threshold).sum() / prob_map.size * 100:.2f}%)")
-        else:
+            # 调试模式：显示概率热力图（仅本地模式）
+            if prob_map is None:
+                st.warning("⚠️ API 模式下不提供概率热力图")
+                st.markdown("**Prediction**")
+            else:
+                st.markdown("**概率热力图 (调试模式)**")
+                fig3, ax3 = plt.subplots(figsize=(5, 5))
+                im = ax3.imshow(prob_map, cmap='plasma', vmin=0, vmax=1)
+                ax3.set_title("Probability Map", fontsize=10)
+                ax3.axis('off')
+                plt.colorbar(im, ax=ax3, fraction=0.046, pad=0.04)
+                st.pyplot(fig3)
+                plt.close(fig3)
+                
+                # 显示概率统计
+                st.caption(f"**概率统计**: Min={prob_map.min():.4f}, Max={prob_map.max():.4f}, Mean={prob_map.mean():.4f}")
+                st.caption(f"**正样本像素数** (>0.5): {(prob_map > 0.5).sum()} / {prob_map.size} ({(prob_map > 0.5).sum() / prob_map.size * 100:.2f}%)")
+                actual_threshold = inference_metadata.get('actual_threshold', threshold)
+                st.caption(f"**正样本像素数** (>{actual_threshold:.2f}): {(prob_map > actual_threshold).sum()} / {prob_map.size} ({(prob_map > actual_threshold).sum() / prob_map.size * 100:.2f}%)")
+        
+        # 显示预测结果（如果不在概率图模式，或API模式下）
+        if not show_prob_map or (show_prob_map and prob_map is None):
             # 正常模式：显示预测结果（二值化 Mask）
             st.markdown("**Prediction**")
-            # 【关键修复】确保Mask乘以255，并明确指定vmin/vmax
-            pred_display = (binary_mask * 255).astype(np.uint8)
+            
+            # 【关键修复】动态阈值：优先使用用户选择的阈值，从概率图重新生成 mask
+            if prob_map is not None:
+                # 如果有概率图，使用用户选择的阈值重新生成 mask
+                # 确定实际使用的阈值（考虑智能后处理配置）
+                if use_smart_post and smart_post_cfg is not None:
+                    # 智能后处理模式：优先使用配置文件中的阈值，否则使用用户选择的阈值
+                    if 'threshold' in smart_post_cfg and smart_post_cfg['threshold'] is not None:
+                        display_threshold = smart_post_cfg.get('threshold', threshold)
+                    else:
+                        display_threshold = threshold
+                else:
+                    # 手动阈值模式：使用用户选择的阈值
+                    display_threshold = threshold
+                
+                # 从概率图生成二值化 mask（使用用户选择的阈值）
+                pred_mask = (prob_map > display_threshold).astype(np.uint8)
+                
+                # 如果启用了智能后处理，应用后处理逻辑
+                if use_smart_post and smart_post_cfg is not None:
+                    method = smart_post_cfg.get('method', 'baseline')
+                    params = smart_post_cfg.get('params', {})
+                    
+                    if method == "lcc":
+                        # LCC方法：保留最大连通域
+                        labeled, num_features = ndimage.label(pred_mask)
+                        if num_features > 0:
+                            sizes = ndimage.sum(pred_mask, labeled, range(1, num_features + 1))
+                            largest_label = int(np.argmax(sizes)) + 1
+                            pred_mask = (labeled == largest_label).astype(np.uint8)
+                    elif method == "remove_small":
+                        # remove_small方法：移除小区域
+                        min_size = int(params.get("min_size", 0))
+                        if min_size > 0:
+                            labeled, num_features = ndimage.label(pred_mask)
+                            if num_features > 0:
+                                sizes = ndimage.sum(pred_mask, labeled, range(1, num_features + 1))
+                                mask_filtered = np.zeros_like(pred_mask, dtype=np.uint8)
+                                for i, size in enumerate(sizes, start=1):
+                                    if size >= min_size:
+                                        mask_filtered[labeled == i] = 1
+                                pred_mask = mask_filtered
+                
+                # 转换为 0-255 用于显示
+                pred_display = (pred_mask * 255).astype(np.uint8)
+                actual_threshold_used = display_threshold
+            else:
+                # 如果没有概率图，使用服务器返回的 binary_mask（降级方案）
+                if binary_mask.max() <= 1.0:
+                    pred_display = (binary_mask * 255).astype(np.uint8)
+                else:
+                    pred_display = binary_mask.astype(np.uint8)
+                # 使用服务器返回的阈值（可能不是用户选择的）
+                actual_threshold_used = inference_metadata.get('actual_threshold', threshold)
+                st.warning("⚠️ 无法获取概率图，使用服务器返回的 mask（阈值可能不匹配）")
+            
             # 确保值在0-255范围内
             pred_display = np.clip(pred_display, 0, 255).astype(np.uint8)
             
             fig3, ax3 = plt.subplots(figsize=(5, 5))
             
-            # 根据后处理模式设置标题（使用实际生效的阈值）
-            if use_smart_post and smart_post_cfg is not None:
+            # 根据后处理模式设置标题
+            if inference_mode == "API 服务 (推荐)":
+                if use_smart_post and smart_post_cfg is not None:
+                    method = smart_post_cfg.get('method', 'baseline')
+                    post_title = f"Prediction (API, {method}, 阈值={actual_threshold_used:.4f})"
+                else:
+                    post_title = f"Prediction (API, 阈值={actual_threshold_used:.4f})"
+            elif use_smart_post and smart_post_cfg is not None:
                 method = smart_post_cfg.get('method', 'baseline')
-                post_title = f"Prediction ({method}, 阈值={actual_threshold:.4f})"
+                post_title = f"Prediction ({method}, 阈值={actual_threshold_used:.4f})"
             else:
-                post_title = f"Prediction (阈值={actual_threshold:.4f})"
+                post_title = f"Prediction (阈值={actual_threshold_used:.4f})"
             
             # 【关键修复】明确指定vmin=0, vmax=255，确保Mask可见
             ax3.imshow(pred_display, cmap='gray', vmin=0, vmax=255)
@@ -905,6 +1310,9 @@ def main():
             ax3.axis('off')
             st.pyplot(fig3)
             plt.close(fig3)
+            
+            # 显示当前使用的阈值信息
+            st.caption(f"**当前显示阈值**: {actual_threshold_used:.4f} | 正像素: {(pred_display > 127).sum()} / {pred_display.size} ({(pred_display > 127).sum() / pred_display.size * 100:.2f}%)")
         
         # 在主区域也显示 Dice（如果存在）
         if dice_score is not None:
@@ -913,6 +1321,12 @@ def main():
     # ==================== 深度调试面板 ====================
     st.markdown("---")
     with st.expander("🔍 深度调试面板 (Debug Info)", expanded=True):
+        # API 模式下检查概率图是否可用
+        if inference_mode == "API 服务 (推荐)":
+            if prob_map is None or not inference_metadata.get('prob_map_available', False):
+                st.info("ℹ️ API 模式下概率图不可用（请确保服务器支持返回概率图）")
+                return
+        
         # 确定实际使用的阈值
         if use_smart_post and smart_post_cfg is not None:
             if 'threshold' in smart_post_cfg and smart_post_cfg['threshold'] is not None:
@@ -923,10 +1337,14 @@ def main():
             actual_threshold = threshold
         
         # 1. 显示概率统计数据
-        prob_min = prob_map.min()
-        prob_max = prob_map.max()
-        prob_mean = prob_map.mean()
-        prob_median = np.median(prob_map)
+        if prob_map is not None:
+            prob_min = prob_map.min()
+            prob_max = prob_map.max()
+            prob_mean = prob_map.mean()
+            prob_median = np.median(prob_map)
+        else:
+            st.warning("⚠️ 概率图不可用（API 模式）")
+            return
         
         col_stat1, col_stat2 = st.columns(2)
         with col_stat1:
@@ -988,29 +1406,30 @@ def main():
         st.pyplot(fig_hist)
         plt.close(fig_hist)
         
-        # 3. 阈值效果预览
-        st.markdown("**👁️ 阈值效果预览**")
-        col_preview1, col_preview2, col_preview3 = st.columns(3)
-        
-        # 预览不同阈值的效果
-        preview_thresholds = [actual_threshold * 0.5, actual_threshold, actual_threshold * 1.5]
-        preview_thresholds = [min(max(t, 0.0), 1.0) for t in preview_thresholds]  # 限制在[0, 1]
-        
-        for idx, (col, prev_thresh) in enumerate(zip([col_preview1, col_preview2, col_preview3], preview_thresholds)):
-            with col:
-                prev_mask = (prob_map > prev_thresh).astype(np.uint8) * 255
-                prev_display = np.clip(prev_mask, 0, 255).astype(np.uint8)
-                
-                fig_prev, ax_prev = plt.subplots(figsize=(3, 3))
-                ax_prev.imshow(prev_display, cmap='gray', vmin=0, vmax=255)
-                ax_prev.set_title(f'阈值={prev_thresh:.3f}', fontsize=9)
-                ax_prev.axis('off')
-                st.pyplot(fig_prev)
-                plt.close(fig_prev)
-                
-                # 显示像素统计
-                positive_pixels = (prob_map > prev_thresh).sum()
-                st.caption(f"正像素: {positive_pixels} ({positive_pixels/prob_map.size*100:.1f}%)")
+        # 3. 阈值效果预览（仅本地模式，需要概率图）
+        if prob_map is not None:
+            st.markdown("**👁️ 阈值效果预览**")
+            col_preview1, col_preview2, col_preview3 = st.columns(3)
+            
+            # 预览不同阈值的效果
+            preview_thresholds = [actual_threshold * 0.5, actual_threshold, actual_threshold * 1.5]
+            preview_thresholds = [min(max(t, 0.0), 1.0) for t in preview_thresholds]  # 限制在[0, 1]
+            
+            for idx, (col, prev_thresh) in enumerate(zip([col_preview1, col_preview2, col_preview3], preview_thresholds)):
+                with col:
+                    prev_mask = (prob_map > prev_thresh).astype(np.uint8) * 255
+                    prev_display = np.clip(prev_mask, 0, 255).astype(np.uint8)
+                    
+                    fig_prev, ax_prev = plt.subplots(figsize=(3, 3))
+                    ax_prev.imshow(prev_display, cmap='gray', vmin=0, vmax=255)
+                    ax_prev.set_title(f'阈值={prev_thresh:.3f}', fontsize=9)
+                    ax_prev.axis('off')
+                    st.pyplot(fig_prev)
+                    plt.close(fig_prev)
+                    
+                    # 显示像素统计
+                    positive_pixels = (prob_map > prev_thresh).sum()
+                    st.caption(f"正像素: {positive_pixels} ({positive_pixels/prob_map.size*100:.1f}%)")
 
 
 if __name__ == "__main__":

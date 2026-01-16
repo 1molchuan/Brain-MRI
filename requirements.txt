@@ -30,8 +30,11 @@ segmentation-models-pytorch>=0.3.0
 # Grad-CAM可视化（可选但推荐）
 pytorch-grad-cam>=1.4.0
 
-# Web应用框架（Streamlit App）
+# Web应用框架
 streamlit>=1.28.0
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+requests>=2.31.0
 
 # 医学图像格式支持
 nibabel>=3.2.0
