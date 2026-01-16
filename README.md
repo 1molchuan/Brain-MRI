@@ -106,9 +106,13 @@
 
 - 📊 **测试功能**
   - 多指标评估（Dice、IoU、Precision、Recall、Specificity、HD95）
-  - Brent 阈值优化 + 多进程并行
-  - 性能分析报告生成（MATLAB）
-  - 注意力热图可视化（Grad-CAM）
+  - Brent 阈值优化 + 多进程并行（30秒内完成阈值搜索）
+  - **MATLAB 性能分析报告生成**（可选）
+    - 性能分析柱状图（Dice、IoU、Precision、Recall）
+    - 测试结果可视化（原图、GT、预测对比）
+    - 训练历史曲线（Loss、Dice 变化趋势）
+    - 预测网格可视化
+  - 注意力热图可视化（Grad-CAM，测试时可用）
 
 - 🔮 **预测功能**
   - 单张/批量图像预测
@@ -156,7 +160,9 @@
 - **操作系统**: Windows 10/11, Linux, macOS
 - **Python**: 3.7 - 3.12
 - **CUDA**: 11.0+（如果使用 GPU）
-- **MATLAB**: R2020b+（可选，用于报告生成）
+- **MATLAB**: R2020b+（可选，用于性能分析报告生成）
+  - 如果未安装 MATLAB，系统会自动使用 Matplotlib 绘图
+  - MATLAB 功能包括：性能分析柱状图、测试结果可视化、训练历史曲线
 
 ---
 
@@ -589,12 +595,17 @@ for chunk in response.iter_content(chunk_size=None, decode_unicode=True):
 
 ### 评估功能
 - ✅ 多指标评估（Dice, IoU, Precision, Recall, Specificity, HD95）
-- ✅ **Brent 阈值优化 + 多进程并行** - 高效搜索最佳阈值（~15次评估，8核并行）
-- ✅ 性能分析报告生成（MATLAB）
+- ✅ **Brent 阈值优化 + 多进程并行** - 高效搜索最佳阈值（~15次评估，8核并行，30秒内完成）
+- ✅ **MATLAB 性能分析报告生成**（可选，需要 MATLAB R2020b+）
+  - 性能分析柱状图：显示全局指标（Dice、IoU、Precision、Recall）的均值和标准差
+  - 测试结果可视化：多样本对比展示（原图、GT、预测）
+  - 训练历史曲线：Loss 和 Dice 变化趋势
+  - 预测网格可视化：批量预测结果展示
 - ✅ 低 Dice 案例识别
-- ✅ 注意力热图可视化（Grad-CAM）
+- ✅ 注意力热图可视化（Grad-CAM，测试时可用，训练过程中已禁用以提升速度）
 - ✅ 空 Mask 特殊处理（双空=1.0，单空=0.0）
 - ✅ 样本级指标统计
+- ✅ **全局指标计算**：基于所有样本（包括空mask）的全局指标，确保与日志一致
 
 ### 预测功能
 - ✅ 单张/批量图像预测
@@ -671,7 +682,17 @@ for chunk in response.iter_content(chunk_size=None, decode_unicode=True):
 8. **使用 Brent 方法优化阈值**（自动启用，多进程并行加速）
 
 ### Q: 训练时 CUDA 内存不足？
-**A**: 尝试减小批次大小、降低图像分辨率、禁用混合精度训练、使用 CPU 训练或启用梯度累积。
+**A**: 尝试减小批次大小、降低图像分辨率、禁用混合精度训练、使用 CPU 训练或启用梯度累积。系统已优化训练流程，禁用训练过程中的注意力热力图生成以节省显存。
+
+### Q: MATLAB 性能分析报告如何启用？
+**A**: 
+1. 确保已安装 MATLAB R2020b+ 和 Python MATLAB Engine
+2. 在 PyQt5 GUI 中，MATLAB 功能会自动检测并启用
+3. 如果 MATLAB 不可用，系统会自动使用 Matplotlib 绘图
+4. 性能分析报告保存在 `worker/matlab_reports/` 目录下
+
+### Q: 性能分析图表显示的 Dice 值不正确？
+**A**: 已修复！现在系统使用全局指标（基于所有样本，包括空mask），与日志中的 "Mean Dice (全样)" 保持一致。如果仍有问题，请检查日志中的调试信息。
 
 ### Q: 如何处理空掩码（无病灶）？
 **A**: 系统具有全面的空掩码处理机制：
@@ -725,7 +746,20 @@ medical-segmentation/
 
 ## 📈 更新日志
 
-### v2.6 (最新)
+### v2.7 (最新)
+- ✅ **MATLAB 性能分析报告优化**
+  - 修复性能分析图表 X 轴标签显示问题
+  - 修复 Dice 值显示错误（使用全局指标而非前景指标）
+  - 优化图表布局和标签可见性
+  - 支持 categorical 数组自动标签设置
+- ✅ **训练流程优化**
+  - 训练过程中禁用注意力热力图生成（提升速度，避免卡死）
+  - 优化显存使用，减少 OOM 错误
+- ✅ **全局指标计算修复**
+  - 确保性能分析图表使用全局指标（基于所有样本，包括空mask）
+  - 与日志中的 "Mean Dice (全样)" 保持一致
+
+### v2.6
 - ✅ **AI 辅助诊断功能**：集成 LLM（支持 OpenAI/DeepSeek/Moonshot）
   - Web App 侧边栏配置 AI 服务（API Key、Base URL、Model 等）
   - 自动提取预测结果元数据并生成诊断报告
