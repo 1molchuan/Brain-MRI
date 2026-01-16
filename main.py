@@ -4412,11 +4412,29 @@ if __name__ == "__main__":
     # 【Windows 多进程支持】在 if __name__ == '__main__' 中预热 MATLAB 引擎
     # 确保所有执行逻辑都在主进程中进行，避免多进程导入时的问题
     _warmup_matlab_engine()
+    
+    # 【重构版】启动常驻 MATLAB 引擎服务
+    try:
+        from utils.matlab_bridge import MatlabService
+        if MATLAB_ENGINE_AVAILABLE:
+            MatlabService.start()
+    except Exception as e:
+        print(f"⚠️ 启动 MATLAB 服务失败: {e}")
 
     # QApplication已在文件顶部导入，无需重复导入
     qt_app = QApplication(sys.argv)
     window = MedicalSegmentationApp()
     window.show()
-    sys.exit(qt_app.exec_())
+    
+    try:
+        sys.exit(qt_app.exec_())
+    finally:
+        # 【重构版】程序退出时关闭 MATLAB 引擎
+        try:
+            from utils.matlab_bridge import MatlabService
+            if MatlabService.is_running():
+                MatlabService.quit()
+        except Exception as e:
+            print(f"⚠️ 关闭 MATLAB 服务时出错: {e}")
 
 

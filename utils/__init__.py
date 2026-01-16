@@ -93,6 +93,7 @@ from utils.matlab_bridge import (
     MatlabCacheDataset,
     MatlabEngineSession,
     MatlabMetricsBridge,
+    MatlabService,
     MatlabVisualizationBridge,
 )
 
@@ -153,6 +154,7 @@ __all__ = [
     'MatlabCacheDataset',
     'MatlabEngineSession',
     'MatlabMetricsBridge',
+    'MatlabService',
     'MatlabVisualizationBridge',
     # 可视化函数
     'render_quick_preview_matplotlib',

@@ -2021,24 +2021,26 @@ class TrainThread(QThread):
                 if len(all_images) >= num_samples:
                     break
 
-        att_layer_payload = {'att1': [], 'att2': [], 'att3': [], 'att4': []}
-        for att_dict in all_attention_maps:
-            for key in att_layer_payload.keys():
-                if key in att_dict:
-                    att_layer_payload[key].append(att_dict[key])
+        # 【已禁用】不再准备 MATLAB 渲染所需的注意力数据，避免生成无用的空 .mat 文件
+        # att_layer_payload = {'att1': [], 'att2': [], 'att3': [], 'att4': []}
+        # for att_dict in all_attention_maps:
+        #     for key in att_layer_payload.keys():
+        #         if key in att_dict:
+        #             att_layer_payload[key].append(att_dict[key])
 
-        if self.enable_matlab_plots and self.matlab_viz_bridge:
-            try:
-                payload_path = self._save_attention_payload(all_images, all_masks, all_preds, att_layer_payload, "attention_visualization")
-                # 【持久化修复】保存到持久化目录
-                import time
-                timestamp = time.strftime("%Y%m%d_%H%M%S")
-                matlab_path = os.path.join(self.persistent_report_dir, f"attention_visualization_{timestamp}_matlab.png")
-                os.makedirs(os.path.dirname(matlab_path), exist_ok=True)
-                self.matlab_viz_bridge.render_attention_maps(payload_path, matlab_path)
-                return matlab_path
-            except Exception as exc:
-                print(f"[MATLAB Plot] 注意力可视化回退: {exc}")
+        # 【已禁用】训练过程中不再生成注意力热力图，以避免卡死和提升速度
+        # if self.enable_matlab_plots and self.matlab_viz_bridge:
+        #     try:
+        #         payload_path = self._save_attention_payload(all_images, all_masks, all_preds, att_layer_payload, "attention_visualization")
+        #         # 【持久化修复】保存到持久化目录
+        #         import time
+        #         timestamp = time.strftime("%Y%m%d_%H%M%S")
+        #         matlab_path = os.path.join(self.persistent_report_dir, f"attention_visualization_{timestamp}_matlab.png")
+        #         os.makedirs(os.path.dirname(matlab_path), exist_ok=True)
+        #         self.matlab_viz_bridge.render_attention_maps(payload_path, matlab_path)
+        #         return matlab_path
+        #     except Exception as exc:
+        #         print(f"[MATLAB Plot] 注意力可视化回退: {exc}")
         
         # 创建可视化 - 优化布局
         num_samples = min(num_samples, len(all_images))
@@ -3880,151 +3882,237 @@ class TrainThread(QThread):
                                 # 转换为 numpy 数组，确保是 double 类型
                                 dice_array = np.array(dice_values_clean, dtype=np.float64)
                                 
-                                # 直接保存为 .mat 文件，使用 MATLAB 脚本期望的字段名
-                                perf_payload_path = os.path.join(self.temp_dir, f"performance_metrics_epoch{epoch+1}_payload.mat")
-                                from scipy.io import savemat
-                                savemat(perf_payload_path, {
-                                    'dice_scores': dice_array,  # MATLAB 脚本期望的字段名
-                                    'iou_scores': np.array(epoch_metrics.get('iou', []), dtype=np.float64),
-                                    'precision_scores': np.array(epoch_metrics.get('precision', []), dtype=np.float64),
-                                    'recall_scores': np.array(epoch_metrics.get('recall', []), dtype=np.float64),
-                                })
+                                # 【强制修复】准备性能分析数据，按照 matlab_bridge.py 期望的格式
+                                # 【关键修复】直接使用验证循环中计算的全局指标（val_dice, avg_iou, avg_precision, avg_recall）
+                                # 这些是真正的全局指标（基于所有样本，包括空mask），与日志中的 "Mean Dice (全样)" 一致
+                                group_means = []
+                                group_stds = []
+                                metric_names = []
                                 
-                                # 【持久化修复】保存到持久化目录
-                                import time
-                                timestamp = time.strftime("%Y%m%d_%H%M%S")
-                                perf_analysis_path = os.path.join(self.persistent_report_dir, f"performance_analysis_epoch{epoch+1}_{timestamp}_matlab.png")
-                                os.makedirs(os.path.dirname(perf_analysis_path), exist_ok=True)
-                                self.matlab_viz_bridge.render_performance_analysis(perf_payload_path, perf_analysis_path)
-                                print(f"[高清渲染] 性能分析报表已保存到持久化目录: {perf_analysis_path}")
+                                # 【关键修复】使用验证循环中计算的全局指标变量
+                                # val_dice: 全局 Mean Dice (全样)，基于所有样本（1120个）
+                                # avg_iou, avg_precision, avg_recall: 全局指标，基于所有样本
+                                # 注意：这些变量在验证循环中计算，确保使用正确的全局指标
+                                
+                                # 获取全局 Dice（val_dice 应该总是存在）
+                                try:
+                                    global_dice = val_dice  # 全局 Mean Dice (全样)
+                                except NameError:
+                                    global_dice = float('nan')
+                                    print(f"[性能分析] 警告: val_dice 不存在，将使用 avg_epoch_metrics")
+                                
+                                # 获取全局 IoU, Precision, Recall（可能不存在，如果 val_total_count == 0）
+                                try:
+                                    global_iou = avg_iou if not np.isnan(avg_iou) else float('nan')
+                                except NameError:
+                                    global_iou = float('nan')
+                                
+                                try:
+                                    global_precision = avg_precision if not np.isnan(avg_precision) else float('nan')
+                                except NameError:
+                                    global_precision = float('nan')
+                                
+                                try:
+                                    global_recall = avg_recall if not np.isnan(avg_recall) else float('nan')
+                                except NameError:
+                                    global_recall = float('nan')
+                                
+                                global_metrics = {
+                                    'dice': global_dice,  # 使用 val_dice（全局 Mean Dice）
+                                    'iou': global_iou,
+                                    'precision': global_precision,
+                                    'recall': global_recall,
+                                }
+                                
+                                # 定义要使用的指标（按顺序）
+                                metric_keys = ['dice', 'iou', 'precision', 'recall']
+                                
+                                for metric_name in metric_keys:
+                                    # 【强制逻辑】优先使用全局指标变量
+                                    mean_val = global_metrics.get(metric_name, float('nan'))
+                                    
+                                    # 如果全局指标不可用，回退到 avg_epoch_metrics
+                                    if np.isnan(mean_val):
+                                        mean_val = avg_epoch_metrics.get(metric_name, float('nan'))
+                                        print(f"[性能分析] 警告: 全局指标 {metric_name} 不可用，使用 avg_epoch_metrics = {mean_val:.4f}")
+                                    else:
+                                        print(f"[性能分析] 使用全局指标: {metric_name} = {mean_val:.4f} (全样，与日志一致)")
+                                    
+                                    # 从 epoch_metrics 获取原始列表，用于计算标准差
+                                    raw_values = epoch_metrics.get(metric_name, [])
+                                    
+                                    if not np.isnan(mean_val) and len(raw_values) > 0:
+                                        # 过滤掉无效值（NaN, Inf）
+                                        valid_values = np.array([v for v in raw_values if np.isfinite(v)], dtype=np.float64)
+                                        if len(valid_values) > 0:
+                                            # 使用全局平均值（与日志中的 Mean Dice (全样) 一致）
+                                            group_means.append(float(mean_val))
+                                            # 计算标准差
+                                            std_val = np.std(valid_values)
+                                            group_stds.append(float(std_val))
+                                            metric_names.append(metric_name)
+                                
+                                # 检查是否有有效数据
+                                if len(group_means) == 0:
+                                    print(f"[性能分析] 警告: 没有有效的性能指标数据，跳过性能分析图生成")
+                                else:
+                                    # 转换为 numpy 数组
+                                    group_means = np.array(group_means, dtype=np.float64)
+                                    group_stds = np.array(group_stds, dtype=np.float64)
+                                    metric_names_array = np.array(metric_names, dtype='<U100')
+                                    
+                                    # 保存为 .mat 文件，使用 matlab_bridge.py 期望的字段名
+                                    perf_payload_path = os.path.join(self.temp_dir, f"performance_metrics_epoch{epoch+1}_payload.mat")
+                                    from scipy.io import savemat
+                                    payload = {
+                                        'avg_metrics_values': group_means,  # matlab_bridge.py 期望的字段名
+                                        'std_metrics_values': group_stds,   # matlab_bridge.py 期望的字段名
+                                        'avg_metrics_names': metric_names_array,  # matlab_bridge.py 期望的字段名
+                                    }
+                                    savemat(perf_payload_path, payload)
+                                    
+                                    # 【验证逻辑】打印保存的 keys，方便调试
+                                    print(f"[性能分析] 已保存 .mat 文件，包含的 keys: {list(payload.keys())}")
+                                    print(f"[性能分析] 指标数量: {len(group_means)}, 指标名称: {metric_names}")
+                                    # 打印指标值（整体，所有样本）
+                                    metric_values_str = ", ".join([f"{name}={val:.4f}" for name, val in zip(metric_names, group_means)])
+                                    print(f"[性能分析] 指标值（整体，所有样本）: {metric_values_str}")
+                                    
+                                    # 【持久化修复】保存到持久化目录
+                                    import time
+                                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+                                    perf_analysis_path = os.path.join(self.persistent_report_dir, f"performance_analysis_epoch{epoch+1}_{timestamp}_matlab.png")
+                                    os.makedirs(os.path.dirname(perf_analysis_path), exist_ok=True)
+                                    self.matlab_viz_bridge.render_performance_analysis(perf_payload_path, perf_analysis_path)
+                                    print(f"[高清渲染] 性能分析报表已保存到持久化目录: {perf_analysis_path}")
                             except Exception as exc:
                                 print(f"[高清渲染] 性能分析报表生成失败: {exc}")
                                 import traceback
                                 traceback.print_exc()
                         
-                        # 2. 生成注意力热力图（如果模型支持）
-                        # 【显存优化】使用临时eval模型
-                        temp_eval_model_for_att = model.eval() if not isinstance(model, nn.DataParallel) else model.module.eval()
-                        if self.use_ema and ema_model is not None and epoch >= self.ema_eval_start_epoch:
-                            temp_eval_model_for_att = ema_model.eval()
-                            if isinstance(model, nn.DataParallel):
-                                temp_eval_model_for_att = nn.DataParallel(temp_eval_model_for_att)
-                        
-                        if self._supports_attention_maps(temp_eval_model_for_att):
-                            try:
-                                # 收集注意力数据
-                                all_images_att = []
-                                all_masks_att = []
-                                all_preds_att = []
-                                att_layer_payload = {'att1': [], 'att2': [], 'att3': [], 'att4': []}
-                                
-                                # 【性能优化】只对前 2 个 batch 生成 Grad-CAM，其他 batch 跳过以提升速度
-                                max_gradcam_batches_att = 2  # 只对前 2 个 batch 生成 Grad-CAM（训练循环中）
-                                
-                                att_count = 0
-                                for batch_idx_att, batch_data in enumerate(val_loader):
-                                    if att_count >= 4:  # 只收集4个样本
-                                        break
-                                    if len(batch_data) == 3:
-                                        images, masks, _ = batch_data
-                                    else:
-                                        images, masks = batch_data
-                                    images, masks = images.to(device), masks.to(device)
-                                    
-                                    # 【性能优化】判断是否需要生成 Grad-CAM（仅前 2 个 batch）
-                                    need_gradcam_att = (batch_idx_att < max_gradcam_batches_att)
-                                    is_deeplabv3 = self.model_type in ("deeplabv3plus", "smp_deeplabv3plus")
-                                    
-                                    if need_gradcam_att:
-                                        # 需要 Grad-CAM 的样本：必须在 torch.enable_grad() 下运行
-                                        # 【DeepLabV3+ 兼容性 + Grad-CAM 集成】DeepLabV3+ 不支持 return_attention，使用 Grad-CAM
-                                        if is_deeplabv3:
-                                            # DeepLabV3+ 不支持 return_attention，先获取输出
-                                            with torch.enable_grad():
-                                                outputs = temp_eval_model_for_att(images)
-                                                # 使用 Grad-CAM 生成热力图（需要梯度）
-                                                actual_model = self._unwrap_model(temp_eval_model_for_att)
-                                                attention_maps = self._generate_gradcam_for_deeplabv3(actual_model, images, device)
-                                        else:
-                                            outputs, attention_maps = temp_eval_model_for_att(images, return_attention=True)
-                                    else:
-                                        # 不需要 Grad-CAM 的样本：使用 torch.no_grad() 加速
-                                        with torch.no_grad():
-                                            if is_deeplabv3:
-                                                # DeepLabV3+ 不需要注意力图，直接获取输出
-                                                outputs = temp_eval_model_for_att(images)
-                                                attention_maps = {}  # 不需要热力图
-                                            else:
-                                                # 其他模型：尝试获取注意力图，但不强制
-                                                try:
-                                                    outputs, attention_maps = temp_eval_model_for_att(images, return_attention=True)
-                                                except:
-                                                    # 如果获取失败，只获取输出
-                                                    outputs = temp_eval_model_for_att(images)
-                                                    attention_maps = {}
-                                    
-                                    # 如果不需要 Grad-CAM 且已收集足够样本，直接退出
-                                    if not need_gradcam_att and att_count >= 4:
-                                        break
-                                    
-                                    # 只处理需要可视化的样本（前 2 个 batch）
-                                    if need_gradcam_att:
-                                        preds = torch.sigmoid(outputs)
-                                        preds_binary = (preds > 0.5).float()
-                                        
-                                        for i in range(images.size(0)):
-                                            if att_count >= 4:
-                                                break
-                                            img = images[i].cpu().permute(1, 2, 0).numpy()
-                                            img = img * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
-                                            img = np.clip(img, 0, 1).astype(np.float32)
-                                            mask = masks[i, 0].cpu().numpy().astype(np.float32)
-                                            pred = preds_binary[i, 0].cpu().numpy().astype(np.float32)
-                                            
-                                            all_images_att.append(img)
-                                            all_masks_att.append(mask)
-                                            all_preds_att.append(pred)
-                                            
-                                            # 收集注意力图
-                                            for att_name in ['att1', 'att2', 'att3', 'att4']:
-                                                if att_name in attention_maps:
-                                                    att_np = attention_maps[att_name][i, 0].cpu().numpy()
-                                                    # 上采样到512x512
-                                                    from scipy.ndimage import zoom
-                                                    target_size = (512, 512)  # 提升分辨率以保留更多病灶边缘细节
-                                                    if att_np.shape != target_size:
-                                                        zoom_factors = (target_size[0] / att_np.shape[0], target_size[1] / att_np.shape[1])
-                                                        att_np = zoom(att_np, zoom_factors, order=1)
-                                                    att_layer_payload[att_name].append(att_np)
-                                            
-                                            att_count += 1
-                                        
-                                        # 【显存优化】删除注意力图收集的中间变量
-                                        del outputs, attention_maps, preds, preds_binary
-                                        if torch.cuda.is_available() and att_count % 2 == 0:
-                                            torch.cuda.empty_cache()
-                                
-                                if all_images_att:
-                                    att_payload = self._save_attention_payload(all_images_att, all_masks_att, all_preds_att, att_layer_payload, f"attention_epoch{epoch+1}")
-                                    # 【持久化修复】保存到持久化目录
-                                    import time
-                                    timestamp = time.strftime("%Y%m%d_%H%M%S")
-                                    att_path = os.path.join(self.persistent_report_dir, f"attention_visualization_epoch{epoch+1}_{timestamp}_matlab.png")
-                                    os.makedirs(os.path.dirname(att_path), exist_ok=True)
-                                    self.matlab_viz_bridge.render_attention_maps(att_payload, att_path)
-                                    print(f"[高清渲染] 注意力热力图已保存到持久化目录: {att_path}")
-                                
-                                # 【显存优化】删除注意力图相关变量
-                                del all_images_att, all_masks_att, all_preds_att, att_layer_payload
-                                if torch.cuda.is_available():
-                                    torch.cuda.empty_cache()
-                            except Exception as exc:
-                                print(f"[高清渲染] 注意力热力图生成失败: {exc}")
-                        # 【显存优化】删除临时eval模型
-                        if 'temp_eval_model_for_att' in locals():
-                            del temp_eval_model_for_att
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                        # 【已禁用】2. 生成注意力热力图（训练过程中不再生成，以避免卡死和提升速度）
+                        # # 【显存优化】使用临时eval模型
+                        # temp_eval_model_for_att = model.eval() if not isinstance(model, nn.DataParallel) else model.module.eval()
+                        # if self.use_ema and ema_model is not None and epoch >= self.ema_eval_start_epoch:
+                        #     temp_eval_model_for_att = ema_model.eval()
+                        #     if isinstance(model, nn.DataParallel):
+                        #         temp_eval_model_for_att = nn.DataParallel(temp_eval_model_for_att)
+                        # 
+                        # if self._supports_attention_maps(temp_eval_model_for_att):
+                        #     try:
+                        #         # 收集注意力数据
+                        #         all_images_att = []
+                        #         all_masks_att = []
+                        #         all_preds_att = []
+                        #         att_layer_payload = {'att1': [], 'att2': [], 'att3': [], 'att4': []}
+                        #         
+                        #         # 【性能优化】只对前 2 个 batch 生成 Grad-CAM，其他 batch 跳过以提升速度
+                        #         max_gradcam_batches_att = 2  # 只对前 2 个 batch 生成 Grad-CAM（训练循环中）
+                        #         
+                        #         att_count = 0
+                        #         for batch_idx_att, batch_data in enumerate(val_loader):
+                        #             if att_count >= 4:  # 只收集4个样本
+                        #                 break
+                        #             if len(batch_data) == 3:
+                        #                 images, masks, _ = batch_data
+                        #             else:
+                        #                 images, masks = batch_data
+                        #             images, masks = images.to(device), masks.to(device)
+                        #             
+                        #             # 【性能优化】判断是否需要生成 Grad-CAM（仅前 2 个 batch）
+                        #             need_gradcam_att = (batch_idx_att < max_gradcam_batches_att)
+                        #             is_deeplabv3 = self.model_type in ("deeplabv3plus", "smp_deeplabv3plus")
+                        #             
+                        #             if need_gradcam_att:
+                        #                 # 需要 Grad-CAM 的样本：必须在 torch.enable_grad() 下运行
+                        #                 # 【DeepLabV3+ 兼容性 + Grad-CAM 集成】DeepLabV3+ 不支持 return_attention，使用 Grad-CAM
+                        #                 if is_deeplabv3:
+                        #                     # DeepLabV3+ 不支持 return_attention，先获取输出
+                        #                     with torch.enable_grad():
+                        #                         outputs = temp_eval_model_for_att(images)
+                        #                         # 使用 Grad-CAM 生成热力图（需要梯度）
+                        #                         actual_model = self._unwrap_model(temp_eval_model_for_att)
+                        #                         attention_maps = self._generate_gradcam_for_deeplabv3(actual_model, images, device)
+                        #                 else:
+                        #                     outputs, attention_maps = temp_eval_model_for_att(images, return_attention=True)
+                        #             else:
+                        #                 # 不需要 Grad-CAM 的样本：使用 torch.no_grad() 加速
+                        #                 with torch.no_grad():
+                        #                     if is_deeplabv3:
+                        #                         # DeepLabV3+ 不需要注意力图，直接获取输出
+                        #                         outputs = temp_eval_model_for_att(images)
+                        #                         attention_maps = {}  # 不需要热力图
+                        #                     else:
+                        #                         # 其他模型：尝试获取注意力图，但不强制
+                        #                         try:
+                        #                             outputs, attention_maps = temp_eval_model_for_att(images, return_attention=True)
+                        #                         except:
+                        #                             # 如果获取失败，只获取输出
+                        #                             outputs = temp_eval_model_for_att(images)
+                        #                             attention_maps = {}
+                        #             
+                        #             # 如果不需要 Grad-CAM 且已收集足够样本，直接退出
+                        #             if not need_gradcam_att and att_count >= 4:
+                        #                 break
+                        #             
+                        #             # 只处理需要可视化的样本（前 2 个 batch）
+                        #             if need_gradcam_att:
+                        #                 preds = torch.sigmoid(outputs)
+                        #                 preds_binary = (preds > 0.5).float()
+                        #                 
+                        #                 for i in range(images.size(0)):
+                        #                     if att_count >= 4:
+                        #                         break
+                        #                     img = images[i].cpu().permute(1, 2, 0).numpy()
+                        #                     img = img * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
+                        #                     img = np.clip(img, 0, 1).astype(np.float32)
+                        #                     mask = masks[i, 0].cpu().numpy().astype(np.float32)
+                        #                     pred = preds_binary[i, 0].cpu().numpy().astype(np.float32)
+                        #                     
+                        #                     all_images_att.append(img)
+                        #                     all_masks_att.append(mask)
+                        #                     all_preds_att.append(pred)
+                        #                     
+                        #                     # 收集注意力图
+                        #                     for att_name in ['att1', 'att2', 'att3', 'att4']:
+                        #                         if att_name in attention_maps:
+                        #                             att_np = attention_maps[att_name][i, 0].cpu().numpy()
+                        #                             # 上采样到512x512
+                        #                             from scipy.ndimage import zoom
+                        #                             target_size = (512, 512)  # 提升分辨率以保留更多病灶边缘细节
+                        #                             if att_np.shape != target_size:
+                        #                                 zoom_factors = (target_size[0] / att_np.shape[0], target_size[1] / att_np.shape[1])
+                        #                                 att_np = zoom(att_np, zoom_factors, order=1)
+                        #                             att_layer_payload[att_name].append(att_np)
+                        #                     
+                        #                     att_count += 1
+                        #                 
+                        #                 # 【显存优化】删除注意力图收集的中间变量
+                        #                 del outputs, attention_maps, preds, preds_binary
+                        #                 if torch.cuda.is_available() and att_count % 2 == 0:
+                        #                     torch.cuda.empty_cache()
+                        #         
+                        #         if all_images_att:
+                        #             att_payload = self._save_attention_payload(all_images_att, all_masks_att, all_preds_att, att_layer_payload, f"attention_epoch{epoch+1}")
+                        #             # 【持久化修复】保存到持久化目录
+                        #             import time
+                        #             timestamp = time.strftime("%Y%m%d_%H%M%S")
+                        #             att_path = os.path.join(self.persistent_report_dir, f"attention_visualization_epoch{epoch+1}_{timestamp}_matlab.png")
+                        #             os.makedirs(os.path.dirname(att_path), exist_ok=True)
+                        #             self.matlab_viz_bridge.render_attention_maps(att_payload, att_path)
+                        #             print(f"[高清渲染] 注意力热力图已保存到持久化目录: {att_path}")
+                        #         
+                        #         # 【显存优化】删除注意力图相关变量
+                        #         del all_images_att, all_masks_att, all_preds_att, att_layer_payload
+                        #         if torch.cuda.is_available():
+                        #             torch.cuda.empty_cache()
+                        #     except Exception as exc:
+                        #         print(f"[高清渲染] 注意力热力图生成失败: {exc}")
+                        # # 【显存优化】删除临时eval模型
+                        # if 'temp_eval_model_for_att' in locals():
+                        #     del temp_eval_model_for_att
+                        # if torch.cuda.is_available():
+                        #     torch.cuda.empty_cache()
                     except Exception as exc:
                         print(f"[高清渲染] MATLAB 高清渲染过程出错: {exc}")
                         import traceback
