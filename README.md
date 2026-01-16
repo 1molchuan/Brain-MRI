@@ -1,4 +1,4 @@
-# 🏥 脑肿瘤分割系统 - AI智能分析平台
+# 🏥 脑肿瘤分割系统 - AI 医学影像智能分析平台
 
 <div align="center">
 
@@ -6,388 +6,237 @@
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.0.0+-orange.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)
+![Stars](https://img.shields.io/github/stars/1molchuan/Brain-MRI?style=social)
 
-**一个全面的医学图像分割系统，支持多种先进的深度学习模型架构，配备 Web 界面、API 服务和 AI 辅助诊断功能**
+**🚀 专业的医学图像分割系统 | 🧠 7+ 深度学习模型 | 🌐 现代化 Web 界面 | 🤖 AI 辅助诊断**
 
-[功能特性](#-主要特性) • [快速开始](#-快速开始) • [使用指南](#-使用指南) • [API 文档](#-api-文档) • [常见问题](#-常见问题)
+[✨ 特性](#-核心特性) • [🚀 快速开始](#-快速开始) • [📖 文档](#-使用指南) • [🔧 API](#-api-文档) • [❓ FAQ](#-常见问题)
 
 </div>
 
 ---
 
+## 🎯 项目亮点
+
+> 💡 **为什么选择本系统？**
+
+- ✅ **三端全覆盖** - Web 界面、桌面应用、RESTful API 三合一
+- ✅ **7+ 先进模型** - ImprovedUNet、ResNetUNet、TransUNet、DS-TransUNet、SwinUNet、U-Net++、DeepLabV3+
+- ✅ **极速阈值优化** - Brent 算法 + 多进程并行，30 秒内完成（vs 传统方法数分钟）
+- ✅ **智能后处理** - 数据驱动的自适应后处理策略，自动搜索最优配置
+- ✅ **AI 辅助诊断** - 集成 LLM（OpenAI/DeepSeek/Moonshot），自动生成诊断报告
+- ✅ **生产就绪** - Docker 支持、API 文档完善、性能优化到位
+
 ## 📋 目录
 
-- [概述](#-概述)
-- [主要特性](#-主要特性)
+- [核心特性](#-核心特性)
 - [系统要求](#-系统要求)
 - [快速开始](#-快速开始)
 - [使用指南](#-使用指南)
+- [模型架构](#-支持的模型架构)
 - [API 文档](#-api-文档)
-- [支持的模型架构](#-支持的模型架构)
 - [常见问题](#-常见问题)
 - [项目结构](#-项目结构)
 - [更新日志](#-更新日志)
+- [贡献指南](#-贡献)
 
----
+## ✨ 核心特性
 
-## 🎯 概述
+### 🎨 三端部署方案
 
-本系统是一个专为脑肿瘤分割任务设计的医学图像分割平台，提供三种使用方式：
+| 方式 | 适用场景 | 主要功能 |
+|------|---------|----------|
+| 🌐 **Web 应用** (`app.py`) | 快速演示、批量处理 | 批量上传、实时调节、AI 诊断、可视化分析 |
+| 🖥️ **桌面应用** (`main.py`) | 本地开发、完整工作流 | 模型训练、测试评估、批量预测、性能分析 |
+| 🔌 **API 服务** (`server.py`) | 生产部署、系统集成 | RESTful API、模型推理、AI 聊天接口 |
 
-1. **🌐 Streamlit Web App** (`app.py`) - 现代化的 Web 界面，支持批量图像处理、实时阈值调节和 AI 辅助诊断
-2. **🖥️ PyQt5 GUI** (`main.py`) - 功能完整的桌面应用，支持训练、测试、预测和性能分析
-3. **🔌 FastAPI 后端服务** (`server.py`) - RESTful API 服务，支持模型推理和 AI 聊天接口
+### 🧠 深度学习模型
 
-### 核心优势
+<details>
+<summary><b>点击展开查看 7+ 种支持的模型架构</b></summary>
 
-- ✅ **多模型架构支持** - 7+ 种先进的深度学习模型（ImprovedUNet、ResNetUNet、TransUNet、DS-TransUNet、SwinUNet、U-Net++、DeepLabV3+）
-- ✅ **智能后处理** - 数据驱动自适应后处理策略，自动搜索最优配置
-- ✅ **高效阈值优化** - Brent 方法 + 多进程并行，30 秒内完成阈值搜索
-- ✅ **AI 辅助诊断** - 集成 LLM（支持 OpenAI/DeepSeek/Moonshot），自动生成诊断报告
-- ✅ **批量处理** - 支持批量上传 2D 图像序列，自动配对原图和 Mask
-- ✅ **实时可视化** - 三列对比展示、概率热力图、深度调试面板
+- **ImprovedUNet** - 改进的 U-Net，集成注意力机制，适合小数据集
+- **ResNetUNet** - ResNet 编码器 + U-Net，支持预训练权重
+- **TransUNet** - Transformer + U-Net 混合架构
+- **DS-TransUNet** - 双尺度 Transformer，支持 GWO 优化
+- **SwinUNet** - Swin Transformer + U-Net，支持 GWO 优化
+- **U-Net++** (SMP) - 多编码器支持，ImageNet 预训练
+- **DeepLabV3+** (SMP) - 高精度分割，推荐用于生产环境
 
----
+</details>
 
-## ✨ 主要特性
+### 🚀 核心优势
 
-### 🌐 Streamlit Web App (`app.py`)
+| 功能 | 传统方法 | 本系统 |
+|------|---------|--------|
+| ⚡ **阈值优化** | 网格搜索，数分钟 | Brent 算法 + 多进程，**30 秒** |
+| 🎯 **后处理** | 手动调参 | 数据驱动自动搜索 |
+| 🤖 **AI 诊断** | 无 | 集成 LLM，自动生成报告 |
+| 📊 **可视化** | 基础图表 | 概率热力图、实时调试面板 |
+| 🔧 **部署** | 单一方式 | Web/桌面/API 三端全覆盖 |
 
-**核心功能：**
+### 🔬 智能处理流程
 
-- 📁 **批量图像上传**
-  - 支持批量上传 TIF 格式的 2D 图像序列
-  - 智能配对原图和对应的 `_mask.tif` 文件
-  - 自然排序，保证切片顺序正确
+```mermaid
+graph LR
+    A[图像输入] --> B[模型推理]
+    B --> C[Brent 阈值优化]
+    C --> D[智能后处理]
+    D --> E[结果输出]
+    E --> F[AI 诊断报告]
+```
 
-- 🔍 **切片浏览器**
-  - 使用滑块浏览整个图像序列
-  - 实时显示当前切片信息和 Dice 系数
-
-- 🎚️ **实时阈值调节**
-  - 通过滑块实时调节阈值（0.0-1.0）
-  - 立即查看预测结果变化
-  - 支持智能后处理配置
-
-- 📊 **三列对比展示**
-  - 原图、Ground Truth、预测结果并排显示
-  - 自动计算 Dice 系数（如果有 GT Mask）
-
-- 🎨 **可视化功能**
-  - 概率热力图（调试模式）
-  - 深度调试面板（概率分布直方图、阈值效果预览）
-  - 详细统计信息（Min/Max/Mean/Median）
-
-- 🤖 **AI 影像诊断助手**
-  - 在左侧边栏配置 AI 服务（API Key、Base URL、Model 等）
-  - 自动提取预测结果元数据（文件名、肿瘤像素数、Dice 系数等）
-  - 自动生成诊断报告
-  - 支持流式对话，实时显示 AI 回复
-  - 支持多种 LLM 服务（OpenAI、DeepSeek、Moonshot）
-
-- 🔧 **智能后处理集成**
-  - 支持上传 `best_postprocessing_config.json`
-  - 自动应用最优后处理策略（LCC、Remove-Small 等）
-  - 动态阈值配置
-
-- ⚙️ **推理模式选择**
-  - **API 服务模式**（推荐）：使用 FastAPI 后端，快速推理
-  - **本地调试模式**：在本地加载模型，适合测试不同权重
-
-### 🖥️ PyQt5 GUI (`main.py`)
-
-**核心功能：**
-
-- 🚀 **训练功能**
-  - 支持多种模型架构选择
-  - 实时训练监控和可视化
-  - 自动保存最佳模型
-  - 支持 GWO 优化（SwinUNet/DS-TransUNet）
-
-- 📊 **测试功能**
-  - 多指标评估（Dice、IoU、Precision、Recall、Specificity、HD95）
-  - Brent 阈值优化 + 多进程并行（30秒内完成阈值搜索）
-  - **MATLAB 性能分析报告生成**（可选）
-    - 性能分析柱状图（Dice、IoU、Precision、Recall）
-    - 测试结果可视化（原图、GT、预测对比）
-    - 训练历史曲线（Loss、Dice 变化趋势）
-    - 预测网格可视化
-  - 注意力热图可视化（Grad-CAM，测试时可用）
-
-- 🔮 **预测功能**
-  - 单张/批量图像预测
-  - 测试时增强（TTA）
-  - 智能后处理
-  - 结果可视化
-
-- 📈 **性能分析**
-  - 训练曲线实时显示
-  - Dice 系数变化趋势图
-  - 测试集分割结果可视化
-
-### 🔌 FastAPI 后端服务 (`server.py`)
-
-**核心功能：**
-
-- 🧠 **模型推理 API**
-  - `/predict` - 图像分割推理接口
-  - 支持返回概率图（JSON 格式）或二值化 Mask（PNG 格式）
-  - 自动应用智能后处理
-  - ImageNet 标准化预处理
-
-- 🤖 **AI 聊天 API**
-  - `/chat` - AI 辅助诊断聊天接口
-  - 支持流式响应（Server-Sent Events）
-  - 支持动态 LLM 配置（API Key、Base URL、Model 等）
-  - 自动整合上下文数据（预测结果元数据）
-
-- 🔍 **健康检查**
-  - `/health` - 服务健康检查接口
-  - `/` - API 信息接口
+**智能后处理策略**
+- ✅ LCC（最大连通域）- 去除噪点
+- ✅ Remove-Small - 移除小区域
+- ✅ 孔洞填充 - 提升完整性
+- ✅ 边缘平滑 - 修正锯齿
+- ✅ 形态学操作 - 开运算/闭运算
+- ✅ 动态阈值 - 自适应调整
+- ✅ 高置信度保护 - 保留微小病灶
 
 ---
 
 ## 📋 系统要求
 
-### 硬件要求
+| 组件 | 最低要求 | 推荐配置 |
+|------|---------|----------|
+| **GPU** | NVIDIA GPU (4GB+) | NVIDIA GPU (8GB+) |
+| **内存** | 8GB RAM | 16GB+ RAM |
+| **存储** | 10GB | 20GB+ |
+| **系统** | Windows 10/Linux/macOS | Windows 11/Ubuntu 20.04+ |
+| **Python** | 3.7 | 3.9 - 3.11 |
+| **CUDA** | 11.0+ | 11.8+ |
 
-- **GPU**: 推荐 NVIDIA GPU（支持 CUDA），显存 ≥ 4GB（推荐 ≥ 8GB）
-- **内存**: ≥ 8GB RAM（推荐 ≥ 16GB）
-- **存储**: ≥ 10GB 可用空间
-
-### 软件要求
-
-- **操作系统**: Windows 10/11, Linux, macOS
-- **Python**: 3.7 - 3.12
-- **CUDA**: 11.0+（如果使用 GPU）
-- **MATLAB**: R2020b+（可选，用于性能分析报告生成）
-  - 如果未安装 MATLAB，系统会自动使用 Matplotlib 绘图
-  - MATLAB 功能包括：性能分析柱状图、测试结果可视化、训练历史曲线
+> 💡 **可选**: MATLAB R2020b+（用于高级性能分析报告）
 
 ---
 
 ## 🚀 快速开始
 
-### 1. 克隆仓库
+### 一键启动
 
 ```bash
-git clone https://github.com/yourusername/medical-segmentation.git
-cd medical-segmentation
-```
+# 1. 克隆项目
+git clone https://github.com/1molchuan/Brain-MRI.git
+cd Brain-MRI
 
-### 2. 安装依赖
-
-```bash
+# 2. 安装依赖
 pip install -r requirements.txt
-```
 
-**核心依赖：**
-- `torch>=2.0.0` – PyTorch 深度学习框架
-- `torchvision>=0.15.0` – 与 PyTorch 版本匹配
-- `PyQt5>=5.15.0` – GUI 框架（桌面应用）
-- `streamlit>=1.28.0` – Web 框架（Web 应用）
-- `fastapi>=0.104.0` – API 框架（后端服务）
-- `uvicorn[standard]>=0.24.0` – ASGI 服务器
-- `openai>=1.0.0` – OpenAI SDK（AI 辅助诊断，可选）
-- `albumentations>=1.3.0` – 数据增强
-- `opencv-python>=4.5.0` – 图像处理
-- `scikit-image>=0.19.0` – 图像工具
-- `numpy>=1.21.0,<2.0.0` – 科学计算
-- `scipy>=1.7.0` – 科学计算
-- `segmentation-models-pytorch>=0.3.0` – SMP 库（U-Net++、DeepLabV3+）
-- `pytorch-grad-cam>=1.4.0` – Grad-CAM 可视化（可选）
+# 3. 选择启动方式
 
-### 3. 运行应用
-
-#### 方式一：Streamlit Web App（推荐）
-
-```bash
-# 启动 Web 应用
+# 方式 A: Web 应用（推荐新手）
 streamlit run app.py
-```
 
-然后在浏览器中打开显示的 URL（通常是 `http://localhost:8501`）
-
-**功能特点：**
-- 📁 批量上传 TIF 格式的 2D 图像序列
-- 🔍 智能配对原图和对应的 `_mask.tif` 文件
-- 🎚️ 实时阈值调节，立即查看预测结果变化
-- 🔧 智能后处理集成
-- 📊 三列对比展示（原图、Ground Truth、预测结果）
-- 🎨 概率热力图和深度调试面板
-- 🤖 AI 影像诊断助手（在侧边栏配置）
-
-#### 方式二：FastAPI 后端服务
-
-```bash
-# 启动 API 服务
+# 方式 B: API 服务（推荐生产环境）
 python server.py
-```
 
-服务将在 `http://127.0.0.1:8000` 启动
-
-**前置要求：**
-- 确保 `best_model.pth` 文件存在于项目根目录
-- （可选）`best_postprocessing_config.json` 用于智能后处理
-
-**API 端点：**
-- `GET /` - API 信息
-- `GET /health` - 健康检查
-- `POST /predict` - 图像分割推理
-- `POST /chat` - AI 辅助诊断聊天
-
-#### 方式三：PyQt5 GUI（桌面应用）
-
-```bash
-# 启动桌面应用
+# 方式 C: 桌面应用（完整功能）
 python main.py
 ```
 
-**功能特点：**
-- 🚀 完整的训练、测试、预测功能
-- 📊 实时训练监控和可视化
-- 📈 性能分析报告生成
-- 🎯 注意力热图可视化
+### 快速验证
+
+启动 Web 应用后，在浏览器访问 `http://localhost:8501`，按以下步骤测试：
+
+1. **上传图像** - 批量上传 TIF 格式图像（自动配对 `_mask.tif`）
+2. **选择模式** - 在侧边栏选择 "API 服务" 或 "本地调试"
+3. **查看结果** - 使用滑块浏览切片，实时调节阈值
+4. **AI 诊断** - 配置 AI 服务（可选），自动生成诊断报告
+
+> 💡 **提示**: 首次运行需要下载模型权重，请确保网络连接正常
 
 ---
 
 ## 📖 使用指南
 
-### Streamlit Web App 使用流程
+<details>
+<summary><b>🌐 Web 应用详细教程</b></summary>
 
-#### 1. 启动应用
+### 基础流程
+1. **启动服务** - `streamlit run app.py`
+2. **配置模式** - 侧边栏选择 "API 服务" 或 "本地调试"
+3. **上传图像** - 批量上传 TIF 图像（自动配对 mask）
+4. **调节参数** - 实时调整阈值，查看效果
+5. **AI 诊断** - 配置 LLM 服务，生成报告（可选）
 
+### 高级功能
+- **智能后处理** - 上传 `best_postprocessing_config.json`
+- **深度调试** - 查看概率分布直方图和阈值预览
+- **批量分析** - 切片浏览器快速查看所有结果
+
+</details>
+
+<details>
+<summary><b>🔌 API 服务使用指南</b></summary>
+
+### 启动服务
 ```bash
-streamlit run app.py
+python server.py  # 默认端口 8000
 ```
 
-#### 2. 配置推理模式
-
-在左侧边栏选择推理模式：
-- **API 服务（推荐）**：使用 FastAPI 后端，快速推理
-- **本地调试（Local）**：在本地加载模型，适合测试不同权重
-
-#### 3. 上传模型（本地模式）
-
-如果选择"本地调试"模式，需要在侧边栏上传模型文件（`.pth`）
-
-#### 4. 上传图像
-
-在主区域批量上传 TIF 格式的 2D 图像序列：
-- 支持格式：`.tif`, `.tiff`
-- 系统会自动识别并配对原图和对应的 `_mask.tif` 文件
-- 例如：`image1.tif` 和 `image1_mask.tif` 会自动配对
-
-#### 5. 配置后处理（可选）
-
-在侧边栏上传 `best_postprocessing_config.json` 以启用智能后处理：
-- 自动应用最优后处理策略
-- 或使用手动阈值调节
-
-#### 6. 浏览结果
-
-- 使用切片浏览器选择要查看的图像
-- 实时调节阈值，立即查看预测结果变化
-- 查看三列对比（原图、Ground Truth、预测结果）
-- 使用深度调试面板分析概率分布和阈值效果
-
-#### 7. 使用 AI 辅助诊断
-
-在左侧边栏的"🤖 AI 服务配置"中：
-1. 填写 **API 服务地址**（默认：`http://127.0.0.1:8000`）
-2. 填写 **LLM API Key**（OpenAI/DeepSeek/Moonshot）
-3. 选择或填写 **LLM Base URL**（如 `https://api.deepseek.com/v1`）
-4. 选择 **模型名称**（如 `deepseek-chat`、`gpt-3.5-turbo`）
-5. 调整高级参数（Temperature、Max Tokens，可选）
-
-完成预测后，系统会自动提取元数据并发送给 AI，生成诊断报告。
-
-### FastAPI 后端服务使用
-
-#### 1. 准备模型文件
-
-确保 `best_model.pth` 文件存在于项目根目录：
+### 配置环境变量（AI 功能）
 ```bash
-# 模型文件应位于项目根目录
-best_model.pth
+export OPENAI_API_KEY="your_key"
+export LLM_BASE_URL="https://api.deepseek.com/v1"
+export LLM_MODEL="deepseek-chat"
 ```
 
-（可选）准备后处理配置文件：
-```bash
-best_postprocessing_config.json
+### 调用示例
+```python
+import requests
+
+# 图像分割推理
+with open("brain.tif", "rb") as f:
+    response = requests.post(
+        "http://127.0.0.1:8000/predict?return_prob_map=true",
+        files={"file": f}
+    )
+    result = response.json()
+
+# AI 诊断聊天
+response = requests.post(
+    "http://127.0.0.1:8000/chat",
+    json={
+        "messages": [{"role": "user", "content": "请分析这张影像"}],
+        "context_data": {"文件名": "brain.tif"},
+        "llm_config": {
+            "api_key": "your_key",
+            "base_url": "https://api.deepseek.com/v1",
+            "model": "deepseek-chat"
+        }
+    },
+    stream=True
+)
 ```
 
-#### 2. 启动服务
+</details>
 
-```bash
-python server.py
-```
+<details>
+<summary><b>🖥️ 桌面应用使用指南</b></summary>
 
-服务将在 `http://127.0.0.1:8000` 启动
+### 训练工作流
+1. **选择数据** - 指定训练/验证数据目录
+2. **配置模型** - 选择架构（推荐：DeepLabV3+）
+3. **设置参数** - 轮次、批次大小、学习率等
+4. **开始训练** - 实时监控 Loss 和 Dice 曲线
+5. **自动保存** - 最佳模型自动保存为 `best_model.pth`
 
-#### 3. 配置 LLM（可选）
+### 测试评估
+1. **加载模型** - 选择训练好的 `.pth` 文件
+2. **选择数据** - 指定测试数据目录
+3. **配置选项** - 启用 TTA、Grad-CAM 等
+4. **开始测试** - 自动优化阈值（Brent 算法）
+5. **查看报告** - MATLAB 性能分析报告（如果可用）
 
-如果使用 AI 辅助诊断功能，需要设置环境变量：
+### 批量预测
+1. **加载模型** - 选择 `.pth` 文件
+2. **添加图像** - 批量导入待预测图像
+3. **配置后处理** - 上传 `best_postprocessing_config.json`（可选）
+4. **开始预测** - 批量处理并导出结果
 
-```bash
-# Windows
-set OPENAI_API_KEY=your_api_key_here
-set LLM_BASE_URL=https://api.deepseek.com/v1
-set LLM_MODEL=deepseek-chat
-
-# Linux/macOS
-export OPENAI_API_KEY=your_api_key_here
-export LLM_BASE_URL=https://api.deepseek.com/v1
-export LLM_MODEL=deepseek-chat
-```
-
-#### 4. 使用 API
-
-**图像分割推理：**
-```bash
-curl -X POST "http://127.0.0.1:8000/predict?return_prob_map=true" \
-  -H "Content-Type: multipart/form-data" \
-  -F "file=@image.tif"
-```
-
-**AI 聊天接口：**
-```bash
-curl -X POST "http://127.0.0.1:8000/chat" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [{"role": "user", "content": "请分析这张影像"}],
-    "context_data": {"文件名": "image1.tif", "肿瘤像素数": "1234"},
-    "llm_config": {
-      "api_key": "your_api_key",
-      "base_url": "https://api.deepseek.com/v1",
-      "model": "deepseek-chat"
-    }
-  }'
-```
-
-### PyQt5 GUI 使用流程
-
-#### 1. 训练模型
-
-1. 选择数据目录
-2. 选择数据集类型（标准 / 2.5D）
-3. 选择模型架构
-4. 设置训练参数（轮次、批次大小、优化器等）
-5. 点击"开始训练"
-
-#### 2. 测试模型
-
-1. 加载训练好的模型文件（`.pth`）
-2. 选择测试数据目录
-3. 配置选项（模型架构、TTA 等）
-4. 点击"开始测试"
-
-#### 3. 预测图像
-
-1. 加载模型
-2. 添加图像（支持批量）
-3. 设置阈值
-4. 点击"开始预测"
+</details>
 
 ---
 

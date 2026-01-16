@@ -190,44 +190,46 @@ def load_image_file(file) -> Tuple[np.ndarray, Dict]:
 
 def preprocess_image_for_2d(image: np.ndarray) -> torch.Tensor:
     """
-    2D 模式：智能通道适配 - 优先保留 RGB 信息
-    - RGB 图像：保留原样，归一化后转换为 (1, 3, H, W)
-    - 灰度图像：归一化后复制3份转换为 (1, 3, H, W)
+    2D 模式：智能通道适配 + ImageNet 标准化
+    - RGB 图像：保留原样，归一化到 [0, 1] 后应用 ImageNet 标准化
+    - 灰度图像：归一化后复制3份，应用 ImageNet 标准化
+
+    【关键修复】添加 ImageNet 标准化，与 server.py 保持一致
     """
     # 确保是 float32 类型
     img_float = image.astype(np.float32)
-    
+
     # 处理RGB图像：如果已经是RGB，直接使用
     if len(img_float.shape) == 3 and img_float.shape[2] == 3:
         # RGB图像：保留原样，归一化到 [0, 1]
-        if img_float.max() > 1.0:
-            img_normalized = img_float / 255.0
+        img_max = img_float.max()
+        img_min = img_float.min()
+
+        # 【修复除零风险】统一的鲁棒归一化逻辑
+        if img_max > img_min:
+            img_normalized = (img_float - img_min) / (img_max - img_min)
+        elif img_max > 0:
+            img_normalized = img_float / img_max
         else:
-            # 如果已经在 [0, 1] 范围，使用 Min-Max 归一化确保完全在 [0, 1]
-            img_min = img_float.min()
-            img_max = img_float.max()
-            if img_max > img_min:
-                img_normalized = (img_float - img_min) / (img_max - img_min)
-            else:
-                img_normalized = np.zeros_like(img_float)
-        
+            img_normalized = np.zeros_like(img_float)
+
         img_normalized = np.clip(img_normalized, 0.0, 1.0)
-        
+
         # 转换为 (3, H, W) 格式: (H, W, 3) -> (3, H, W)
         stacked = np.transpose(img_normalized, (2, 0, 1))
     elif len(img_float.shape) == 3 and img_float.shape[2] == 4:
         # RGBA图像：只取RGB通道，忽略Alpha
         img_rgb = img_float[:, :, :3]
-        if img_rgb.max() > 1.0:
-            img_normalized = img_rgb / 255.0
+        img_max = img_rgb.max()
+        img_min = img_rgb.min()
+
+        if img_max > img_min:
+            img_normalized = (img_rgb - img_min) / (img_max - img_min)
+        elif img_max > 0:
+            img_normalized = img_rgb / img_max
         else:
-            img_min = img_rgb.min()
-            img_max = img_rgb.max()
-            if img_max > img_min:
-                img_normalized = (img_rgb - img_min) / (img_max - img_min)
-            else:
-                img_normalized = np.zeros_like(img_rgb)
-        
+            img_normalized = np.zeros_like(img_rgb)
+
         img_normalized = np.clip(img_normalized, 0.0, 1.0)
         stacked = np.transpose(img_normalized, (2, 0, 1))
     else:
@@ -242,57 +244,68 @@ def preprocess_image_for_2d(image: np.ndarray) -> torch.Tensor:
                 img_float = np.mean(img_float, axis=2)
         elif len(img_float.shape) != 2:
             raise ValueError(f"Expected 2D or 3D image, got shape {img_float.shape}")
-        
+
         # 归一化
         img_max = img_float.max()
-        if img_max > 1.0:
+        img_min = img_float.min()
+
+        if img_max > img_min:
+            img_normalized = (img_float - img_min) / (img_max - img_min)
+        elif img_max > 0:
             img_normalized = img_float / img_max
         else:
-            img_min = img_float.min()
-            if img_max > img_min:
-                img_normalized = (img_float - img_min) / (img_max - img_min)
-            else:
-                img_normalized = np.zeros_like(img_float)
-        
+            img_normalized = np.zeros_like(img_float)
+
         img_normalized = np.clip(img_normalized, 0.0, 1.0)
-        
+
         # 复制3份：stack = [img, img, img]
         stacked = np.stack([img_normalized, img_normalized, img_normalized], axis=0)  # (3, H, W)
-    
+
     # 转换为 Tensor: (1, 3, H, W)
     tensor = torch.from_numpy(stacked).float().unsqueeze(0)
-    
-    # 【Debug】打印 Tensor shape
+
+    # 【关键修复】应用 ImageNet 标准化（与 server.py 保持一致）
+    # ImageNet 预训练模型的标准化参数
+    IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
+    IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
+
+    # 标准化公式: (x - mean) / std
+    tensor = (tensor - IMAGENET_MEAN) / IMAGENET_STD
+
+    # 【Debug】打印 Tensor shape 和统计信息
     print(f"[Debug] preprocess_image_for_2d: Input Tensor Shape = {tensor.shape}")
-    
+    print(f"[Debug] preprocess_image_for_2d: Min={tensor.min().item():.4f}, Max={tensor.max().item():.4f}, Mean={tensor.mean().item():.4f}")
+
     return tensor
 
 
 def preprocess_image_for_2_5d(image: np.ndarray) -> torch.Tensor:
     """
-    2.5D 模式：智能通道适配 - 优先保留 RGB 信息
-    - RGB 图像：保留原样，归一化后转换为 (1, 3, H, W)
-    - 灰度图像：归一化后复制3份转换为 (1, 3, H, W)
+    2.5D 模式：智能通道适配 + ImageNet 标准化
+    - RGB 图像：保留原样，归一化到 [0, 1] 后应用 ImageNet 标准化
+    - 灰度图像：归一化后复制3份，应用 ImageNet 标准化
+
+    【关键修复】添加 ImageNet 标准化，与 server.py 保持一致
     """
     # 确保是 float32 类型
     img_float = image.astype(np.float32)
-    
+
     # 处理RGB图像：如果已经是RGB，直接使用
     if len(img_float.shape) == 3 and img_float.shape[2] == 3:
         # RGB图像：保留原样，归一化到 [0, 1]
-        if img_float.max() > 1.0:
-            img_normalized = img_float / 255.0
+        img_max = img_float.max()
+        img_min = img_float.min()
+
+        # 【修复除零风险】统一的鲁棒归一化逻辑
+        if img_max > img_min:
+            img_normalized = (img_float - img_min) / (img_max - img_min)
+        elif img_max > 0:
+            img_normalized = img_float / img_max
         else:
-            # 如果已经在 [0, 1] 范围，使用 Min-Max 归一化确保完全在 [0, 1]
-            img_min = img_float.min()
-            img_max = img_float.max()
-            if img_max > img_min:
-                img_normalized = (img_float - img_min) / (img_max - img_min)
-            else:
-                img_normalized = np.zeros_like(img_float)
-        
+            img_normalized = np.zeros_like(img_float)
+
         img_normalized = np.clip(img_normalized, 0.0, 1.0)
-        
+
         # 转换为 (3, H, W) 格式: (H, W, 3) -> (3, H, W)
         stacked = np.transpose(img_normalized, (2, 0, 1))
     else:
@@ -307,29 +320,38 @@ def preprocess_image_for_2_5d(image: np.ndarray) -> torch.Tensor:
                 img_float = np.mean(img_float, axis=2)
         elif len(img_float.shape) != 2:
             raise ValueError(f"Expected 2D or 3D image, got shape {img_float.shape}")
-        
+
         # 归一化
         img_max = img_float.max()
-        if img_max > 1.0:
+        img_min = img_float.min()
+
+        if img_max > img_min:
+            img_normalized = (img_float - img_min) / (img_max - img_min)
+        elif img_max > 0:
             img_normalized = img_float / img_max
         else:
-            img_min = img_float.min()
-            if img_max > img_min:
-                img_normalized = (img_float - img_min) / (img_max - img_min)
-            else:
-                img_normalized = np.zeros_like(img_float)
-        
+            img_normalized = np.zeros_like(img_float)
+
         img_normalized = np.clip(img_normalized, 0.0, 1.0)
-        
+
         # 复制3份：stack = [img, img, img]
         stacked = np.stack([img_normalized, img_normalized, img_normalized], axis=0)  # (3, H, W)
-    
+
     # 转换为 Tensor: (1, 3, H, W)
     tensor = torch.from_numpy(stacked).float().unsqueeze(0)
-    
-    # 【Debug】打印 Tensor shape
+
+    # 【关键修复】应用 ImageNet 标准化（与 server.py 保持一致）
+    # ImageNet 预训练模型的标准化参数
+    IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
+    IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
+
+    # 标准化公式: (x - mean) / std
+    tensor = (tensor - IMAGENET_MEAN) / IMAGENET_STD
+
+    # 【Debug】打印 Tensor shape 和统计信息
     print(f"[Debug] preprocess_image_for_2_5d: Input Tensor Shape = {tensor.shape}")
-    
+    print(f"[Debug] preprocess_image_for_2_5d: Min={tensor.min().item():.4f}, Max={tensor.max().item():.4f}, Mean={tensor.mean().item():.4f}")
+
     return tensor
 
 

@@ -99,15 +99,22 @@ def preprocess_image_for_api(image_bytes: bytes) -> torch.Tensor:
     
     # 3. 转换为 numpy 数组 (H, W, 3)，范围 [0, 255]
     img_array = np.array(img_resized, dtype=np.float32)
-    
+
     # 4. 归一化到 [0, 1]
-    # 前端传来的图片通常是 0-255 (uint8)，必须除以 255.0
-    if img_array.max() > 1.0:
-        img_normalized = img_array / 255.0
+    # 【修复】使用鲁棒的 Min-Max 归一化，与 app.py 保持完全一致
+    img_max = img_array.max()
+    img_min = img_array.min()
+
+    if img_max > img_min:
+        # 正常情况：Min-Max 归一化
+        img_normalized = (img_array - img_min) / (img_max - img_min)
+    elif img_max > 0:
+        # 所有值相同但不为0：除以最大值
+        img_normalized = img_array / img_max
     else:
-        # 如果已经在 [0, 1] 范围，直接使用
-        img_normalized = img_array
-    
+        # 全黑图像（所有像素=0）：设为0
+        img_normalized = np.zeros_like(img_array)
+
     # 确保值在 [0, 1] 范围内
     img_normalized = np.clip(img_normalized, 0.0, 1.0)
     
