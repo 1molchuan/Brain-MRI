@@ -110,37 +110,7 @@ from utils import *
 from models import *
 from worker import TrainThread, ModelTestThread, PredictThread
 
-# === 可选功能占位符类（如果未实现，将使用占位符） ===
-try:
-    # 尝试导入API相关类（如果存在）
-    from api_service import SegmentationAPIService, APIServerThread, create_segmentation_api
-except ImportError:
-    # 如果不存在，创建占位符类
-    class SegmentationAPIService:
-        """API服务占位符类"""
-        def __init__(self, *args, **kwargs):
-            raise NotImplementedError("SegmentationAPIService 需要实现。请创建 api_service.py 文件。")
-    
-    class APIServerThread(QThread):
-        """API服务器线程占位符类"""
-        def __init__(self, *args, **kwargs):
-            super().__init__()
-            raise NotImplementedError("APIServerThread 需要实现。请创建 api_service.py 文件。")
-    
-    def create_segmentation_api(service):
-        """创建API应用的占位符函数"""
-        raise NotImplementedError("create_segmentation_api 需要实现。请创建 api_service.py 文件。")
-
-try:
-    # 尝试导入AI助手相关类（如果存在）
-    from ai_assistant import AIAssistantThread
-except ImportError:
-    # 如果不存在，创建占位符类
-    class AIAssistantThread(QThread):
-        """AI助手线程占位符类"""
-        def __init__(self, *args, **kwargs):
-            super().__init__()
-            raise NotImplementedError("AIAssistantThread 需要实现。请创建 ai_assistant.py 文件。")
+# === API 和 AI 助手功能已移除 ===
 
 # 设置随机种子
 random.seed(42)
@@ -196,60 +166,9 @@ class MedicalSegmentationApp(QMainWindow):
         self.test_results = None
         self.low_dice_cases = []
         self.current_results = []
-        self.api_thread = None
-        self.api_model_path = None
-        self.api_service = None
-        self.ai_thread = None
-        self.llm_threshold_thread = None
         self.prediction_stats = None
         self.system_status_labels = {}
         self.tab_indexes = {}
-        # 默认使用旧API地址
-        self.ai_base_url = "https://models.sjtu.edu.cn/api/v1/chat/completions"
-        # 可选的API地址列表
-        self.ai_base_url_options = [
-            ("SJTU模型服务", "https://models.sjtu.edu.cn/api/v1/chat/completions"),
-            ("ChatAnywhere", "https://api.chatanywhere.tech/v1/chat/completions")
-        ]
-        self.ai_model_name = "deepseek-r1"
-        # 不同API服务支持的模型列表
-        self.ai_model_options_by_service = {
-            "https://models.sjtu.edu.cn/api/v1/chat/completions": [
-                ("DeepSeek-R1", "deepseek-r1"),
-                ("DeepSeek-V3", "deepseek-v3"),
-                ("Qwen3-Coder", "qwen3coder"),
-                ("Qwen3-VL", "qwen3vl")
-            ],
-            "https://api.chatanywhere.tech/v1/chat/completions": [
-                ("DeepSeek-R1", "deepseek-r1"),
-                ("DeepSeek-V3", "deepseek-v3"),
-                ("GPT-3.5 Turbo", "gpt-3.5-turbo"),
-                ("GPT-4o Mini", "gpt-4o-mini"),
-                ("GPT-4o", "gpt-4o"),
-                ("GPT-4.1 Mini", "gpt-4.1-mini"),
-                ("GPT-4.1 Nano", "gpt-4.1-nano"),
-                ("GPT-4.1", "gpt-4.1"),
-                ("GPT-5 Mini", "gpt-5-mini"),
-                ("GPT-5 Nano", "gpt-5-nano"),
-                ("GPT-5", "gpt-5")
-            ]
-        }
-        # 默认模型选项（SJTU服务）
-        self.ai_model_options = self.ai_model_options_by_service[self.ai_base_url]
-        # 不同API服务对应的默认API key
-        self.ai_api_key_by_service = {
-            "https://models.sjtu.edu.cn/api/v1/chat/completions": "",
-            "https://api.chatanywhere.tech/v1/chat/completions": ""
-        }
-        # 默认API key（当前服务的）
-        self.ai_api_key = self.ai_api_key_by_service.get(self.ai_base_url, "")
-        # 标记用户是否手动修改过API key
-        self.ai_key_manually_changed = False
-        self.ai_limits = {
-            "rpm": 100,
-            "tpm": 3000,
-            "weekly": 1_000_000
-        }
     
     def initUI(self):
         """主UI初始化方法"""
@@ -719,7 +638,6 @@ class MedicalSegmentationApp(QMainWindow):
         self.create_quick_nav_group(control_layout)
 
         # 初始化隐藏的API控件（不添加到界面，保持功能兼容）
-        self._init_hidden_api_controls(control_panel)
         
         # 其他控制组件...
         control_layout.addStretch()
@@ -783,90 +701,6 @@ class MedicalSegmentationApp(QMainWindow):
                 )
                 print(f"[MATLAB] 关闭引擎时出错: {e}")
 
-    def _init_hidden_api_controls(self, parent):
-        """创建但不显示API服务控件，保留相关功能兼容"""
-        self.api_control_container = QGroupBox("🌐 API服务", parent)
-        api_layout = QVBoxLayout(self.api_control_container)
-        api_layout.setSpacing(10)
-
-        self.api_model_label = QLabel("✗ 未选择API模型", self.api_control_container)
-        self.api_model_label.setWordWrap(True)
-        self.api_model_label.setStyleSheet("""
-            QLabel {
-                padding: 10px;
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #f8fafc, stop:1 #f1f5f9);
-                border: 2px dashed #cbd5e1;
-                border-radius: 8px;
-                color: #64748b;
-                font-size: 10pt;
-            }
-        """)
-        browse_api_model_btn = QPushButton("📁 选择API模型", self.api_control_container)
-        browse_api_model_btn.clicked.connect(self.browse_api_model)
-        browse_api_model_btn.setToolTip("选择用于API推理的已训练模型(.pth/.pt)")
-
-        host_layout = QHBoxLayout()
-        host_label = QLabel("地址:", self.api_control_container)
-        host_label.setMinimumWidth(60)
-        self.api_host_input = QLineEdit("0.0.0.0", self.api_control_container)
-        self.api_host_input.setPlaceholderText("0.0.0.0")
-        host_layout.addWidget(host_label)
-        host_layout.addWidget(self.api_host_input)
-
-        port_layout = QHBoxLayout()
-        port_label = QLabel("端口:", self.api_control_container)
-        port_label.setMinimumWidth(60)
-        self.api_port_spin = QSpinBox(self.api_control_container)
-        self.api_port_spin.setRange(1024, 65535)
-        self.api_port_spin.setValue(8000)
-        port_layout.addWidget(port_label)
-        port_layout.addWidget(self.api_port_spin)
-
-        device_layout = QHBoxLayout()
-        device_label = QLabel("设备:", self.api_control_container)
-        device_label.setMinimumWidth(60)
-        self.api_device_combo = QComboBox(self.api_control_container)
-        self.api_device_combo.addItem("自动选择", None)
-        self.api_device_combo.addItem("CPU", "cpu")
-        if torch.cuda.is_available():
-            self.api_device_combo.addItem("CUDA:0", "cuda:0")
-        device_layout.addWidget(device_label)
-        device_layout.addWidget(self.api_device_combo)
-
-        api_button_layout = QHBoxLayout()
-        api_button_layout.setSpacing(12)
-        self.api_start_btn = QPushButton("▶️ 启动API", self.api_control_container)
-        self.api_start_btn.clicked.connect(self.start_api_server)
-        self.api_stop_btn = QPushButton("⏹ 关闭API", self.api_control_container)
-        self.api_stop_btn.clicked.connect(self.stop_api_server)
-        self.api_stop_btn.setEnabled(False)
-        api_button_layout.addWidget(self.api_start_btn)
-        api_button_layout.addWidget(self.api_stop_btn)
-
-        self.api_status_label = QLabel("⚠️ API未运行", self.api_control_container)
-        self.api_status_label.setWordWrap(True)
-        self.api_status_label.setStyleSheet("""
-            QLabel {
-                padding: 10px;
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #fee2e2, stop:1 #fecaca);
-                border-left: 4px solid #dc2626;
-                border-radius: 8px;
-                color: #991b1b;
-                font-size: 10pt;
-            }
-        """)
-
-        api_layout.addWidget(self.api_model_label)
-        api_layout.addWidget(browse_api_model_btn)
-        api_layout.addLayout(host_layout)
-        api_layout.addLayout(port_layout)
-        api_layout.addLayout(device_layout)
-        api_layout.addLayout(api_button_layout)
-        api_layout.addWidget(self.api_status_label)
-        self.api_control_container.hide()
-
     def create_system_status_group(self, layout):
         """创建系统状态卡片"""
         status_group = QGroupBox("🛰 系统状态")
@@ -906,7 +740,6 @@ class MedicalSegmentationApp(QMainWindow):
             ("前往预测", "predict"),
             ("查看结果", "result"),
             ("性能分析", "analysis"),
-            ("AI助手", "assistant")
         ]
 
         for text, key in buttons:
@@ -988,8 +821,6 @@ class MedicalSegmentationApp(QMainWindow):
         # 模型测试标签页
         self.setup_model_test_tab()
 
-        # AI助手标签页
-        self.setup_ai_assistant_tab()
         
         self.main_layout.addWidget(self.tab_widget)
     
@@ -1435,27 +1266,7 @@ class MedicalSegmentationApp(QMainWindow):
         threshold_spin_layout.addWidget(self.threshold_spin)
         threshold_spin_layout.addStretch()
 
-        self.llm_threshold_btn = QPushButton("🤖 LLM推荐阈值")
-        self.llm_threshold_btn.setEnabled(False)
-        self.llm_threshold_btn.setToolTip("基于最近一次预测的概率统计，请求LLM给出更优阈值建议")
-        self.llm_threshold_btn.clicked.connect(self.request_llm_threshold)
-
-        self.llm_threshold_status = QLabel("需要先完成预测以生成统计数据")
-        self.llm_threshold_status.setWordWrap(True)
-        self.llm_threshold_status.setStyleSheet("""
-            QLabel {
-                padding: 10px 12px;
-                background: #f8fafc;
-                border-radius: 8px;
-                border-left: 4px solid #94a3b8;
-                color: #475569;
-                font-size: 10pt;
-            }
-        """)
-
         threshold_layout.addLayout(threshold_spin_layout)
-        threshold_layout.addWidget(self.llm_threshold_btn)
-        threshold_layout.addWidget(self.llm_threshold_status)
         threshold_group.setLayout(threshold_layout)
         
         # 预测按钮
@@ -2376,144 +2187,6 @@ class MedicalSegmentationApp(QMainWindow):
         self.test_results = None
         self.low_dice_cases = []
 
-    def setup_ai_assistant_tab(self):
-        """AI助手标签页"""
-        ai_tab = QWidget()
-        layout = QVBoxLayout()
-        layout.setSpacing(15)
-        layout.setContentsMargins(20, 20, 20, 20)
-
-        # API配置
-        config_group = QGroupBox("🔐 API配置")
-        config_layout = QVBoxLayout()
-        config_layout.setSpacing(10)
-
-        # API地址选择
-        url_layout = QHBoxLayout()
-        url_label = QLabel("接口地址:")
-        url_label.setMinimumWidth(80)
-        self.ai_url_combo = QComboBox()
-        for display, url in self.ai_base_url_options:
-            self.ai_url_combo.addItem(display, url)
-        # 设置当前选中的URL（匹配默认值）
-        current_index = 0
-        for i, (_, url) in enumerate(self.ai_base_url_options):
-            if url == self.ai_base_url:
-                current_index = i
-                break
-        self.ai_url_combo.setCurrentIndex(current_index)
-        self.ai_url_combo.currentIndexChanged.connect(self.on_api_url_changed)
-        self.ai_url_combo.setToolTip("选择要使用的API服务地址")
-        url_layout.addWidget(url_label)
-        url_layout.addWidget(self.ai_url_combo)
-        config_layout.addLayout(url_layout)
-        
-        self.ai_base_label = QLabel(f"当前地址: {self.ai_base_url}")
-        self.ai_base_label.setStyleSheet("color: #475569; font-weight: 600; font-size: 9pt;")
-        config_layout.addWidget(self.ai_base_label)
-
-        model_layout = QHBoxLayout()
-        model_label = QLabel("模型选择:")
-        model_label.setMinimumWidth(80)
-        self.ai_model_combo = QComboBox()
-        for display, value in self.ai_model_options:
-            self.ai_model_combo.addItem(display, value)
-        # 尝试设置当前模型，如果不存在则使用第一个
-        current_model_index = 0
-        for i in range(self.ai_model_combo.count()):
-            if self.ai_model_combo.itemData(i) == self.ai_model_name:
-                current_model_index = i
-                break
-        self.ai_model_combo.setCurrentIndex(current_model_index)
-        self.ai_model_combo.setToolTip("根据选择的API服务显示可用的模型列表\n切换API服务时会自动更新模型选项")
-        model_layout.addWidget(model_label)
-        model_layout.addWidget(self.ai_model_combo)
-        config_layout.addLayout(model_layout)
-
-        limits_text = (
-            f"资源限制：每分钟请求 {self.ai_limits['rpm']} 次、"
-            f"每分钟 {self.ai_limits['tpm']} tokens、"
-            f"每周 {self.ai_limits['weekly']:,} tokens"
-        )
-        limits_label = QLabel(limits_text)
-        limits_label.setWordWrap(True)
-        limits_label.setStyleSheet("""
-            QLabel {
-                background: #fef3c7;
-                border: 1px solid #f59e0b;
-                border-radius: 8px;
-                padding: 8px;
-                color: #92400e;
-            }
-        """)
-        config_layout.addWidget(limits_label)
-
-        key_layout = QHBoxLayout()
-        key_label = QLabel("API Key:")
-        key_label.setMinimumWidth(80)
-        self.ai_key_input = QLineEdit()
-        self.ai_key_input.setEchoMode(QLineEdit.Password)
-        self.ai_key_input.setPlaceholderText("请输入API Key")
-        self.ai_key_input.setText(self.ai_api_key)
-        # 连接信号，标记用户是否手动修改过API key
-        self.ai_key_input.textChanged.connect(self.on_api_key_changed)
-        key_layout.addWidget(key_label)
-        key_layout.addWidget(self.ai_key_input)
-        config_layout.addLayout(key_layout)
-
-        self.ai_status_label = QLabel("✅ 已就绪")
-        self.ai_status_label.setStyleSheet("""
-            QLabel {
-                padding: 8px 10px;
-                background: #dcfce7;
-                border-left: 4px solid #16a34a;
-                border-radius: 8px;
-                color: #166534;
-            }
-        """)
-        config_layout.addWidget(self.ai_status_label)
-
-        config_group.setLayout(config_layout)
-        layout.addWidget(config_group)
-
-        # 对话区域
-        conversation_group = QGroupBox("💬 对话")
-        convo_layout = QVBoxLayout()
-        convo_layout.setSpacing(10)
-
-        self.ai_prompt_input = QTextEdit()
-        self.ai_prompt_input.setPlaceholderText("请输入您想咨询的问题，例如：\n“如何提升当前分割模型的Dice指标？”")
-        self.ai_prompt_input.setMinimumHeight(120)
-
-        self.ai_response_view = QTextBrowser()
-        self.ai_response_view.setOpenExternalLinks(True)
-        self.ai_response_view.setReadOnly(True)
-        self.ai_response_view.setStyleSheet("background: #f8fafc;")
-        self.ai_response_view.setMinimumHeight(200)
-
-        button_layout = QHBoxLayout()
-        self.ai_send_btn = QPushButton("🚀 发送请求")
-        self.ai_send_btn.clicked.connect(self.send_ai_request)
-        self.ai_clear_btn = QPushButton("🧹 清空对话")
-        self.ai_clear_btn.clicked.connect(self.clear_ai_history)
-        button_layout.addWidget(self.ai_send_btn)
-        button_layout.addWidget(self.ai_clear_btn)
-
-        convo_layout.addWidget(QLabel("问题输入："))
-        convo_layout.addWidget(self.ai_prompt_input)
-        convo_layout.addLayout(button_layout)
-        convo_layout.addWidget(QLabel("AI回复："))
-        convo_layout.addWidget(self.ai_response_view)
-
-        conversation_group.setLayout(convo_layout)
-        layout.addWidget(conversation_group)
-        layout.addStretch()
-
-        ai_tab.setLayout(layout)
-        self.tab_widget.addTab(ai_tab, "🤖 AI助手")
-        self.tab_indexes["assistant"] = self.tab_widget.indexOf(ai_tab)
-    
-
     def browse_data_dir(self):
         """选择训练数据目录"""
         directory = QFileDialog.getExistingDirectory(self, "选择数据目录")
@@ -3084,25 +2757,6 @@ class MedicalSegmentationApp(QMainWindow):
         
         dialog.exec_()
     
-    def browse_api_model(self):
-        """选择API服务使用的模型"""
-        path, _ = QFileDialog.getOpenFileName(self, "选择API模型文件", "", "PyTorch模型 (*.pth *.pt)")
-        if path:
-            self.api_model_path = path
-            self.api_model_label.setText(f"✓ {path}")
-            self.api_model_label.setStyleSheet("""
-                QLabel {
-                    padding: 12px;
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                        stop:0 #dcfce7, stop:1 #bbf7d0);
-                    border: 2px solid #16a34a;
-                    border-radius: 8px;
-                    color: #166534;
-                    font-size: 10pt;
-                    font-weight: 500;
-                }
-            """)
-    
     def browse_input_images(self):
         """选择输入图像"""
         paths, _ = QFileDialog.getOpenFileNames(self, "选择图像文件", "", 
@@ -3158,233 +2812,6 @@ class MedicalSegmentationApp(QMainWindow):
         """处理保存结果checkbox状态变化"""
         # 如果取消勾选，允许不选输出目录；如果勾选，必须选择输出目录
         self.update_predict_btn_state()
-
-    def start_api_server(self):
-        """启动内置API服务"""
-        if self.api_thread and self.api_thread.isRunning():
-            QMessageBox.information(self, "提示", "API服务已经在运行中")
-            return
-
-        if not self.api_model_path or not os.path.exists(self.api_model_path):
-            QMessageBox.warning(self, "警告", "请先选择有效的API模型文件")
-            return
-
-        host = self.api_host_input.text().strip() or "0.0.0.0"
-        port = self.api_port_spin.value()
-        device = self.api_device_combo.currentData()
-
-        try:
-            self.api_service = SegmentationAPIService(self.api_model_path, device=device)
-        except Exception as exc:
-            QMessageBox.warning(self, "错误", f"模型加载失败: {exc}")
-            self.set_api_status(f"❌ 模型加载失败: {exc}", status="error")
-            self.api_service = None
-            return
-
-        self.api_thread = APIServerThread(self.api_service, host, port)
-        self.api_thread.status_changed.connect(self.on_api_status_changed)
-        self.api_thread.server_started.connect(self.on_api_started)
-        self.api_thread.server_stopped.connect(self.on_api_stopped)
-        self.api_thread.error_occurred.connect(self.on_api_error)
-        self.api_thread.finished.connect(self.on_api_thread_finished)
-        self.api_thread.start()
-
-        self.api_start_btn.setEnabled(False)
-        self.api_stop_btn.setEnabled(True)
-        self.set_api_status("⏳ API服务启动中...", status="info")
-
-    def stop_api_server(self):
-        """停止API服务"""
-        if self.api_thread and self.api_thread.isRunning():
-            self.api_thread.stop()
-            self.set_api_status("⏳ 正在停止API服务...", status="info")
-        else:
-            QMessageBox.information(self, "提示", "API服务当前未运行")
-
-    def on_api_status_changed(self, message):
-        self.set_api_status(message, status="info")
-
-    def on_api_started(self, message):
-        self.set_api_status(message, status="running")
-
-    def on_api_stopped(self, message):
-        self.set_api_status(message, status="info")
-        self.api_start_btn.setEnabled(True)
-        self.api_stop_btn.setEnabled(False)
-
-    def on_api_error(self, message):
-        self.set_api_status(f"❌ API错误: {message}", status="error")
-        QMessageBox.warning(self, "API错误", message)
-
-    def on_api_thread_finished(self):
-        self.api_thread = None
-        self.api_service = None
-        self.api_start_btn.setEnabled(True)
-        self.api_stop_btn.setEnabled(False)
-
-    def set_api_status(self, text, status="info"):
-        """更新API状态显示"""
-        styles = {
-            "info": """
-                QLabel {
-                    padding: 10px;
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                        stop:0 #e0f2fe, stop:1 #bae6fd);
-                    border-left: 4px solid #0284c7;
-                    border-radius: 8px;
-                    color: #075985;
-                    font-size: 10pt;
-                }
-            """,
-            "running": """
-                QLabel {
-                    padding: 10px;
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                        stop:0 #dcfce7, stop:1 #bbf7d0);
-                    border-left: 4px solid #16a34a;
-                    border-radius: 8px;
-                    color: #166534;
-                    font-size: 10pt;
-                }
-            """,
-            "error": """
-                QLabel {
-                    padding: 10px;
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                        stop:0 #fee2e2, stop:1 #fecaca);
-                    border-left: 4px solid #dc2626;
-                    border-radius: 8px;
-                    color: #991b1b;
-                    font-size: 10pt;
-                }
-            """
-        }
-        self.api_status_label.setStyleSheet(styles.get(status, styles["info"]))
-        self.api_status_label.setText(text)
-
-    def send_ai_request(self):
-        """发送远程AI请求"""
-        if self.ai_thread and self.ai_thread.isRunning():
-            QMessageBox.information(self, "提示", "正在等待上一条回复，请稍候。")
-            return
-
-        prompt = self.ai_prompt_input.toPlainText().strip()
-        if not prompt:
-            QMessageBox.warning(self, "警告", "请先输入问题")
-            return
-
-        api_key = self.ai_key_input.text().strip() or self.ai_api_key
-        if not api_key:
-            QMessageBox.warning(self, "警告", "请填写API Key")
-            return
-
-        self.append_ai_message("用户", prompt, is_markdown=False)
-        self.ai_send_btn.setEnabled(False)
-        self.set_ai_status_label("⏳ 正在请求AI服务...", status="info")
-
-        selected_model = self.ai_model_combo.currentData() or self.ai_model_combo.currentText()
-
-        self.ai_thread = AIAssistantThread(
-            base_url=self.ai_base_url,
-            model=selected_model,
-            api_key=api_key,
-            prompt=prompt
-        )
-        self.ai_thread.success.connect(self.on_ai_success)
-        self.ai_thread.error.connect(self.on_ai_error)
-        self.ai_thread.finished.connect(self.on_ai_finished)
-        self.ai_thread.start()
-
-    def on_ai_success(self, content: str):
-        self.append_ai_message("AI", content, is_markdown=True)
-        self.set_ai_status_label("✅ AI回复已收到", status="success")
-
-    def on_ai_error(self, message: str):
-        self.append_ai_message("系统", f"请求失败：{message}", is_markdown=False)
-        self.set_ai_status_label(f"❌ {message}", status="error")
-        QMessageBox.warning(self, "AI请求失败", message)
-
-    def on_ai_finished(self):
-        self.ai_send_btn.setEnabled(True)
-        self.ai_thread = None
-
-    def clear_ai_history(self):
-        self.ai_response_view.clear()
-        self.set_ai_status_label("🧼 对话已清空，等待新的问题", status="info")
-
-    def append_ai_message(self, role: str, message: str, is_markdown: bool = False):
-        """将聊天内容以HTML追加到对话框，支持Markdown渲染"""
-        if not hasattr(self, "ai_response_view"):
-            return
-
-        role_html = self.escape_html(role)
-        if is_markdown:
-            body_html = self.render_markdown_html(message)
-        else:
-            body_html = self.escape_html(message).replace("\n", "<br>")
-
-        html_block = f"""
-        <div style="padding:8px 0;">
-            <div style="font-weight:600;color:#0f172a;">{role_html}：</div>
-            <div style="margin-top:6px;color:#1e293b;line-height:1.6;">{body_html}</div>
-            <hr style="border:none;border-top:1px solid #e2e8f0;margin:12px 0;">
-        </div>
-        """
-        self.ai_response_view.moveCursor(QTextCursor.End)
-        self.ai_response_view.insertHtml(html_block)
-        self.ai_response_view.moveCursor(QTextCursor.End)
-        self.ai_response_view.verticalScrollBar().setValue(
-            self.ai_response_view.verticalScrollBar().maximum()
-        )
-
-    def render_markdown_html(self, text: str) -> str:
-        """将Markdown文本转换为HTML，缺少依赖时退回普通文本"""
-        try:
-            import markdown  # 延迟导入，避免强依赖
-
-            return markdown.markdown(
-                text,
-                extensions=["fenced_code", "tables", "nl2br"]
-            )
-        except Exception:
-            return self.escape_html(text).replace("\n", "<br>")
-
-    def escape_html(self, text: str) -> str:
-        """安全转义HTML"""
-        return html.escape(text or "", quote=False)
-
-    def set_ai_status_label(self, text, status="info"):
-        styles = {
-            "info": """
-                QLabel {
-                    padding: 8px 10px;
-                    background: #e0f2fe;
-                    border-left: 4px solid #0284c7;
-                    border-radius: 8px;
-                    color: #075985;
-                }
-            """,
-            "success": """
-                QLabel {
-                    padding: 8px 10px;
-                    background: #dcfce7;
-                    border-left: 4px solid #16a34a;
-                    border-radius: 8px;
-                    color: #166534;
-                }
-            """,
-            "error": """
-                QLabel {
-                    padding: 8px 10px;
-                    background: #fee2e2;
-                    border-left: 4px solid #dc2626;
-                    border-radius: 8px;
-                    color: #991b1b;
-                }
-            """
-        }
-        self.ai_status_label.setStyleSheet(styles.get(status, styles["info"]))
-        self.ai_status_label.setText(text)
 
     def compute_prediction_statistics(self, results):
         """根据预测概率生成统计信息"""
@@ -3442,222 +2869,6 @@ class MedicalSegmentationApp(QMainWindow):
             "thresholds": thresholds
         }
 
-    def on_api_key_changed(self, text):
-        """当用户手动修改API key时标记"""
-        # 检查当前输入的key是否等于当前服务的默认key
-        current_default_key = self.ai_api_key_by_service.get(self.ai_base_url, "")
-        if text.strip() != current_default_key:
-            self.ai_key_manually_changed = True
-        else:
-            # 如果用户改回了默认值，重置标记
-            self.ai_key_manually_changed = False
-    
-    def on_api_url_changed(self, index):
-        """当用户选择不同的API地址时更新模型选项"""
-        if index >= 0:
-            selected_url = self.ai_url_combo.itemData(index)
-            if selected_url:
-                # 保存旧URL，用于判断是否需要更新API key
-                old_url = self.ai_base_url
-                self.ai_base_url = selected_url
-                self.ai_base_label.setText(f"当前地址: {self.ai_base_url}")
-                
-                # 根据选择的API服务更新模型选项
-                if selected_url in self.ai_model_options_by_service:
-                    model_options = self.ai_model_options_by_service[selected_url]
-                    self.ai_model_options = model_options
-                    
-                    # 更新模型下拉框
-                    model_combo = getattr(self, "ai_model_combo", None)
-                    if model_combo:
-                        model_combo.clear()
-                        for display, value in model_options:
-                            model_combo.addItem(display, value)
-                        # 默认选择第一个模型
-                        if model_options:
-                            model_combo.setCurrentIndex(0)
-                            self.ai_model_name = model_options[0][1]
-                
-                # 根据选择的API服务更新API key（如果用户没有手动修改过）
-                if selected_url in self.ai_api_key_by_service:
-                    new_api_key = self.ai_api_key_by_service[selected_url]
-                    key_input = getattr(self, "ai_key_input", None)
-                    if key_input:
-                        current_key = key_input.text().strip()
-                        old_default_key = self.ai_api_key_by_service.get(old_url, "")
-                        # 如果当前key等于旧服务的默认key，或者用户没有手动修改过，则自动更新
-                        if current_key == old_default_key or not self.ai_key_manually_changed:
-                            # 临时断开信号，避免触发手动修改标记
-                            try:
-                                key_input.textChanged.disconnect(self.on_api_key_changed)
-                            except:
-                                pass
-                            key_input.setText(new_api_key)
-                            self.ai_api_key = new_api_key
-                            self.ai_key_manually_changed = False
-                            # 重新连接信号
-                            key_input.textChanged.connect(self.on_api_key_changed)
-                        # 如果用户手动修改过，保持用户输入的key不变
-    
-    def build_threshold_prompt(self, stats, current_threshold):
-        """构造发送给LLM的提示词"""
-        lines = [
-            "你是一名医学图像分割系统的调参与质检助手。",
-            "我们已经对若干张图像进行了前景概率预测，下面是统计数据。",
-            f"当前用于二值化的阈值为 {current_threshold:.2f}。",
-            "请根据统计信息判断是否需要调整阈值，使预测掩膜更加合理。",
-            "如果统计显示高概率像素占比很小，可以适当降低阈值；反之可提高。",
-            "请仅输出JSON，格式为：",
-            '{"recommended_threshold": 0.xx, "reason": "简要说明"}',
-            "其中 recommended_threshold 必须在 0.05 到 0.95 之间。"
-        ]
-
-        agg = stats["aggregate"]
-        lines.append("\n【整体统计】")
-        lines.append(f"- 平均概率: {agg['mean_prob']:.4f} (std {agg['std_prob']:.4f})")
-        lines.append(f"- P10/P90: {agg['p10']:.4f} / {agg['p90']:.4f}")
-        lines.append("- 不同阈值下的前景占比：")
-        for thr, ratio in agg["foreground_ratio"].items():
-            lines.append(f"  - 阈值 {thr}: 前景像素 {ratio*100:.2f}%")
-
-        lines.append("\n【样本统计】")
-        for sample in stats["samples"]:
-            fg_ratios = ", ".join(
-                [f"{thr}:{ratio*100:.1f}%" for thr, ratio in sample["foreground_ratio"].items()]
-            )
-            lines.append(
-                f"- 样本{sample['index']}: mean={sample['mean_prob']:.4f}, "
-                f"std={sample['std_prob']:.4f}, p10/p90={sample['p10']:.4f}/{sample['p90']:.4f}, "
-                f"foreground({fg_ratios})"
-            )
-
-        lines.append("\n请基于上述数据输出JSON。")
-        return "\n".join(lines)
-
-    def request_llm_threshold(self):
-        """调用LLM推荐阈值"""
-        if not self.prediction_stats:
-            QMessageBox.warning(self, "提示", "请先运行一次预测以生成统计数据。")
-            return
-
-        api_key_widget = getattr(self, "ai_key_input", None)
-        api_key = (api_key_widget.text().strip() if api_key_widget else self.ai_api_key).strip() or self.ai_api_key
-        if not api_key:
-            QMessageBox.warning(self, "提示", "请在AI助手中填写可用的API Key。")
-            return
-
-        model_combo = getattr(self, "ai_model_combo", None)
-        model_name = None
-        if model_combo and model_combo.currentData():
-            model_name = model_combo.currentData()
-        elif model_combo:
-            model_name = model_combo.currentText()
-        else:
-            model_name = self.ai_model_name
-
-        if self.llm_threshold_thread and self.llm_threshold_thread.isRunning():
-            QMessageBox.information(self, "提示", "上一条请求尚未完成，请稍候。")
-            return
-
-        prompt = self.build_threshold_prompt(self.prediction_stats, self.threshold_spin.value())
-        self.llm_threshold_thread = AIAssistantThread(
-            base_url=self.ai_base_url,
-            model=model_name,
-            api_key=api_key,
-            prompt=prompt
-        )
-        self.llm_threshold_thread.success.connect(self.on_llm_threshold_success)
-        self.llm_threshold_thread.error.connect(self.on_llm_threshold_error)
-        self.llm_threshold_thread.finished.connect(self.on_llm_threshold_finished)
-        self.llm_threshold_thread.start()
-        self.llm_threshold_btn.setEnabled(False)
-        self.set_llm_threshold_status("⏳ 正在请求LLM分析阈值...", status="info")
-
-    def on_llm_threshold_success(self, content):
-        try:
-            data = self.extract_json_from_text(content)
-            recommended = float(data.get("recommended_threshold"))
-            reason = data.get("reason", "LLM未提供原因")
-        except Exception as exc:
-            self.set_llm_threshold_status(f"解析LLM回复失败: {exc}", status="error")
-            QMessageBox.warning(self, "阈值推荐失败", f"无法解析LLM回复:\n{content}")
-            return
-
-        recommended = min(max(recommended, 0.05), 0.95)
-        self.threshold_spin.setValue(recommended)
-        self.set_llm_threshold_status(
-            f"推荐阈值 {recommended:.2f}\n原因: {reason}", status="success"
-        )
-        QMessageBox.information(
-            self,
-            "LLM 阈值建议",
-            f"推荐使用阈值 {recommended:.2f}\n原因：{reason}\n"
-            "请重新运行预测以应用新的阈值。"
-        )
-
-    def on_llm_threshold_error(self, message):
-        self.set_llm_threshold_status(f"❌ 请求失败: {message}", status="error")
-        QMessageBox.warning(self, "LLM请求错误", message)
-
-    def on_llm_threshold_finished(self):
-        if self.llm_threshold_thread:
-            self.llm_threshold_thread = None
-        if self.prediction_stats:
-            self.llm_threshold_btn.setEnabled(True)
-
-    def set_llm_threshold_status(self, text, status="info"):
-        styles = {
-            "info": """
-                QLabel {
-                    padding: 10px 12px;
-                    background: #f8fafc;
-                    border-radius: 8px;
-                    border-left: 4px solid #94a3b8;
-                    color: #475569;
-                    font-size: 10pt;
-                }
-            """,
-            "success": """
-                QLabel {
-                    padding: 10px 12px;
-                    background: #dcfce7;
-                    border-radius: 8px;
-                    border-left: 4px solid #16a34a;
-                    color: #166534;
-                    font-size: 10pt;
-                }
-            """,
-            "error": """
-                QLabel {
-                    padding: 10px 12px;
-                    background: #fee2e2;
-                    border-radius: 8px;
-                    border-left: 4px solid #dc2626;
-                    color: #991b1b;
-                    font-size: 10pt;
-                }
-            """
-        }
-        if hasattr(self, "llm_threshold_status"):
-            self.llm_threshold_status.setStyleSheet(styles.get(status, styles["info"]))
-            self.llm_threshold_status.setText(text)
-
-    def extract_json_from_text(self, text):
-        """尝试从LLM回复中解析JSON"""
-        text = text.strip()
-        try:
-            return json.loads(text)
-        except Exception:
-            pass
-
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            snippet = text[start:end + 1]
-            return json.loads(snippet)
-
-        raise ValueError("未找到有效的JSON内容")
-    
     def start_training(self):
         """开始训练"""
         if not self.data_dir:
@@ -3928,9 +3139,6 @@ class MedicalSegmentationApp(QMainWindow):
         self.predict_thread.update_progress.connect(self.update_predict_progress)
         self.predict_thread.prediction_finished.connect(self.prediction_complete)
         self.predict_thread.start()
-        if hasattr(self, 'llm_threshold_btn'):
-            self.llm_threshold_btn.setEnabled(False)
-            self.set_llm_threshold_status("正在进行预测，完成后可请求LLM推荐阈值", status="info")
     
     def update_predict_progress(self, value, message):
         """更新预测进度"""
@@ -3951,11 +3159,6 @@ class MedicalSegmentationApp(QMainWindow):
         # 保存当前结果
         self.current_results = input_numpy_images
         self.prediction_stats = self.compute_prediction_statistics(input_numpy_images)
-        if self.prediction_stats and hasattr(self, 'llm_threshold_btn'):
-            self.llm_threshold_btn.setEnabled(True)
-            self.set_llm_threshold_status(
-                "统计数据已生成，点击“LLM推荐阈值”获取建议。", status="success"
-            )
         
         # 清空旧的结果展示和缩略图
         for i in reversed(range(self.result_container_layout.count())):
@@ -5093,20 +4296,6 @@ f"结果已保存到:\n{input_path}\n{output_path}")
             self.predict_thread.terminate()
             self.predict_thread.wait()
 
-        if self.api_thread and self.api_thread.isRunning():
-            self.api_thread.stop()
-            self.api_thread.wait()
-
-        if self.ai_thread:
-            if self.ai_thread.isRunning():
-                self.ai_thread.terminate()
-                self.ai_thread.wait()
-            self.ai_thread = None
-
-        if self.llm_threshold_thread and self.llm_threshold_thread.isRunning():
-            self.llm_threshold_thread.terminate()
-            self.llm_threshold_thread.wait()
-        
         event.accept()
     def update_training_plot(self, pixmap):
         """更新界面上的训练曲线图"""
@@ -5220,59 +4409,14 @@ class MatlabMetricsBridge:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="医学图像分割GUI/API应用")
-    parser.add_argument(
-        "--mode",
-        choices=["gui", "api"],
-        default="gui",
-        help="运行模式: gui(默认) 或 api",
-    )
-    parser.add_argument(
-        "--model",
-        help="API模式下用于推理的模型路径(.pth/.pt)",
-    )
-    parser.add_argument(
-        "--host",
-        default="0.0.0.0",
-        help="API模式监听地址，默认0.0.0.0",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=8000,
-        help="API模式端口，默认8000",
-    )
-    parser.add_argument(
-        "--device",
-        help="API模式下指定推理设备，例如cpu或cuda:0",
-    )
-    parser.add_argument(
-        "--reload",
-        action="store_true",
-        help="API模式是否启用热重载(开发用途)",
-    )
-    args = parser.parse_args()
-
     # 【Windows 多进程支持】在 if __name__ == '__main__' 中预热 MATLAB 引擎
     # 确保所有执行逻辑都在主进程中进行，避免多进程导入时的问题
     _warmup_matlab_engine()
 
-    if args.mode == "gui":
-        # QApplication已在文件顶部导入，无需重复导入
-        qt_app = QApplication(sys.argv)
-        window = MedicalSegmentationApp()
-        window.show()
-        sys.exit(qt_app.exec_())    
-    else:
-        if not args.model:
-            parser.error("API模式必须通过--model提供模型路径")
-        service = SegmentationAPIService(model_path=args.model, device=args.device)
-        api_app = create_segmentation_api(service)
-        try:
-            uvicorn = importlib.import_module("uvicorn")
-        except ImportError as exc:
-            raise ImportError("运行API模式需要安装uvicorn: pip install uvicorn") from exc
-
-        uvicorn.run(api_app, host=args.host, port=args.port, reload=args.reload)
+    # QApplication已在文件顶部导入，无需重复导入
+    qt_app = QApplication(sys.argv)
+    window = MedicalSegmentationApp()
+    window.show()
+    sys.exit(qt_app.exec_())
 
 

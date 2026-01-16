@@ -816,6 +816,90 @@ def main():
             value=False,
             help="勾选后，右侧显示原始概率图而非 Overlay，便于调试"
         )
+        
+        st.markdown("---")
+        
+        # ==================== AI 服务配置 ====================
+        st.subheader("🤖 AI 服务配置")
+        
+        # 初始化 AI 配置（使用 session_state 保存）
+        if "ai_config" not in st.session_state:
+            st.session_state.ai_config = {
+                "api_base_url": "http://127.0.0.1:8000",
+                "api_key": "",
+                "model_name": "gpt-3.5-turbo",
+                "temperature": 0.7,
+                "max_tokens": 2000
+            }
+        
+        # API 服务地址
+        ai_api_base_url = st.text_input(
+            "API 服务地址",
+            value=st.session_state.ai_config.get("api_base_url", "http://127.0.0.1:8000"),
+            help="后端 API 服务地址（默认: http://127.0.0.1:8000）",
+            key="ai_api_base_url_input"
+        )
+        st.session_state.ai_config["api_base_url"] = ai_api_base_url
+        
+        # LLM API Key（从环境变量或用户输入）
+        ai_api_key = st.text_input(
+            "LLM API Key",
+            value=st.session_state.ai_config.get("api_key", os.getenv("OPENAI_API_KEY", "")),
+            type="password",
+            help="OpenAI/DeepSeek/Moonshot API Key（也可通过环境变量 OPENAI_API_KEY 设置）",
+            key="ai_api_key_input"
+        )
+        st.session_state.ai_config["api_key"] = ai_api_key
+        
+        # LLM Base URL（可选，用于自定义 API 服务）
+        ai_llm_base_url = st.text_input(
+            "LLM Base URL（可选）",
+            value=st.session_state.ai_config.get("llm_base_url", os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")),
+            help="LLM API 基础地址（默认: https://api.openai.com/v1）\n"
+                 "DeepSeek: https://api.deepseek.com/v1\n"
+                 "Moonshot: https://api.moonshot.cn/v1",
+            key="ai_llm_base_url_input"
+        )
+        st.session_state.ai_config["llm_base_url"] = ai_llm_base_url
+        
+        # 模型选择
+        ai_model_name = st.text_input(
+            "模型名称",
+            value=st.session_state.ai_config.get("model_name", os.getenv("LLM_MODEL", "gpt-3.5-turbo")),
+            help="LLM 模型名称（默认: gpt-3.5-turbo）\n"
+                 "DeepSeek: deepseek-chat\n"
+                 "Moonshot: moonshot-v1-8k",
+            key="ai_model_name_input"
+        )
+        st.session_state.ai_config["model_name"] = ai_model_name
+        
+        # 高级参数（可折叠）
+        with st.expander("⚙️ 高级参数", expanded=False):
+            ai_temperature = st.slider(
+                "Temperature",
+                min_value=0.0,
+                max_value=2.0,
+                value=st.session_state.ai_config.get("temperature", 0.7),
+                step=0.1,
+                help="控制输出的随机性（0.0-2.0），值越大越随机"
+            )
+            st.session_state.ai_config["temperature"] = ai_temperature
+            
+            ai_max_tokens = st.number_input(
+                "Max Tokens",
+                min_value=100,
+                max_value=8000,
+                value=st.session_state.ai_config.get("max_tokens", 2000),
+                step=100,
+                help="最大生成 token 数"
+            )
+            st.session_state.ai_config["max_tokens"] = ai_max_tokens
+        
+        # 状态显示
+        if ai_api_key:
+            st.success("✅ AI 服务已配置")
+        else:
+            st.warning("⚠️ 请填写 API Key 以启用 AI 服务")
     
     # ==================== Main Area ====================
     
@@ -1430,6 +1514,214 @@ def main():
                     # 显示像素统计
                     positive_pixels = (prob_map > prev_thresh).sum()
                     st.caption(f"正像素: {positive_pixels} ({positive_pixels/prob_map.size*100:.1f}%)")
+    
+    # ==================== AI 影像诊断助手 ====================
+    st.markdown("---")
+    st.subheader("🤖 AI 影像诊断助手")
+    
+    # 初始化对话历史
+    if "chat_messages" not in st.session_state:
+        st.session_state.chat_messages = []
+    
+    # 初始化上下文数据标志
+    if "context_sent" not in st.session_state:
+        st.session_state.context_sent = False
+    
+    # 如果完成了预测且还没有发送上下文，自动发送上下文
+    if binary_mask is not None and not st.session_state.context_sent:
+        # 提取元数据
+        tumor_pixels = (binary_mask > 127).sum() if binary_mask.max() > 1.0 else binary_mask.sum()
+        total_pixels = binary_mask.size
+        tumor_percentage = (tumor_pixels / total_pixels * 100) if total_pixels > 0 else 0.0
+        
+        context_data = {
+            "文件名": current_pair['original_name'],
+            "肿瘤像素数": f"{tumor_pixels}",
+            "总像素数": f"{total_pixels}",
+            "肿瘤占比": f"{tumor_percentage:.2f}%",
+            "图像尺寸": f"{H}x{W}"
+        }
+        
+        if dice_score is not None:
+            context_data["Dice系数"] = f"{dice_score:.4f}"
+        
+        if prob_map is not None:
+            context_data["概率图最大值"] = f"{prob_map.max():.4f}"
+            context_data["概率图平均值"] = f"{prob_map.mean():.4f}"
+        
+        # 构建自动消息
+        auto_message = f"我刚刚完成了一张影像的分析。文件名：{current_pair['original_name']}，检测到肿瘤区域像素数：{tumor_pixels}，肿瘤占比：{tumor_percentage:.2f}%"
+        if dice_score is not None:
+            auto_message += f"，Dice置信度：{dice_score:.4f}"
+        auto_message += "。请帮我生成一份简要的分析报告。"
+        
+        # 添加到对话历史
+        st.session_state.chat_messages.append({
+            "role": "user",
+            "content": auto_message
+        })
+        
+        # 标记上下文已发送
+        st.session_state.context_sent = True
+        
+        # 发送到后端
+        try:
+            # 使用侧边栏配置的 API 地址
+            api_base_url = st.session_state.ai_config.get("api_base_url", "http://127.0.0.1:8000")
+            api_url = f"{api_base_url}/chat"
+            
+            # 准备 LLM 配置（如果用户提供了）
+            llm_config = None
+            if st.session_state.ai_config.get("api_key"):
+                llm_config = {
+                    "api_key": st.session_state.ai_config.get("api_key"),
+                    "base_url": st.session_state.ai_config.get("llm_base_url", "https://api.openai.com/v1"),
+                    "model": st.session_state.ai_config.get("model_name", "gpt-3.5-turbo"),
+                    "temperature": st.session_state.ai_config.get("temperature", 0.7),
+                    "max_tokens": st.session_state.ai_config.get("max_tokens", 2000)
+                }
+            
+            response = requests.post(
+                api_url,
+                json={
+                    "messages": st.session_state.chat_messages,
+                    "context_data": context_data,
+                    "llm_config": llm_config
+                },
+                stream=True,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                # 流式接收回复
+                assistant_reply = ""
+                message_placeholder = st.empty()
+                for chunk in response.iter_content(chunk_size=None, decode_unicode=True):
+                    if chunk:
+                        assistant_reply += chunk
+                        message_placeholder.markdown(assistant_reply)
+                
+                # 添加到对话历史
+                st.session_state.chat_messages.append({
+                    "role": "assistant",
+                    "content": assistant_reply
+                })
+            else:
+                st.error(f"❌ AI 服务错误: {response.status_code}")
+        except Exception as e:
+            st.error(f"❌ 无法连接到 AI 服务: {e}")
+            st.info("💡 提示：请确保 `server.py` 正在运行，并且已配置 LLM API Key")
+    
+    # 显示对话历史
+    for message in st.session_state.chat_messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+    
+    # 用户输入
+    if prompt := st.chat_input("请输入您的问题..."):
+        # 添加用户消息
+        st.session_state.chat_messages.append({
+            "role": "user",
+            "content": prompt
+        })
+        
+        # 显示用户消息
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        
+        # 准备上下文数据（如果有新的预测结果）
+        context_data = None
+        if binary_mask is not None:
+            tumor_pixels = (binary_mask > 127).sum() if binary_mask.max() > 1.0 else binary_mask.sum()
+            total_pixels = binary_mask.size
+            tumor_percentage = (tumor_pixels / total_pixels * 100) if total_pixels > 0 else 0.0
+            
+            context_data = {
+                "文件名": current_pair['original_name'],
+                "肿瘤像素数": f"{tumor_pixels}",
+                "总像素数": f"{total_pixels}",
+                "肿瘤占比": f"{tumor_percentage:.2f}%",
+                "图像尺寸": f"{H}x{W}"
+            }
+            
+            if dice_score is not None:
+                context_data["Dice系数"] = f"{dice_score:.4f}"
+            
+            if prob_map is not None:
+                context_data["概率图最大值"] = f"{prob_map.max():.4f}"
+                context_data["概率图平均值"] = f"{prob_map.mean():.4f}"
+        
+        # 发送到后端
+        with st.chat_message("assistant"):
+            try:
+                # 使用侧边栏配置的 API 地址
+                api_base_url = st.session_state.ai_config.get("api_base_url", "http://127.0.0.1:8000")
+                api_url = f"{api_base_url}/chat"
+                
+                # 准备 LLM 配置（如果用户提供了）
+                llm_config = None
+                if st.session_state.ai_config.get("api_key"):
+                    llm_config = {
+                        "api_key": st.session_state.ai_config.get("api_key"),
+                        "base_url": st.session_state.ai_config.get("llm_base_url", "https://api.openai.com/v1"),
+                        "model": st.session_state.ai_config.get("model_name", "gpt-3.5-turbo"),
+                        "temperature": st.session_state.ai_config.get("temperature", 0.7),
+                        "max_tokens": st.session_state.ai_config.get("max_tokens", 2000)
+                    }
+                
+                response = requests.post(
+                    api_url,
+                    json={
+                        "messages": st.session_state.chat_messages,
+                        "context_data": context_data,
+                        "llm_config": llm_config
+                    },
+                    stream=True,
+                    timeout=60
+                )
+                
+                if response.status_code == 200:
+                    # 流式接收回复
+                    assistant_reply = ""
+                    message_placeholder = st.empty()
+                    for chunk in response.iter_content(chunk_size=None, decode_unicode=True):
+                        if chunk:
+                            assistant_reply += chunk
+                            message_placeholder.markdown(assistant_reply)
+                    
+                    # 添加到对话历史
+                    st.session_state.chat_messages.append({
+                        "role": "assistant",
+                        "content": assistant_reply
+                    })
+                else:
+                    error_msg = f"❌ AI 服务错误: {response.status_code}"
+                    st.error(error_msg)
+                    st.session_state.chat_messages.append({
+                        "role": "assistant",
+                        "content": error_msg
+                    })
+            except requests.exceptions.ConnectionError:
+                error_msg = "❌ 无法连接到 AI 服务，请确保 `server.py` 正在运行"
+                st.error(error_msg)
+                st.info("💡 提示：请运行 `python server.py` 启动后端服务")
+                st.session_state.chat_messages.append({
+                    "role": "assistant",
+                    "content": error_msg
+                })
+            except Exception as e:
+                error_msg = f"❌ 请求失败: {e}"
+                st.error(error_msg)
+                st.session_state.chat_messages.append({
+                    "role": "assistant",
+                    "content": error_msg
+                })
+    
+    # 清空对话按钮
+    if st.button("🗑️ 清空对话历史"):
+        st.session_state.chat_messages = []
+        st.session_state.context_sent = False
+        st.rerun()
 
 
 if __name__ == "__main__":

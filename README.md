@@ -1,4 +1,4 @@
-# 🏥 医学图像分割系统 - AI智能分析平台
+# 🏥 脑肿瘤分割系统 - AI智能分析平台
 
 <div align="center">
 
@@ -6,131 +6,153 @@
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.0.0+-orange.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)
-[![GitHub stars](https://img.shields.io/github/stars/1molchuan/Brain-MRI?style=social)](https://github.com/1molchuan/Brain-MRI)
-[![许可证](https://img.shields.io/badge/许可证-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Python](https://img.shields.io/badge/Python-3.7%2B-blue)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-red)](https://pytorch.org/)
 
-## 概述
+**一个全面的医学图像分割系统，支持多种先进的深度学习模型架构，配备 Web 界面、API 服务和 AI 辅助诊断功能**
 
-一个全面的医学图像分割系统，具有图形界面，支持多种先进的深度学习模型架构。该系统专为医学图像分割任务设计，特别针对脑肿瘤分割场景进行了优化。
-
-[功能特性](#-主要特性) • [快速开始](#-快速开始) • [使用指南](#-使用指南) • [模型架构](#-支持的模型架构) • [常见问题](#-常见问题)
+[功能特性](#-主要特性) • [快速开始](#-快速开始) • [使用指南](#-使用指南) • [API 文档](#-api-文档) • [常见问题](#-常见问题)
 
 </div>
 
 ---
 
-## 🆕 最新更新
+## 📋 目录
 
-- **🌐 Streamlit Web App (`app.py`)**  
-  - 全新的 Web 界面，支持浏览器访问，无需安装 GUI 依赖
-  - **批量图像上传**：支持批量上传 TIF 格式的 2D 图像序列，自动配对原图和 Mask
-  - **智能模型检测**：自动检测模型模式（2D/2.5D），自适应输入通道数
-  - **实时阈值调节**：支持手动调节阈值，实时查看预测结果变化
-  - **智能后处理集成**：支持上传 `best_postprocessing_config.json`，自动应用最优后处理策略
-  - **三列对比展示**：原图、Ground Truth、预测结果并排显示
-  - **深度调试面板**：概率分布直方图、阈值效果预览、详细统计信息
-  - **概率热力图**：可选显示原始概率图，便于调试和分析
+- [概述](#-概述)
+- [主要特性](#-主要特性)
+- [系统要求](#-系统要求)
+- [快速开始](#-快速开始)
+- [使用指南](#-使用指南)
+- [API 文档](#-api-文档)
+- [支持的模型架构](#-支持的模型架构)
+- [常见问题](#-常见问题)
+- [项目结构](#-项目结构)
+- [更新日志](#-更新日志)
 
-- **🔧 阈值调节功能优化**  
-  - 修复了智能后处理中阈值硬编码问题（`_apply_strategy` 内部 0.5 阈值）
-  - 确保用户手动调节的阈值能够正确应用到预测结果
-  - 支持在 Web App 中实时调节阈值，立即查看效果
+---
 
-- **架构重构（Architectural Refactoring）**  
-  - 将原本超大、单文件的 `worker.py`（约 1.1 万行）和 `utils.py`（约 4.5 千行），重构为模块化包结构 `worker/` 与 `utils/`。  
-  - 通过 `__init__.py` 保持向后兼容，原有 `from worker import ...` 和 `from utils import *` 写法仍然可用。  
-  - 重构显著提升了代码的 **可维护性**（按职责拆分）、**可执行性**（更快加载、更少循环依赖），并解决了单文件在 IDE/代码审查中带来的性能瓶颈。  
+## 🎯 概述
 
-- **基于 HD-BET 的数据优化与模型增强**  
-  - 在 LGG-MRI 原始数据集上，引入 **HD-BET 深度学习颅骨剥离（Skull Stripping）** 流水线：自动移除颅骨、脂肪、皮肤等颅外组织，只保留颅内脑组织。  
-  - 通过清理强背景噪声，使模型的注意力更集中于 **颅内肿瘤前景**，减少无意义的高亮区域。  
-  - 在经过 HD-BET 预处理的高质量数据集上重新训练 DeepLabV3+，显著提升了：  
-    - **收敛速度**（更稳定、更少震荡）  
-    - **对肿瘤前景的分割鲁棒性**（边界更平滑、小病灶保留更好）  
-  - 该高质量 DeepLabV3+ 模型也作为后续实验与集成的 **基础强模型（strong baseline）** 使用。  
+本系统是一个专为脑肿瘤分割任务设计的医学图像分割平台，提供三种使用方式：
 
-- **数据驱动自适应后处理 + 一键生成配置**  
-  - 引入 `utils/smart_postprocessing.py`：基于验证集自动搜索 Baseline / LCC / Remove-Small (10/30/100/300) 的最优策略。  
-  - 新增脚本 `generate_smart_postprocessing_config.py`，对**已有模型**无需重训即可生成 `best_postprocessing_config.json`，测试/推理自动加载。  
-  - 测试和训练阶段阈值搜索已升级为 **Brent 方法 + 多进程并行**，使用全量样本、综合评分（Dice/IoU/Specificity）作为目标，速度提升 6-10 倍。  
+1. **🌐 Streamlit Web App** (`app.py`) - 现代化的 Web 界面，支持批量图像处理、实时阈值调节和 AI 辅助诊断
+2. **🖥️ PyQt5 GUI** (`main.py`) - 功能完整的桌面应用，支持训练、测试、预测和性能分析
+3. **🔌 FastAPI 后端服务** (`server.py`) - RESTful API 服务，支持模型推理和 AI 聊天接口
+
+### 核心优势
+
+- ✅ **多模型架构支持** - 7+ 种先进的深度学习模型（ImprovedUNet、ResNetUNet、TransUNet、DS-TransUNet、SwinUNet、U-Net++、DeepLabV3+）
+- ✅ **智能后处理** - 数据驱动自适应后处理策略，自动搜索最优配置
+- ✅ **高效阈值优化** - Brent 方法 + 多进程并行，30 秒内完成阈值搜索
+- ✅ **AI 辅助诊断** - 集成 LLM（支持 OpenAI/DeepSeek/Moonshot），自动生成诊断报告
+- ✅ **批量处理** - 支持批量上传 2D 图像序列，自动配对原图和 Mask
+- ✅ **实时可视化** - 三列对比展示、概率热力图、深度调试面板
 
 ---
 
 ## ✨ 主要特性
 
-### 🎯 多模型架构支持
-- **ImprovedUNet** - 改进的 U-Net 架构，集成注意力机制
-- **ResNetUNet** - 基于 ResNet 编码器的 U-Net，支持预训练权重
-- **TransUNet** - Transformer + U-Net 混合架构
-- **DS-TransUNet** - 双尺度 Transformer U-Net，支持 GWO 优化
-- **SwinUNet** - 基于 Swin Transformer 的 U-Net，支持 GWO 优化
-- **U-Net++** - 基于 SMP 的密集连接 U-Net
-- **DeepLabV3+** - 基于 SMP 的 DeepLabV3+，支持 Grad-CAM
-- **NN-Former** - 基于 Transformer 的医学图像分割模型
+### 🌐 Streamlit Web App (`app.py`)
 
-### 🖥️ 友好的图形界面
-- **PyQt5 GUI** - 基于 PyQt5 构建的现代化桌面应用
+**核心功能：**
+
+- 📁 **批量图像上传**
+  - 支持批量上传 TIF 格式的 2D 图像序列
+  - 智能配对原图和对应的 `_mask.tif` 文件
+  - 自然排序，保证切片顺序正确
+
+- 🔍 **切片浏览器**
+  - 使用滑块浏览整个图像序列
+  - 实时显示当前切片信息和 Dice 系数
+
+- 🎚️ **实时阈值调节**
+  - 通过滑块实时调节阈值（0.0-1.0）
+  - 立即查看预测结果变化
+  - 支持智能后处理配置
+
+- 📊 **三列对比展示**
+  - 原图、Ground Truth、预测结果并排显示
+  - 自动计算 Dice 系数（如果有 GT Mask）
+
+- 🎨 **可视化功能**
+  - 概率热力图（调试模式）
+  - 深度调试面板（概率分布直方图、阈值效果预览）
+  - 详细统计信息（Min/Max/Mean/Median）
+
+- 🤖 **AI 影像诊断助手**
+  - 在左侧边栏配置 AI 服务（API Key、Base URL、Model 等）
+  - 自动提取预测结果元数据（文件名、肿瘤像素数、Dice 系数等）
+  - 自动生成诊断报告
+  - 支持流式对话，实时显示 AI 回复
+  - 支持多种 LLM 服务（OpenAI、DeepSeek、Moonshot）
+
+- 🔧 **智能后处理集成**
+  - 支持上传 `best_postprocessing_config.json`
+  - 自动应用最优后处理策略（LCC、Remove-Small 等）
+  - 动态阈值配置
+
+- ⚙️ **推理模式选择**
+  - **API 服务模式**（推荐）：使用 FastAPI 后端，快速推理
+  - **本地调试模式**：在本地加载模型，适合测试不同权重
+
+### 🖥️ PyQt5 GUI (`main.py`)
+
+**核心功能：**
+
+- 🚀 **训练功能**
+  - 支持多种模型架构选择
   - 实时训练监控和可视化
-  - 直观的操作流程
-  - 支持 MATLAB 报告生成
-- **🌐 Streamlit Web App** - 全新的 Web 界面（`app.py`）
-  - 浏览器访问，无需安装 GUI 依赖
-  - 批量图像上传和处理
-  - 实时阈值调节和可视化
-  - 智能后处理集成
-  - 深度调试面板
+  - 自动保存最佳模型
+  - 支持 GWO 优化（SwinUNet/DS-TransUNet）
 
-### 🚀 高性能训练
-- ✅ 混合精度训练（AMP）
-- ✅ 学习率调度（Poly/ReduceLROnPlateau）
-- ✅ 早停机制
-- ✅ EMA（指数移动平均）
-- ✅ SWA（随机权重平均）
-- ✅ 最佳模型自动保存
-- ✅ CuDNN Benchmark 优化
-- ✅ DataLoader 多进程优化
+- 📊 **测试功能**
+  - 多指标评估（Dice、IoU、Precision、Recall、Specificity、HD95）
+  - Brent 阈值优化 + 多进程并行
+  - 性能分析报告生成（MATLAB）
+  - 注意力热图可视化（Grad-CAM）
 
-### 📊 智能阈值优化
-- **Brent 方法（布伦特方法）** - 使用 SciPy 的 `minimize_scalar` 进行高效单维度阈值搜索
-- **多进程并行加速** - 测试阶段使用 `ProcessPoolExecutor` 并行计算，充分利用多核 CPU（8核并行）
-- 优化目标为综合得分：`Score = 0.4*Dice + 0.3*IoU + 0.3*Specificity`
-- **性能优势**：仅需 ~15 次评估即可收敛（相比 GWO 的 ~100 次），配合多进程加速，总耗时从几分钟压缩到 30 秒以内
+- 🔮 **预测功能**
+  - 单张/批量图像预测
+  - 测试时增强（TTA）
+  - 智能后处理
+  - 结果可视化
 
-### 📈 丰富的评估指标
-- Dice、IoU、Precision、Recall、Specificity、HD95
-- 空 Mask 特殊处理（双空=1.0，单空=0.0）
-- 样本级指标统计
+- 📈 **性能分析**
+  - 训练曲线实时显示
+  - Dice 系数变化趋势图
+  - 测试集分割结果可视化
 
-### 🔍 测试时增强 (TTA)
-- 多尺度推理（0.8x, 1.0x, 1.2x）
-- 8 种几何变换（翻转、旋转等）
-- 可提升 1-3% 的 Dice 系数
+### 🔌 FastAPI 后端服务 (`server.py`)
 
-### 💡 智能后处理
-- **LCC（最大连通域）** - 保留最大连通区域，去除噪点
-- **孔洞填充** - 填补小孔洞，提升分割完整性
-- **边缘平滑** - Gaussian 滤波，修正锯齿边缘
-- **形态学操作** - 开运算、闭运算，去除毛刺和填充缝隙
-- **动态面积阈值** - 根据概率图平均值动态调整过滤阈值
-- **高置信度小病灶保护** - 智能保留高置信度的微小病灶
-- **数据驱动自适应后处理** - 基于验证集自动搜索 Baseline/LCC/Remove-Small 策略并保存为 `best_postprocessing_config.json`
+**核心功能：**
 
-### 📐 数据集支持
-- **标准数据集** - 单通道医学图像
-- **2.5D 数据集** - TCGA-LGG 格式（三通道堆叠）
+- 🧠 **模型推理 API**
+  - `/predict` - 图像分割推理接口
+  - 支持返回概率图（JSON 格式）或二值化 Mask（PNG 格式）
+  - 自动应用智能后处理
+  - ImageNet 标准化预处理
+
+- 🤖 **AI 聊天 API**
+  - `/chat` - AI 辅助诊断聊天接口
+  - 支持流式响应（Server-Sent Events）
+  - 支持动态 LLM 配置（API Key、Base URL、Model 等）
+  - 自动整合上下文数据（预测结果元数据）
+
+- 🔍 **健康检查**
+  - `/health` - 服务健康检查接口
+  - `/` - API 信息接口
 
 ---
 
 ## 📋 系统要求
 
 ### 硬件要求
+
 - **GPU**: 推荐 NVIDIA GPU（支持 CUDA），显存 ≥ 4GB（推荐 ≥ 8GB）
 - **内存**: ≥ 8GB RAM（推荐 ≥ 16GB）
 - **存储**: ≥ 10GB 可用空间
 
 ### 软件要求
+
 - **操作系统**: Windows 10/11, Linux, macOS
 - **Python**: 3.7 - 3.12
 - **CUDA**: 11.0+（如果使用 GPU）
@@ -153,209 +175,356 @@ cd medical-segmentation
 pip install -r requirements.txt
 ```
 
-**核心依赖**：
-- `torch>=2.0.0` – PyTorch深度学习框架
-- `torchvision>=0.15.0` – 与PyTorch版本匹配
-- `PyQt5>=5.15.0` – GUI框架（桌面应用）
-- `streamlit>=1.28.0` – Web框架（Web应用）
+**核心依赖：**
+- `torch>=2.0.0` – PyTorch 深度学习框架
+- `torchvision>=0.15.0` – 与 PyTorch 版本匹配
+- `PyQt5>=5.15.0` – GUI 框架（桌面应用）
+- `streamlit>=1.28.0` – Web 框架（Web 应用）
+- `fastapi>=0.104.0` – API 框架（后端服务）
+- `uvicorn[standard]>=0.24.0` – ASGI 服务器
+- `openai>=1.0.0` – OpenAI SDK（AI 辅助诊断，可选）
 - `albumentations>=1.3.0` – 数据增强
 - `opencv-python>=4.5.0` – 图像处理
-- `scikit-image>=0.19.0` – 图像工具（morphology操作）
-- `numpy>=1.21.0,<2.0.0` – 科学计算（限制2.0以下避免兼容性问题）
-- `scipy>=1.7.0` – 科学计算（Brent方法优化、连通域分析）
-- `segmentation-models-pytorch>=0.3.0` – SMP库（U‑Net++、DeepLabV3+）
-- `pytorch-grad-cam>=1.4.0` – Grad‑CAM可视化（可选但推荐）
-- `matlab.engine` – MATLAB引擎（可选，用于报告生成）
+- `scikit-image>=0.19.0` – 图像工具
+- `numpy>=1.21.0,<2.0.0` – 科学计算
+- `scipy>=1.7.0` – 科学计算
+- `segmentation-models-pytorch>=0.3.0` – SMP 库（U-Net++、DeepLabV3+）
+- `pytorch-grad-cam>=1.4.0` – Grad-CAM 可视化（可选）
 
 ### 3. 运行应用
 
-**方式一：PyQt5 GUI（桌面应用）**
-```bash
-python main.py
-```
+#### 方式一：Streamlit Web App（推荐）
 
-**方式二：Streamlit Web App（Web 界面）**
 ```bash
+# 启动 Web 应用
 streamlit run app.py
 ```
 
 然后在浏览器中打开显示的 URL（通常是 `http://localhost:8501`）
 
-**Web App 功能特点**：
-- 📁 **批量上传**：支持批量上传 TIF 格式的 2D 图像序列
-- 🔍 **智能配对**：自动识别并配对原图和对应的 `_mask.tif` 文件
-- 🎚️ **实时阈值调节**：通过滑块实时调节阈值，立即查看预测结果变化
-- 🔧 **智能后处理**：支持上传 `best_postprocessing_config.json`，自动应用最优后处理策略
-- 📊 **三列对比**：原图、Ground Truth、预测结果并排显示
-- 🎨 **概率热力图**：可选显示原始概率图，便于调试和分析
-- 📈 **深度调试面板**：概率分布直方图、阈值效果预览、详细统计信息
+**功能特点：**
+- 📁 批量上传 TIF 格式的 2D 图像序列
+- 🔍 智能配对原图和对应的 `_mask.tif` 文件
+- 🎚️ 实时阈值调节，立即查看预测结果变化
+- 🔧 智能后处理集成
+- 📊 三列对比展示（原图、Ground Truth、预测结果）
+- 🎨 概率热力图和深度调试面板
+- 🤖 AI 影像诊断助手（在侧边栏配置）
 
-### 4. 为“已有模型”生成智能后处理配置（无需重训）
+#### 方式二：FastAPI 后端服务
 
 ```bash
-# 示例（Windows，路径含空格请加引号）
-python generate_smart_postprocessing_config.py ^
-  --model_path "C:\\path\\to\\best_model.pth" ^
-  --data_dir "C:\\path\\to\\dataset" ^
-  --model_type deeplabv3plus ^
-  --use_tta
+# 启动 API 服务
+python server.py
 ```
 
-生成后的 `best_postprocessing_config.json` 会放在模型同目录，测试与推理会自动加载该配置并应用数据驱动自适应后处理。
+服务将在 `http://127.0.0.1:8000` 启动
 
----
+**前置要求：**
+- 确保 `best_model.pth` 文件存在于项目根目录
+- （可选）`best_postprocessing_config.json` 用于智能后处理
 
-## 📁 项目结构
+**API 端点：**
+- `GET /` - API 信息
+- `GET /health` - 健康检查
+- `POST /predict` - 图像分割推理
+- `POST /chat` - AI 辅助诊断聊天
 
-```
-medical-segmentation/
-├── main.py                    # 主入口（PyQt5 GUI和应用程序）
-├── app.py                     # Streamlit Web App（Web界面）
-├── models.py                  # 所有模型架构
-├── dataset.py                 # 2.5D数据集加载器（TCGA2_5DDataset）
-├── config.py                  # 集中式模型配置
-├── requirements.txt           # 依赖列表
-├── generate_smart_postprocessing_config.py  # 为已有模型生成智能后处理配置
-├── README.md                  # 本文档
-├── LICENSE                    # 许可证文件
-│
-├── utils/                     # 工具函数模块（模块化结构）
-│   ├── __init__.py            # 向后兼容接口
-│   ├── common.py              # 公共导入和配置
-│   ├── helpers.py             # 基础工具函数（EarlyStopping等）
-│   ├── window_ops.py           # 窗口操作函数
-│   ├── image_augmentation.py  # 图像增强类
-│   ├── model_loader.py        # 模型加载函数
-│   ├── data_processing.py    # 数据处理函数
-│   ├── standalone_funcs.py   # 独立函数（多进程）
-│   ├── process_pool.py        # 进程池管理器
-│   ├── multiprocess_helpers.py # 多进程辅助函数
-│   ├── gwo_optimizer.py       # GWO优化器
-│   ├── threshold_scan.py      # 阈值扫描
-│   ├── dataset.py             # 数据集类（MedicalImageDataset）
-│   ├── smart_postprocessing.py # 数据驱动自适应后处理策略搜索
-│   ├── matlab_bridge.py       # MATLAB相关类
-│   ├── visualization.py       # 可视化函数
-│   └── README.md              # Utils模块说明
-│
-├── worker/                    # 工作线程模块（模块化结构）
-│   ├── __init__.py            # 向后兼容接口
-│   ├── common.py              # 公共导入和配置
-│   ├── test_thread.py         # ModelTestThread（模型测试线程）
-│   ├── train_thread.py        # TrainThread（训练线程）
-│   ├── predict_thread.py      # PredictThread（预测线程）
-│   └── README.md              # Worker模块说明
-│
-├── matlab_reports/            # 生成的MATLAB报告
-└── data/                      # 数据目录（用户创建）
-    ├── patient_id1/
-    │   ├── image1.png
-    │   ├── image1_mask.png
-    │   └── ...
-    └── ...
+#### 方式三：PyQt5 GUI（桌面应用）
+
+```bash
+# 启动桌面应用
+python main.py
 ```
 
-### 文件说明
-
-- **main.py**: 主程序文件，包含 PyQt5 GUI 界面和应用程序入口，支持 MATLAB 引擎预热
-- **models.py**: 包含所有模型架构的定义
-- **utils/**: 工具函数模块，包含数据处理、模型加载、MATLAB 可视化桥接、GWO 优化器等
-  - `helpers.py`: 基础工具函数（EarlyStopping、指标计算等）
-  - `gwo_optimizer.py`: 灰狼优化算法阈值优化器
-  - `model_loader.py`: 模型加载和参数推断
-  - `dataset.py`: 医学图像数据集类
-  - `standalone_funcs.py`: 后处理函数（LCC、孔洞填充等）
-  - `matlab_bridge.py`: MATLAB 引擎会话和可视化桥接
-  - 更多模块详见 `utils/README.md`
-- **worker/**: 工作线程模块，包含训练、测试和预测的业务逻辑
-  - `train_thread.py`: 训练线程（TrainThread）
-  - `test_thread.py`: 测试线程（ModelTestThread）
-  - `predict_thread.py`: 预测线程（PredictThread）
-  - 更多详情详见 `worker/README.md`
-- **dataset.py**: 2.5D 数据集加载器，支持 TCGA-LGG 格式的三通道堆叠输入
-- **config.py**: 集中管理所有模型的配置参数
+**功能特点：**
+- 🚀 完整的训练、测试、预测功能
+- 📊 实时训练监控和可视化
+- 📈 性能分析报告生成
+- 🎯 注意力热图可视化
 
 ---
 
 ## 📖 使用指南
 
-### 训练模型
+### Streamlit Web App 使用流程
 
-#### 1. 准备数据
+#### 1. 启动应用
 
-**标准数据集格式：**
-```text
-data_dir/
-├── patient_id1/
-│   ├── image1.png          # 原始图像
-│   ├── image1_mask.png     # 对应的mask
-│   ├── image2.png
-│   └── image2_mask.png
-├── patient_id2/
-│   ├── image1.png
-│   └── image1_mask.png
-└── ...
+```bash
+streamlit run app.py
 ```
 
-**2.5D 数据集格式（TCGA-LGG）：**
-```text
-data_dir/
-├── TCGA_CS_5393_19990606_1.tif
-├── TCGA_CS_5393_19990606_2.tif
-├── TCGA_CS_5393_19990606_3.tif
-└── ...
+#### 2. 配置推理模式
+
+在左侧边栏选择推理模式：
+- **API 服务（推荐）**：使用 FastAPI 后端，快速推理
+- **本地调试（Local）**：在本地加载模型，适合测试不同权重
+
+#### 3. 上传模型（本地模式）
+
+如果选择"本地调试"模式，需要在侧边栏上传模型文件（`.pth`）
+
+#### 4. 上传图像
+
+在主区域批量上传 TIF 格式的 2D 图像序列：
+- 支持格式：`.tif`, `.tiff`
+- 系统会自动识别并配对原图和对应的 `_mask.tif` 文件
+- 例如：`image1.tif` 和 `image1_mask.tif` 会自动配对
+
+#### 5. 配置后处理（可选）
+
+在侧边栏上传 `best_postprocessing_config.json` 以启用智能后处理：
+- 自动应用最优后处理策略
+- 或使用手动阈值调节
+
+#### 6. 浏览结果
+
+- 使用切片浏览器选择要查看的图像
+- 实时调节阈值，立即查看预测结果变化
+- 查看三列对比（原图、Ground Truth、预测结果）
+- 使用深度调试面板分析概率分布和阈值效果
+
+#### 7. 使用 AI 辅助诊断
+
+在左侧边栏的"🤖 AI 服务配置"中：
+1. 填写 **API 服务地址**（默认：`http://127.0.0.1:8000`）
+2. 填写 **LLM API Key**（OpenAI/DeepSeek/Moonshot）
+3. 选择或填写 **LLM Base URL**（如 `https://api.deepseek.com/v1`）
+4. 选择 **模型名称**（如 `deepseek-chat`、`gpt-3.5-turbo`）
+5. 调整高级参数（Temperature、Max Tokens，可选）
+
+完成预测后，系统会自动提取元数据并发送给 AI，生成诊断报告。
+
+### FastAPI 后端服务使用
+
+#### 1. 准备模型文件
+
+确保 `best_model.pth` 文件存在于项目根目录：
+```bash
+# 模型文件应位于项目根目录
+best_model.pth
 ```
-系统会自动将相邻切片堆叠为三通道输入。
 
-#### 2. 配置训练参数
+（可选）准备后处理配置文件：
+```bash
+best_postprocessing_config.json
+```
 
-在 GUI 界面中：
-- 选择数据目录
-- 选择数据集类型（标准 / 2.5D）
-- 选择模型架构
-- 设置训练轮次（Epochs）
-- 设置批次大小（Batch Size）
-- 选择优化器（Adam/AdamW/SGD）
-- 启用/禁用 TTA、GWO 优化等
+#### 2. 启动服务
 
-#### 3. 开始训练
+```bash
+python server.py
+```
 
-- 点击"开始训练"按钮
-- 实时查看训练进度和验证指标
-- 训练完成后自动生成性能分析报告
+服务将在 `http://127.0.0.1:8000` 启动
 
-### 测试模型
+#### 3. 配置 LLM（可选）
 
-1. **加载模型**: 选择训练好的模型文件（.pth）
-2. **选择测试数据**: 指定测试数据目录
-3. **配置选项**:
-   - 选择模型架构（或从 checkpoint 自动推断）
-   - 启用/禁用 TTA
-   - 阈值优化自动使用 Brent 方法（多进程并行，推荐）
-4. **开始测试**: 点击"开始测试"按钮，查看详细性能指标和可视化结果
+如果使用 AI 辅助诊断功能，需要设置环境变量：
 
-### 预测图像
+```bash
+# Windows
+set OPENAI_API_KEY=your_api_key_here
+set LLM_BASE_URL=https://api.deepseek.com/v1
+set LLM_MODEL=deepseek-chat
 
-#### 方式一：PyQt5 GUI
-1. **加载模型**: 选择训练好的模型文件
-2. **选择图像**: 支持单张或批量图像预测
-3. **设置阈值**: 调整二值化阈值（默认 0.5，或使用 Brent 优化结果）
-4. **开始预测**: 点击"开始预测"按钮，查看预测结果
+# Linux/macOS
+export OPENAI_API_KEY=your_api_key_here
+export LLM_BASE_URL=https://api.deepseek.com/v1
+export LLM_MODEL=deepseek-chat
+```
 
-#### 方式二：Streamlit Web App
-1. **启动应用**: 运行 `streamlit run app.py`
-2. **上传模型**: 在侧边栏上传训练好的模型文件（`.pth`）
-3. **上传图像**: 批量上传 TIF 格式的 2D 图像序列
-   - 系统会自动识别并配对原图和对应的 `_mask.tif` 文件
-   - 例如：`image1.tif` 和 `image1_mask.tif` 会自动配对
-4. **配置后处理**（可选）:
-   - 上传 `best_postprocessing_config.json` 以启用智能后处理
-   - 或使用手动阈值调节
-5. **浏览结果**: 
-   - 使用切片浏览器选择要查看的图像
-   - 实时调节阈值，立即查看预测结果变化
-   - 查看三列对比（原图、Ground Truth、预测结果）
-   - 使用深度调试面板分析概率分布和阈值效果
+#### 4. 使用 API
+
+**图像分割推理：**
+```bash
+curl -X POST "http://127.0.0.1:8000/predict?return_prob_map=true" \
+  -H "Content-Type: multipart/form-data" \
+  -F "file=@image.tif"
+```
+
+**AI 聊天接口：**
+```bash
+curl -X POST "http://127.0.0.1:8000/chat" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "请分析这张影像"}],
+    "context_data": {"文件名": "image1.tif", "肿瘤像素数": "1234"},
+    "llm_config": {
+      "api_key": "your_api_key",
+      "base_url": "https://api.deepseek.com/v1",
+      "model": "deepseek-chat"
+    }
+  }'
+```
+
+### PyQt5 GUI 使用流程
+
+#### 1. 训练模型
+
+1. 选择数据目录
+2. 选择数据集类型（标准 / 2.5D）
+3. 选择模型架构
+4. 设置训练参数（轮次、批次大小、优化器等）
+5. 点击"开始训练"
+
+#### 2. 测试模型
+
+1. 加载训练好的模型文件（`.pth`）
+2. 选择测试数据目录
+3. 配置选项（模型架构、TTA 等）
+4. 点击"开始测试"
+
+#### 3. 预测图像
+
+1. 加载模型
+2. 添加图像（支持批量）
+3. 设置阈值
+4. 点击"开始预测"
+
+---
+
+## 📡 API 文档
+
+### 基础信息
+
+- **Base URL**: `http://127.0.0.1:8000`
+- **API 版本**: `1.0.0`
+
+### 端点列表
+
+#### 1. GET `/`
+
+获取 API 信息
+
+**响应示例：**
+```json
+{
+  "message": "Brain Tumor Segmentation API",
+  "status": "running",
+  "device": "cuda",
+  "model_mode": "2.5D"
+}
+```
+
+#### 2. GET `/health`
+
+健康检查
+
+**响应示例：**
+```json
+{
+  "status": "healthy",
+  "device": "cuda"
+}
+```
+
+#### 3. POST `/predict`
+
+图像分割推理
+
+**请求参数：**
+- `file` (File, required): 上传的图像文件（TIF/PNG/JPG）
+- `return_prob_map` (bool, optional): 是否返回概率图，默认 `false`
+
+**响应格式：**
+
+如果 `return_prob_map=false`（默认）：
+- Content-Type: `image/png`
+- 返回二值化 Mask 图像（PNG 格式，0-255）
+
+如果 `return_prob_map=true`：
+- Content-Type: `application/json`
+- 响应体：
+```json
+{
+  "prob_map_shape": [256, 256],
+  "prob_map_data": "base64_encoded_data",
+  "prob_map_dtype": "float32",
+  "prob_map_min": 0.0,
+  "prob_map_max": 1.0,
+  "prob_map_mean": 0.1234,
+  "binary_mask": "base64_encoded_png",
+  "threshold": 0.5
+}
+```
+
+**使用示例：**
+```python
+import requests
+
+# 读取图像文件
+with open("image.tif", "rb") as f:
+    files = {"file": f}
+    response = requests.post(
+        "http://127.0.0.1:8000/predict?return_prob_map=true",
+        files=files
+    )
+
+if response.status_code == 200:
+    data = response.json()
+    # 解码概率图
+    import base64
+    import numpy as np
+    prob_map_bytes = base64.b64decode(data["prob_map_data"])
+    prob_map = np.frombuffer(prob_map_bytes, dtype=np.float32).reshape(data["prob_map_shape"])
+```
+
+#### 4. POST `/chat`
+
+AI 辅助诊断聊天接口
+
+**请求体：**
+```json
+{
+  "messages": [
+    {"role": "user", "content": "请分析这张影像"}
+  ],
+  "context_data": {
+    "文件名": "image1.tif",
+    "肿瘤像素数": "1234",
+    "总像素数": "65536",
+    "肿瘤占比": "1.88%",
+    "图像尺寸": "256x256",
+    "Dice系数": "0.8276"
+  },
+  "llm_config": {
+    "api_key": "your_api_key",
+    "base_url": "https://api.deepseek.com/v1",
+    "model": "deepseek-chat",
+    "temperature": 0.7,
+    "max_tokens": 2000
+  }
+}
+```
+
+**响应格式：**
+- Content-Type: `text/event-stream` (Server-Sent Events)
+- 流式返回 AI 回复内容
+
+**使用示例：**
+```python
+import requests
+
+response = requests.post(
+    "http://127.0.0.1:8000/chat",
+    json={
+        "messages": [{"role": "user", "content": "请分析这张影像"}],
+        "context_data": {"文件名": "image1.tif", "肿瘤像素数": "1234"},
+        "llm_config": {
+            "api_key": "your_api_key",
+            "base_url": "https://api.deepseek.com/v1",
+            "model": "deepseek-chat"
+        }
+    },
+    stream=True
+)
+
+for chunk in response.iter_content(chunk_size=None, decode_unicode=True):
+    if chunk:
+        print(chunk, end="", flush=True)
+```
 
 ---
 
@@ -399,6 +568,7 @@ data_dir/
 - ImageNet 预训练权重
 - 支持 Grad-CAM 可视化
 - 支持 1/3 通道输入自适应
+- **推荐用于高精度分割任务**
 
 ---
 
@@ -433,135 +603,22 @@ data_dir/
 - ✅ 结果可视化
 - ✅ 批量导出
 
-### 可视化功能
-- ✅ 训练曲线实时显示
-- ✅ 注意力热图（Grad-CAM）
-- ✅ 预测结果网格可视化
-- ✅ MATLAB 性能分析报告
-- ✅ 混淆矩阵可视化
-
----
-
-## 📊 性能指标
-
-系统支持以下评估指标：
-
-- **Dice 系数**: 衡量分割重叠度（只计算前景类，空 Mask 特殊处理）
-- **IoU（交并比）**: 衡量预测与真实掩码的重叠（只计算前景类，空 Mask 特殊处理）
-- **Precision（精确率）**: 预测为正样本中真正为正的比例
-- **Recall（召回率）**: 真实正样本中被正确预测的比例
-- **Specificity（特异度）**: 真实负样本中被正确预测的比例
-- **HD95**: 95% Hausdorff 距离，衡量边界精度
-
-### 空 Mask 处理策略
-
-系统实现了完善的空 Mask（无病灶）处理逻辑：
-
-- **双空（GT 为空且 Pred 为空）**: Dice=1.0, IoU=1.0（完美预测）
-- **单空（GT 为空但 Pred 不为空）**: Dice=0.0, IoU=0.0（误报）
-- **单空（GT 不为空但 Pred 为空）**: Dice=0.0, IoU=0.0（漏报）
-
-后处理函数实现了"绝对最小面积限制"，确保微小噪点（面积 < min_size）被清空，从而触发"双空=1.0"的满分指标。
-
----
-
-## 🔧 高级功能
-
-### Brent 阈值优化方法
-
-**功能**: 使用 SciPy 的 Brent 方法（`minimize_scalar`）进行高效单维度阈值搜索，配合多进程并行加速
-
-**优势**:
-- 🚀 **极速收敛**: 仅需 ~15 次评估即可收敛（相比 GWO 的 ~100 次）
-- ⚡ **多核并行**: 使用 `ProcessPoolExecutor` 并行计算，8 核同时工作，速度提升 6-10 倍
-- 🎯 **精确搜索**: 基于黄金分割和逆二次插值的混合算法，精度更高
-- 📊 **自动优化**: 无需手动设置阈值范围，搜索区间 [0.1, 0.9]
-
-**使用方法**:
-- 在训练验证和测试阶段自动启用
-- 优化目标：`Score = 0.4*Dice + 0.3*IoU + 0.3*Specificity`
-- 多进程配置：`max_workers = min(8, os.cpu_count())`
-
-**性能表现**:
-- **之前**：单核串行，1000 张图 × 0.1 秒 = 100 秒/次，15 次 = 25 分钟
-- **之后**：8 核并行，1000 张图 ÷ 8 × 0.1 秒 ≈ 12.5 秒/次，15 次 ≈ 30 秒
-
-**实现位置**: 
-- `worker/test_thread.py` - 测试阶段（多进程并行）
-- `worker/train_thread.py` - 训练验证阶段
-
-**注意**: GWO 优化器仍保留在 `utils/gwo_optimizer.py`，用于 SwinUNet/DS-TransUNet/NN-Former 的超参数优化
-
-### 测试时增强 (TTA)
-- 多尺度推理（0.8x, 1.0x, 1.2x）
-- 8 种几何变换（翻转、旋转等）
-- 加权融合策略
-- 可将Dice提升1‑3%
-
 ### 智能后处理
-- **LCC（最大连通域）**: 保留最大连通区域，去除噪点
-- **绝对最小面积限制**: 即使最大连通域，如果面积 < min_size，也会被清空（用于空 Mask 优化）
-- **孔洞填充**: 填补小孔洞，提升分割完整性
-- **边缘平滑**: Gaussian 滤波，修正锯齿边缘
-- **形态学操作**: 开运算、闭运算，去除毛刺和填充缝隙
-- **动态面积阈值**: 根据概率图平均值动态调整过滤阈值
-- **高置信度小病灶保护**: 智能保留高置信度（>0.9）的微小病灶
+- ✅ **LCC（最大连通域）** - 保留最大连通区域，去除噪点
+- ✅ **Remove-Small** - 移除小区域（可配置最小面积阈值）
+- ✅ **孔洞填充** - 填补小孔洞，提升分割完整性
+- ✅ **边缘平滑** - Gaussian 滤波，修正锯齿边缘
+- ✅ **形态学操作** - 开运算、闭运算，去除毛刺和填充缝隙
+- ✅ **动态面积阈值** - 根据概率图平均值动态调整过滤阈值
+- ✅ **高置信度小病灶保护** - 智能保留高置信度的微小病灶
+- ✅ **数据驱动自适应后处理** - 基于验证集自动搜索最优策略
 
-**实现位置**: `utils/standalone_funcs.py` - `ensemble_post_process_global()` 和 `refine_segmentation_mask()`
-
-### Grad‑CAM可视化
-- 支持没有原生注意力图的模型（如DeepLabV3+）
-- 使用解码器层作为目标层生成高分辨率热图
-- 自动适配二分类/多分类模型
-- 仅在验证/测试阶段生成（训练时禁用以节省GPU内存）
-- 采样策略：仅处理前5个批次；其余跳过以提高速度。
-
-### 2.5D 数据集支持
-- 支持 TCGA-LGG 格式的 2.5D 数据集
-- 自动将相邻切片堆叠为三通道输入
-- 支持递归搜索子文件夹
-- 优雅处理边界缺失切片。
-
-### MATLAB报告生成
-- 自动生成性能分析报告（条形图 + 误差条）
-- 预测结果网格可视化
-- 高质量图表导出（1200×800，300 DPI）
-- 优化布局（为X轴标签预留空间）
-- 持久保存到 `matlab_reports/` 目录。
-
-**实现位置**: `utils/matlab_bridge.py`
-
-### 性能优化
-- **CuDNN Benchmark**: 自动寻找最适合的卷积算法
-- **DataLoader 优化**:
-  - `num_workers`: 自动设置为 `min(os.cpu_count(), 8)`
-  - `pin_memory`: CUDA 设备自动启用
-  - `persistent_workers`: 保持子进程存活，避免重复创建
-  - `prefetch_factor`: 增加预取因子，提升数据流水线效率
-- **内存优化**: 测试阶段仅收集前 5 个样本用于可视化，其余立即释放
-- **梯度优化**: 验证阶段仅对前 5 个 batch 启用梯度计算（Grad-CAM），其余使用 `torch.no_grad()`
-- **多进程阈值优化**: 使用 `ProcessPoolExecutor` 并行化 Brent 阈值搜索中的 CPU 密集型后处理任务，8 核并行，速度提升 6-10 倍
-- **数据格式优化**: 概率图使用 `float16`，标签使用 `uint8`，减少内存占用和进程间传输开销
-
----
-
-## 🎓 损失函数配置
-
-系统采用**极简且稳健的损失函数配置**：
-
-### 损失函数组合
-- **BCE Loss**: 50%
-- **Dice Loss**: 50%
-
-这是医学分割的黄金标准组合，经过优化以：
-- ✅ 有效约束假阳性
-- ✅ 避免过度自信
-- ✅ 提升空 Mask 场景下的性能
-
-### 优化器配置
-- **默认**: AdamW（weight_decay=5e-4）
-- **支持**: Adam、SGD
-- **学习率**: Encoder 和 Decoder 使用相同学习率（避免训练初期震荡）
+### AI 辅助诊断
+- ✅ **侧边栏配置** - 在 Web App 中直接配置 LLM 服务
+- ✅ **自动上下文提取** - 自动提取预测结果元数据
+- ✅ **流式对话** - 实时显示 AI 回复
+- ✅ **多 LLM 支持** - 支持 OpenAI、DeepSeek、Moonshot 等
+- ✅ **动态配置** - 支持在请求中动态指定 LLM 配置
 
 ---
 
@@ -574,6 +631,34 @@ data_dir/
 - **大数据集**: 推荐 SwinUNet（支持 GWO 优化）
 - **需要高精度**: 推荐 DeepLabV3+（训练稳定，性能优秀）
 
+### Q: Streamlit Web App 和 PyQt5 GUI 有什么区别？
+**A**: 
+- **Streamlit Web App** (`app.py`): Web 界面，专注于推理和可视化，支持批量图像处理、AI 辅助诊断，适合快速测试和演示
+- **PyQt5 GUI** (`main.py`): 桌面应用，功能完整，支持训练、测试、预测，适合本地开发和完整工作流
+- 两者共享相同的模型和后处理逻辑，确保结果一致性
+
+### Q: 如何使用 AI 辅助诊断功能？
+**A**: 
+1. 启动 FastAPI 后端服务：`python server.py`
+2. 启动 Streamlit Web App：`streamlit run app.py`
+3. 在 Web App 左侧边栏的"🤖 AI 服务配置"中：
+   - 填写 API 服务地址（默认：`http://127.0.0.1:8000`）
+   - 填写 LLM API Key
+   - 选择 LLM Base URL 和模型名称
+4. 完成图像预测后，系统会自动提取元数据并发送给 AI，生成诊断报告
+
+### Q: API 服务如何配置 LLM？
+**A**: 
+有两种方式：
+1. **环境变量**（推荐用于生产环境）：
+   ```bash
+   export OPENAI_API_KEY=your_api_key
+   export LLM_BASE_URL=https://api.deepseek.com/v1
+   export LLM_MODEL=deepseek-chat
+   ```
+2. **请求中动态指定**（推荐用于开发/测试）：
+   在 `/chat` 请求的 `llm_config` 字段中提供配置
+
 ### Q: 如何提高模型性能？
 **A**: 
 1. 增加训练数据量
@@ -585,50 +670,14 @@ data_dir/
 7. 使用智能后处理（LCC、孔洞填充等）
 8. **使用 Brent 方法优化阈值**（自动启用，多进程并行加速）
 
-### Q: 训练时CUDA内存不足？
-**A**: 尝试减小批次大小、降低图像分辨率、禁用混合精度训练、使用CPU训练或启用梯度累积。
-
-### Q: TTA会显著增加推理时间吗？
-**A**: 是的，TTA会使推理时间增加约24倍，但可将Dice提升1‑3%。建议仅用于最终评估。
+### Q: 训练时 CUDA 内存不足？
+**A**: 尝试减小批次大小、降低图像分辨率、禁用混合精度训练、使用 CPU 训练或启用梯度累积。
 
 ### Q: 如何处理空掩码（无病灶）？
 **A**: 系统具有全面的空掩码处理机制：
-- 指标计算：两者皆空返回1.0，单边空返回0.0。
-- 后处理：微小噪声（面积 < `min_size`）自动清除。
-- 确保在空GT场景下，小假阳性不影响Dice分数。
-
-### Q: 如何为DeepLabV3+生成注意力热图？
-**A**: DeepLabV3+不支持原生注意力图；系统使用Grad‑CAM。安装 `pytorch-grad-cam`：
-```bash
-pip install grad-cam
-```
-
-### Q: MATLAB报告生成失败？
-**A**:
-1. 确保已安装MATLAB R2020b+。
-2. 安装MATLAB Engine for Python：
-   ```bash
-   cd "matlabroot/extern/engines/python"
-   python setup.py install
-   ```
-3. 检查MATLAB路径配置（`main.py`中的`MATLAB_BIN_PATH`）。
-
-### Q: Brent 阈值优化如何使用？
-**A**: Brent 方法在训练验证和测试阶段自动启用，用于：
-- 高效搜索最佳分割阈值（替代线性扫描和 GWO）
-- 多进程并行加速，充分利用多核 CPU
-- 默认配置已优化，无需手动配置
-
-### Q: GWO 优化器是否仍在使用？
-**A**: GWO 优化器仍保留，但主要用于：
-- SwinUNet/DS-TransUNet/NN-Former 的超参数优化（多维度搜索）
-- 阈值优化已升级为 Brent 方法（单维度搜索更高效）
-
-### Q: Streamlit Web App 和 PyQt5 GUI 有什么区别？
-**A**: 
-- **PyQt5 GUI** (`main.py`): 桌面应用，功能完整，支持训练、测试、预测，适合本地开发和完整工作流
-- **Streamlit Web App** (`app.py`): Web 界面，专注于推理和可视化，支持批量图像处理，适合快速测试和演示
-- 两者共享相同的模型和后处理逻辑，确保结果一致性
+- 指标计算：两者皆空返回 1.0，单边空返回 0.0
+- 后处理：微小噪声（面积 < `min_size`）自动清除
+- 确保在空 GT 场景下，小假阳性不影响 Dice 分数
 
 ### Q: Web App 中阈值调节不生效？
 **A**: 已修复！现在确保：
@@ -638,96 +687,90 @@ pip install grad-cam
 
 ---
 
-## 📝 开发说明
-
-### 代码架构
-
-项目采用**模块化设计**，将功能拆分为多个主要模块：
-
-#### 核心模块
-
-- **main.py**: GUI 界面和应用程序主入口，包含 MATLAB 引擎预热逻辑
-- **models.py**: 所有模型架构的定义
-- **config.py**: 模型配置中心
-- **dataset.py**: 2.5D 数据集加载器（TCGA2_5DDataset）
-
-#### Utils 模块 (`utils/`)
-
-工具函数模块，包含14个子模块：
-
-- **common.py**: 公共导入和配置
-- **helpers.py**: 基础工具函数（EarlyStopping、指标计算等）
-- **gwo_optimizer.py**: 灰狼优化算法阈值优化器
-- **model_loader.py**: 模型加载和参数推断
-- **dataset.py**: 医学图像数据集类（MedicalImageDataset）
-- **standalone_funcs.py**: 后处理函数（LCC、孔洞填充、边缘平滑等）
-- **matlab_bridge.py**: MATLAB 引擎会话和可视化桥接
-- **threshold_scan.py**: 阈值扫描功能
-- **visualization.py**: 可视化函数
-- 更多模块详见 `utils/README.md`
-
-**向后兼容**: 所有原有导入方式仍然有效
-```python
-from utils import *  # 仍然有效
-from utils import EarlyStopping, GreyWolfThresholdOptimizer  # 仍然有效
-```
-
-#### Worker 模块 (`worker/`)
-
-工作线程模块，包含训练、测试和预测的业务逻辑：
-
-- **train_thread.py**: 训练线程（TrainThread）- 约8650行
-- **test_thread.py**: 测试线程（ModelTestThread）- 约2000行
-- **predict_thread.py**: 预测线程（PredictThread）- 约200行
-- **common.py**: 公共导入和配置
-
-**向后兼容**: 所有原有导入方式仍然有效
-```python
-from worker import TrainThread, ModelTestThread, PredictThread  # 仍然有效
-```
-
-更多详情详见 `worker/README.md`
-
-### 关键设计决策
-
-1. **模块化结构**: 将大型文件（`utils.py` 4548行、`worker.py` 11013行）拆分为模块化结构，提高可维护性
-2. **向后兼容**: 保持所有原有导入方式不变，无需修改现有代码
-3. **通道自适应**: DeepLabV3+ 和 U-Net++ 支持 1/3 通道输入自适应，通过数据加载器自动转换
-4. **空 Mask 优化**: 实现了完善的空 Mask 处理逻辑，确保指标计算的准确性
-5. **性能优化**: DataLoader 多进程、CuDNN Benchmark、内存优化、多进程后处理等
-6. **可视化优化**: Grad-CAM 采样策略、MATLAB 报告优化等
-7. **损失函数简化**: 采用 50% BCE + 50% Dice 的黄金标准组合
-8. **Brent 阈值优化**: 使用 SciPy 的 Brent 方法进行高效单维度阈值搜索，配合多进程并行加速
-
-### 模块依赖关系
+## 📁 项目结构
 
 ```
-main.py
-├── models.py
-├── utils/ (通过 __init__.py 统一导出)
-│   ├── common.py (公共导入)
-│   ├── helpers.py
-│   ├── gwo_optimizer.py
-│   ├── model_loader.py
-│   └── ... (其他模块)
-└── worker/ (通过 __init__.py 统一导出)
-    ├── common.py (公共导入)
-    ├── train_thread.py
-    ├── test_thread.py
-    └── predict_thread.py
+medical-segmentation/
+├── main.py                    # PyQt5 GUI 主入口
+├── app.py                     # Streamlit Web App
+├── server.py                  # FastAPI 后端服务
+├── models.py                  # 所有模型架构
+├── dataset.py                 # 2.5D 数据集加载器
+├── config.py                  # 集中式模型配置
+├── generate_smart_postprocessing_config.py  # 生成智能后处理配置
+├── requirements.txt           # 依赖列表
+├── README.md                  # 本文档
+├── LICENSE                    # 许可证文件
+│
+├── utils/                     # 工具函数模块
+│   ├── __init__.py            # 向后兼容接口
+│   ├── common.py              # 公共导入和配置
+│   ├── helpers.py             # 基础工具函数
+│   ├── model_loader.py        # 模型加载函数
+│   ├── smart_postprocessing.py # 智能后处理策略搜索
+│   ├── standalone_funcs.py    # 后处理函数
+│   └── ...                    # 更多模块
+│
+├── worker/                    # 工作线程模块
+│   ├── __init__.py            # 向后兼容接口
+│   ├── train_thread.py        # 训练线程
+│   ├── test_thread.py         # 测试线程
+│   └── predict_thread.py      # 预测线程
+│
+├── matlab_reports/            # 生成的 MATLAB 报告
+└── data/                      # 数据目录（用户创建）
 ```
+
+---
+
+## 📈 更新日志
+
+### v2.6 (最新)
+- ✅ **AI 辅助诊断功能**：集成 LLM（支持 OpenAI/DeepSeek/Moonshot）
+  - Web App 侧边栏配置 AI 服务（API Key、Base URL、Model 等）
+  - 自动提取预测结果元数据并生成诊断报告
+  - 支持流式对话，实时显示 AI 回复
+- ✅ **FastAPI 后端服务**：独立的 API 服务（`server.py`）
+  - `/predict` - 图像分割推理接口
+  - `/chat` - AI 辅助诊断聊天接口
+  - 支持动态 LLM 配置
+- ✅ **Web App 优化**：改进用户体验和功能完整性
+
+### v2.5
+- ✅ **Streamlit Web App**：全新的 Web 界面（`app.py`）
+  - 批量图像上传和处理
+  - 实时阈值调节和可视化
+  - 智能后处理集成
+  - 深度调试面板（概率分布直方图、阈值效果预览）
+- ✅ **阈值调节功能优化**：修复智能后处理中阈值硬编码问题
+- ✅ **智能模型检测**：Web App 自动检测模型模式（2D/2.5D）
+
+### v2.4
+- ✅ **Brent 阈值优化方法**：将 GWO 阈值搜索升级为 Brent 方法
+- ✅ **多进程并行加速**：测试阶段使用 `ProcessPoolExecutor` 并行计算
+- ✅ **性能提升**：Brent 阈值优化总耗时从几分钟压缩到 30 秒以内
+
+### v2.3
+- ✅ **HD-BET 深度学习颅骨剥离**：在 LGG-MRI 数据上引入 HD-BET 预处理流程
+- ✅ **数据质量与注意力提升**：在 Skull Stripping 后的数据集上训练
+- ✅ **DeepLabV3+ 模型增强**：在优化后的数据上重新训练
+
+### v2.2
+- ✅ **模块化重构** - 将 `utils.py` 和 `worker.py` 拆分为模块化结构
+- ✅ **向后兼容** - 保持所有原有导入方式不变
+- ✅ **性能优化** - 多进程后处理和指标计算
 
 ---
 
 ## 📝 许可证
 
-本项目采用MIT许可证。详见[LICENSE](LICENSE)文件。
+本项目采用 MIT 许可证。详见 [LICENSE](LICENSE) 文件。
 
 ---
 
 ## 🤝 贡献
 
-欢迎提交Issue和Pull Request！请确保您的更改符合项目的编码风格，并包含适当的测试。
+欢迎提交 Issue 和 Pull Request！请确保您的更改符合项目的编码风格，并包含适当的测试。
 
 ### 贡献指南
 1. Fork 本仓库
@@ -741,7 +784,7 @@ main.py
 ## 📧 联系方式
 
 如有问题或建议，请：
-- 提交GitHub Issue
+- 提交 GitHub Issue
 - 发送邮件至：chuan2410450745@sjtu.edu.cn
 
 ---
@@ -751,75 +794,11 @@ main.py
 感谢以下开源项目的支持：
 - [PyTorch](https://pytorch.org/) - 深度学习框架
 - [PyQt5](https://www.riverbankcomputing.com/software/pyqt/) - GUI 框架
+- [Streamlit](https://streamlit.io/) - Web 框架
+- [FastAPI](https://fastapi.tiangolo.com/) - API 框架
 - [Albumentations](https://albumentations.ai/) - 数据增强库
 - [Segmentation Models PyTorch](https://github.com/qubvel/segmentation_models.pytorch) - 分割模型库
-- [Swin Transformer](https://github.com/microsoft/Swin-Transformer) - Transformer 架构
-- [Grad-CAM](https://github.com/jacobgil/pytorch-grad-cam) - 可视化工具
-
----
-
-## 📚 数据集
-
-模型训练使用了：
-- [LGG MRI分割数据集](https://www.kaggle.com/datasets/mateuszbuda/lgg-mri-segmentation)
-
----
-
-## 📈 更新日志
-
-### v2.5 (最新)
-- ✅ **Streamlit Web App**：全新的 Web 界面（`app.py`），支持浏览器访问
-  - 批量图像上传和处理
-  - 实时阈值调节和可视化
-  - 智能后处理集成
-  - 深度调试面板（概率分布直方图、阈值效果预览）
-- ✅ **阈值调节功能优化**：修复智能后处理中阈值硬编码问题，确保用户手动调节的阈值能够正确应用
-- ✅ **智能模型检测**：Web App 自动检测模型模式（2D/2.5D），自适应输入通道数
-
-### v2.4
-- ✅ **Brent 阈值优化方法**：将 GWO 阈值搜索升级为 Brent 方法（`scipy.optimize.minimize_scalar`），单维度搜索更高效，仅需 ~15 次评估即可收敛
-- ✅ **多进程并行加速**：测试阶段使用 `ProcessPoolExecutor` 并行计算，8 核同时工作，速度提升 6-10 倍
-- ✅ **性能提升**：Brent 阈值优化总耗时从几分钟压缩到 30 秒以内
-- ✅ **训练验证优化**：训练验证阶段也使用 Brent 方法，保持一致性
-
-### v2.3
-- ✅ **HD-BET 深度学习颅骨剥离**：在 LGG-MRI 原始数据上引入 HD-BET 预处理流程，自动移除颅外组织（颅骨、脂肪、皮肤），构建高质量脑实质掩膜。  
-- ✅ **数据质量与注意力提升**：在 Skull Stripping 后的数据集上训练，使模型注意力更专注于颅内病灶区域，显著减少背景伪激活。  
-- ✅ **DeepLabV3+ 模型增强**：在优化后的数据上重新训练 DeepLabV3+，加快收敛速度并提升对肿瘤前景的分割鲁棒性，形成更强的基础模型。  
-- ✅ **与现有流水线集成**：HD-BET 预处理与现有 DataLoader、后处理和阈值优化无缝结合，可作为统一的高质量输入源。  
-
-### v2.2
-- ✅ **模块化重构** - 将 `utils.py` (4548行) 拆分为 `utils/` 目录（14个模块）
-- ✅ **模块化重构** - 将 `worker.py` (11013行) 拆分为 `worker/` 目录（4个模块）
-- ✅ **向后兼容** - 保持所有原有导入方式不变
-- ✅ **性能优化** - 多进程后处理和指标计算
-- ✅ **代码组织** - 提高可维护性和协作友好性
-
-### v2.1
-- ✅ **新增 GWO 灰狼优化算法** - 智能阈值搜索，替代线性扫描
-- ✅ **简化损失函数配置** - 回归 50% BCE + 50% Dice 的黄金标准
-- ✅ **优化学习率配置** - Encoder/Decoder 使用相同学习率
-- ✅ **移除 pos_weight 放大** - 减少空 Mask 假阳性
-- ✅ **优化后处理策略** - 高置信度小病灶保护
-
-### v2.0
-- ✅ 新增 DeepLabV3+ 和 U-Net++ 模型支持
-- ✅ 集成 Grad-CAM 可视化
-- ✅ 优化空 Mask 处理逻辑
-- ✅ 实现智能后处理（绝对最小面积限制）
-- ✅ 优化 DataLoader 性能（多进程、pin_memory、persistent_workers）
-- ✅ 启用 CuDNN Benchmark
-- ✅ 优化 MATLAB 报告生成（高清图表、优化布局）
-- ✅ 实现阈值扫描功能
-- ✅ 内存优化（测试阶段仅收集少量样本）
-- ✅ 支持 2.5D 数据集（TCGA-LGG）
-
-### v1.0
-- ✅ 基础模型架构（ImprovedUNet、ResNetUNet、TransUNet、DS‑TransUNet、SwinUNet）
-- ✅ GUI界面
-- ✅ 训练/测试/预测功能
-- ✅ TTA支持
-- ✅ 基础后处理
+- [OpenAI](https://openai.com/) - LLM API
 
 ---
 

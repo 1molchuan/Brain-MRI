@@ -6,15 +6,26 @@ FastAPI 后端服务 - 固定模型推理服务
 import os
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict
 import numpy as np
 import torch
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from PIL import Image
 import io
 import cv2
 from scipy import ndimage
+import asyncio
+
+# === OpenAI SDK 导入 ===
+try:
+    from openai import AsyncOpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+    print("⚠️ 警告: openai 库未安装，AI 辅助诊断功能将不可用。请运行: pip install openai")
 
 # === Matplotlib 中文显示配置 ===
 # 尝试设置中文字体，按优先级尝试 Windows/Linux 常见中文字体
@@ -36,11 +47,32 @@ CONFIG_PATH = Path("best_postprocessing_config.json")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 TARGET_SIZE = (256, 256)
 
+# === LLM 配置 ===
+# 从环境变量读取 API Key，如果没有则使用占位符
+LLM_API_KEY = os.getenv("OPENAI_API_KEY", os.getenv("DEEPSEEK_API_KEY", ""))
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")  # 默认 OpenAI，可改为 DeepSeek/Moonshot
+# DeepSeek: https://api.deepseek.com/v1
+# Moonshot: https://api.moonshot.cn/v1
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-3.5-turbo")  # 默认模型，可改为 deepseek-chat, moonshot-v1-8k 等
+
 # ==================== 全局变量 ====================
 app = FastAPI(title="Brain Tumor Segmentation API", version="1.0.0")
+
+# 添加 CORS 中间件（允许前端跨域请求）
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 生产环境应限制为特定域名
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 model = None
 model_mode = None  # "2D" or "2.5D"
 smart_post_cfg = None
+
+# LLM 客户端（延迟初始化）
+llm_client = None
 
 
 # ==================== 预处理函数 ====================
@@ -242,8 +274,46 @@ def load_model_on_startup():
 
 @app.on_event("startup")
 async def startup_event():
-    """启动事件：加载模型"""
+    """启动事件：加载模型和初始化 LLM"""
     load_model_on_startup()
+    init_llm_client()
+
+
+# ==================== 数据模型 ====================
+
+class ChatRequest(BaseModel):
+    """聊天请求数据模型"""
+    messages: List[Dict[str, str]]  # 历史对话，格式: [{"role": "user", "content": "..."}, ...]
+    context_data: Optional[Dict] = None  # 包含肿瘤分割结果的结构化数据 (体积, Dice, 脑区等)
+    # LLM 配置（可选，如果提供则使用，否则使用环境变量或默认值）
+    llm_config: Optional[Dict] = None  # {"api_key": "...", "base_url": "...", "model": "...", "temperature": 0.7, "max_tokens": 2000}
+
+
+# ==================== LLM 初始化 ====================
+
+def init_llm_client():
+    """初始化 LLM 客户端"""
+    global llm_client
+    
+    if not OPENAI_AVAILABLE:
+        print("⚠️ OpenAI SDK 未安装，AI 辅助诊断功能不可用")
+        return None
+    
+    if not LLM_API_KEY:
+        print("⚠️ LLM API Key 未设置，AI 辅助诊断功能不可用")
+        print("   请设置环境变量: OPENAI_API_KEY 或 DEEPSEEK_API_KEY")
+        return None
+    
+    try:
+        llm_client = AsyncOpenAI(
+            api_key=LLM_API_KEY,
+            base_url=LLM_BASE_URL
+        )
+        print(f"✅ LLM 客户端初始化成功: {LLM_BASE_URL}")
+        return llm_client
+    except Exception as e:
+        print(f"❌ LLM 客户端初始化失败: {e}")
+        return None
 
 
 # ==================== API 接口 ====================
@@ -353,6 +423,110 @@ async def predict(file: UploadFile = File(...), return_prob_map: bool = Query(Fa
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+
+
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    """
+    AI 辅助诊断聊天接口
+    
+    Args:
+        request: 包含消息历史、上下文数据和 LLM 配置的请求
+        
+    Returns:
+        流式响应（SSE）或普通 JSON 响应
+    """
+    global llm_client
+    
+    # 从请求中获取 LLM 配置（如果提供）
+    llm_config = request.llm_config or {}
+    api_key = llm_config.get("api_key") or LLM_API_KEY
+    base_url = llm_config.get("base_url") or LLM_BASE_URL
+    model_name = llm_config.get("model") or LLM_MODEL
+    temperature = llm_config.get("temperature", 0.7)
+    max_tokens = llm_config.get("max_tokens", 2000)
+    
+    # 检查 OpenAI SDK 是否可用
+    if not OPENAI_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="OpenAI SDK not installed. Please run: pip install openai"
+        )
+    
+    # 如果提供了新的配置，创建临时客户端
+    use_temp_client = False
+    temp_client = None
+    
+    if llm_config and llm_config.get("api_key"):
+        # 使用前端提供的配置创建临时客户端
+        try:
+            temp_client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+            use_temp_client = True
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to initialize LLM client with provided config: {str(e)}"
+            )
+    else:
+        # 使用全局客户端
+        if llm_client is None:
+            llm_client = init_llm_client()
+            if llm_client is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="LLM service not available. Please check API key configuration."
+                )
+        temp_client = llm_client
+    
+    try:
+        # 构建 System Prompt
+        system_prompt = """你是一名专业的神经外科影像学专家。用户会给你提供脑肿瘤分割的统计数据。请根据数据生成一份专业的影像学诊断报告草案，并回答用户的后续医学问题。请使用中文，语气专业、客观。"""
+        
+        # 如果有上下文数据，将其整合到系统提示中
+        if request.context_data:
+            context_str = "\n\n**当前影像分析结果：**\n"
+            for key, value in request.context_data.items():
+                context_str += f"- {key}: {value}\n"
+            system_prompt += context_str
+        
+        # 构建消息列表
+        messages = [
+            {"role": "system", "content": system_prompt}
+        ]
+        
+        # 添加历史对话
+        messages.extend(request.messages)
+        
+        # 调用 LLM API（流式响应）
+        async def generate_response():
+            try:
+                stream = await temp_client.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                    stream=True,
+                    temperature=temperature,
+                    max_tokens=max_tokens
+                )
+                
+                async for chunk in stream:
+                    if chunk.choices[0].delta.content:
+                        yield chunk.choices[0].delta.content
+            except Exception as e:
+                yield f"\n\n❌ 错误: {str(e)}"
+        
+        # 返回流式响应
+        return StreamingResponse(
+            generate_response(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Chat failed: {str(e)}")
 
 
 if __name__ == "__main__":
